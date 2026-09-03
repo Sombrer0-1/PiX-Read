@@ -1,0 +1,36 @@
+node_modules/
+dist/
+pix/release/
+*.log
+.DS_Store
+*.tsbuildinfo
+packages/*/dist/
+
+# created by the agent kernel when the repo root is used as a session cwd
+.pi/
+
+# Environment
+.env
+
+# Editor files
+.vscode/
+.zed/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Package specific
+.npm/
+coverage/
+.nyc_output/
+.pi_config/
+.opencode/
+packages/coding-agent/binaries/
+# named as a release output dir in AGENTS.md
+pix/release-bugfix/
+vuetify_guide/
+# scratch written into the repo root by concurrent agent sessions
+todo.md
+plans/

@@ -1,0 +1,214 @@
+<script setup lang="ts">
+/**
+ * MessageBlock - User message display block
+ *
+ * Right-aligned gray bubble with attachments kept inline.
+ */
+import { ref } from "vue";
+import type { ChatMessageAttachment } from "@/types/session";
+
+defineProps<{
+  text: string;
+  attachments?: ChatMessageAttachment[];
+  timestamp: number;
+}>();
+
+const selectedAttachment = ref<ChatMessageAttachment | null>(null);
+
+function formatTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatSize(size?: number): string {
+  if (size === undefined) return "";
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024) return `${Math.round(size / 1024)} KB`;
+  return `${size} B`;
+}
+
+function kindLabel(kind: ChatMessageAttachment["kind"]): string {
+  if (kind === "image") return "图片";
+  if (kind === "text") return "文本";
+  return "文件";
+}
+</script>
+
+<template>
+  <div class="message-block">
+    <div class="message-bubble">
+      <div v-if="text" class="message-content">{{ text }}</div>
+      <div v-if="attachments && attachments.length > 0" class="message-attachments">
+      <button
+        v-for="attachment in attachments"
+        :key="`${attachment.path}:${attachment.name}`"
+        class="attachment-chip"
+        :title="attachment.path"
+        @click="selectedAttachment = attachment"
+      >
+        <span class="attachment-kind">{{ kindLabel(attachment.kind) }}</span>
+        <span class="attachment-name">{{ attachment.name }}</span>
+        <span v-if="formatSize(attachment.size)" class="attachment-size">{{ formatSize(attachment.size) }}</span>
+      </button>
+      </div>
+      <span class="message-time">{{ formatTime(timestamp) }}</span>
+    </div>
+
+    <v-dialog
+      :model-value="!!selectedAttachment"
+      max-width="780"
+      @update:model-value="(open) => { if (!open) selectedAttachment = null }"
+    >
+      <v-card v-if="selectedAttachment" class="attachment-dialog">
+        <div class="attachment-dialog-title">{{ selectedAttachment.name }}</div>
+        <div class="attachment-dialog-path">{{ selectedAttachment.path }}</div>
+        <pre v-if="selectedAttachment.content" class="attachment-content">{{ selectedAttachment.content }}</pre>
+        <div v-else class="attachment-empty">此附件已作为 {{ kindLabel(selectedAttachment.kind) }} 发送。</div>
+        <v-card-actions class="attachment-dialog-actions">
+          <v-spacer />
+          <v-btn variant="text" @click="selectedAttachment = null">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+  </div>
+</template>
+
+<style scoped>
+.message-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  animation: message-in 0.18s ease-out;
+}
+
+.message-bubble {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: min(86%, 420px);
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--pix-bg-code, #f1f4f7);
+  color: var(--pix-text-primary);
+}
+
+.message-time {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--pix-text-muted);
+  font-family: var(--pix-font-mono);
+}
+
+.message-content {
+  width: 100%;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--pix-text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
+
+.message-attachments {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--pix-space-xs);
+  margin-top: var(--pix-space-sm);
+  width: 100%;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+  padding: 5px 8px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  cursor: pointer;
+}
+
+.attachment-chip:hover {
+  border-color: var(--pix-border);
+  background: var(--pix-bg-hover);
+  color: var(--pix-text-primary);
+}
+
+.attachment-kind {
+  color: var(--pix-accent);
+  font-weight: var(--pix-weight-semibold);
+  flex-shrink: 0;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.attachment-size {
+  flex-shrink: 0;
+  color: var(--pix-text-muted);
+}
+
+.attachment-dialog {
+  padding: var(--pix-space-lg);
+  border-radius: var(--pix-radius-xl);
+}
+
+.attachment-dialog-title {
+  font-size: var(--pix-text-lg);
+  font-weight: var(--pix-weight-semibold);
+  color: var(--pix-text-primary);
+}
+
+.attachment-dialog-path {
+  margin-top: var(--pix-space-xs);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-xs);
+  word-break: break-all;
+}
+
+.attachment-content {
+  margin-top: var(--pix-space-md);
+  max-height: 55vh;
+  overflow: auto;
+  padding: var(--pix-space-md);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-code);
+  color: var(--pix-text-primary);
+  font-size: var(--pix-text-xs);
+  line-height: var(--pix-leading-base);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.attachment-empty {
+  margin-top: var(--pix-space-md);
+  color: var(--pix-text-secondary);
+  font-size: var(--pix-text-sm);
+}
+
+.attachment-dialog-actions {
+  padding: var(--pix-space-md) 0 0;
+}
+
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+</style>

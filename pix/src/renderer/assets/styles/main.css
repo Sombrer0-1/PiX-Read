@@ -1,0 +1,417 @@
+/**
+ * PiX Global Styles
+ */
+
+@import "./variables.css";
+
+/* ── Reset ── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-base);
+  line-height: var(--pix-leading-base);
+  color: var(--pix-text-primary);
+  background: var(--pix-bg-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  height: 100%;
+}
+
+/* ── Frameless window chrome ──
+ * Each page shell renders exactly one .pix-drag-bar strip at its top. It is the
+ * only drag region in the app, and it always stops short of the window controls
+ * rectangle, because Electron only honours no-drag on descendants of a drag
+ * element and the controls are a fixed, non-descendant overlay. */
+.pix-drag-bar {
+  flex-shrink: 0;
+  height: var(--pix-window-controls-height);
+  /* The extra space guards against device-pixel rounding on scaled displays,
+   * where a bleeding drag region would swallow clicks on the first button. */
+  margin-right: calc(var(--pix-window-controls-width) + var(--pix-space-xs));
+  -webkit-app-region: drag;
+}
+
+/* ── Vuetify font override ── */
+.v-application {
+  font-family: var(--pix-font-ui) !important;
+}
+
+/* ── Vuetify border-radius overrides ── */
+:root {
+  --v-border-radius: 6px;
+}
+
+.v-btn {
+  --v-btn-border-radius: 6px;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+
+.v-card {
+  --v-card-border-radius: 8px;
+  border-radius: var(--pix-radius-lg) !important;
+  box-shadow: none !important;
+}
+
+.v-field {
+  --v-field-border-radius: 6px;
+}
+
+.v-field--variant-outlined .v-field__outline {
+  border-width: 1px;
+}
+
+.v-sheet {
+  --v-sheet-border-radius: 8px;
+  border-radius: var(--pix-radius-lg) !important;
+}
+
+.v-application {
+  background: transparent !important;
+}
+
+.v-card,
+.v-list,
+.v-menu .v-overlay__content {
+  color: var(--pix-text-primary);
+}
+
+.v-btn {
+  text-transform: none;
+}
+
+.v-field {
+  box-shadow: none;
+}
+
+.v-btn.v-btn--variant-flat {
+  box-shadow: none;
+}
+
+.v-btn.v-btn--variant-flat:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+
+.v-btn.v-btn--variant-outlined,
+.v-btn.v-btn--variant-text,
+.v-btn.v-btn--variant-tonal {
+  box-shadow: none;
+}
+
+.v-card--variant-outlined {
+  border-color: var(--pix-border-light);
+}
+
+.v-list {
+  background: transparent;
+}
+
+.v-list-item {
+  min-height: 40px;
+}
+
+.v-alert {
+  border-radius: var(--pix-radius-md);
+}
+
+.v-dialog > .v-overlay__content > .v-card {
+  box-shadow: var(--pix-shadow-xl) !important;
+}
+
+.v-field__outline {
+  --v-field-border-opacity: 1;
+  color: var(--pix-border-light) !important;
+}
+
+.v-field.v-field--focused .v-field__outline {
+  color: var(--pix-accent) !important;
+}
+
+.v-label,
+.v-messages {
+  color: var(--pix-text-muted) !important;
+}
+
+.v-overlay__scrim {
+  background: rgba(31, 41, 51, 0.28) !important;
+}
+
+/* ── Scrollbar styling ── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pix-border-light);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pix-border);
+}
+
+/* ── Links ── */
+a {
+  color: var(--pix-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* ── Selection ── */
+::selection {
+  background: var(--pix-accent-light);
+  color: var(--pix-text-primary);
+}
+
+/* ── Code ── */
+code {
+  font-family: var(--pix-font-mono);
+  font-size: 0.94em;
+  background: var(--pix-bg-code);
+  padding: 2px 5px;
+  border-radius: var(--pix-radius-xs);
+  color: var(--pix-text-primary);
+}
+
+pre {
+  font-family: var(--pix-font-mono);
+  font-size: var(--pix-text-sm);
+  background: var(--pix-bg-code);
+  border: 1px solid var(--pix-border-light);
+  border-radius: var(--pix-radius-md);
+  padding: var(--pix-space-md);
+  overflow-x: auto;
+  line-height: 1.65;
+  color: var(--pix-text-primary);
+}
+
+pre code {
+  padding: 0;
+  background: none;
+}
+
+/* ── Focus ── */
+:focus-visible {
+  outline: 2px solid var(--pix-accent);
+  outline-offset: 2px;
+}
+
+/* ── Button base ── */
+button {
+  font-family: var(--pix-font-ui);
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: var(--pix-text-base);
+  color: var(--pix-text-primary);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  color: var(--pix-text-disabled);
+}
+
+/* ── Input / textarea base ── */
+input,
+textarea {
+  font-family: var(--pix-font-ui);
+  font-size: var(--pix-text-base);
+  color: var(--pix-text-primary);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--pix-text-muted);
+}
+
+/* ── Vuetify overrides ── */
+.v-field__input,
+.v-field {
+  font-family: var(--pix-font-ui) !important;
+}
+
+.v-list-item__title {
+  font-size: var(--pix-text-sm);
+}
+
+.v-divider {
+  border-color: var(--pix-border-light) !important;
+}
+
+/* Shared controls used by both the research desk and the legacy workspace. */
+.button,
+.button-primary,
+.button-quiet,
+.button-danger,
+.text-button,
+.icon-button {
+  transition: background-color var(--pix-transition-fast), border-color var(--pix-transition-fast), color var(--pix-transition-fast), opacity var(--pix-transition-fast);
+}
+
+.button:focus-visible,
+.text-button:focus-visible,
+.icon-button:focus-visible,
+.topbar-action:focus-visible,
+.nav-item:focus-visible,
+.stage-nav-item:focus-visible {
+  outline: 2px solid var(--pix-accent);
+  outline-offset: 2px;
+}
+
+.button-primary {
+  background: var(--pix-accent) !important;
+  color: var(--pix-text-inverse) !important;
+}
+
+.button-primary:hover:not(:disabled) {
+  background: var(--pix-accent-hover) !important;
+}
+
+.button-quiet {
+  border: 1px solid var(--pix-border) !important;
+  background: var(--pix-bg-content) !important;
+  color: var(--pix-text-secondary) !important;
+}
+
+.button-quiet:hover:not(:disabled) {
+  border-color: var(--pix-accent-soft) !important;
+  background: var(--pix-bg-hover) !important;
+  color: var(--pix-accent-hover) !important;
+}
+
+.button-danger {
+  border: 1px solid var(--pix-error-light) !important;
+  background: var(--pix-error-bg) !important;
+  color: var(--pix-error) !important;
+}
+
+.button-danger:hover:not(:disabled) {
+  border-color: var(--pix-error) !important;
+  background: var(--pix-error-light) !important;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--pix-icon-button-size);
+  height: var(--pix-icon-button-size);
+  min-height: var(--pix-icon-button-size);
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--pix-radius-sm);
+  color: var(--pix-text-secondary);
+}
+
+.icon-button:hover:not(:disabled) {
+  border-color: var(--pix-border-light);
+  background: var(--pix-bg-hover);
+  color: var(--pix-accent);
+}
+
+.text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pix-space-xs);
+  min-height: 30px;
+  padding: 0 var(--pix-space-xs);
+  border-radius: var(--pix-radius-sm);
+  color: var(--pix-accent);
+}
+
+.text-button:hover:not(:disabled) {
+  background: var(--pix-bg-active);
+  color: var(--pix-accent-hover);
+}
+
+.search-field,
+.sort-field {
+  min-height: var(--pix-control-height);
+  border: 1px solid var(--pix-border);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-content);
+  color: var(--pix-text-secondary);
+}
+
+.search-field:focus-within,
+.sort-field:focus-within {
+  border-color: var(--pix-accent);
+  box-shadow: 0 0 0 3px var(--pix-focus-ring);
+}
+
+.empty-panel,
+.empty-catalog,
+.empty-inbox,
+.figure-empty,
+.manuscript-empty,
+.artifact-missing,
+.library-state,
+.results-state {
+  color: var(--pix-text-muted);
+}
+
+/* ── Utility classes ── */
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Fade transition ── */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--pix-transition-base);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* ── Spinner animation ── */
+@keyframes pix-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--pix-border-light);
+  border-top-color: var(--pix-accent);
+  border-radius: 50%;
+  animation: pix-spin 0.6s linear infinite;
+}

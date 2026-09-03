@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": false,
+    "importsNotUsedAsValues": "remove",
+    "outDir": "dist/preload-tmp",
+    "rootDir": "src"
+  },
+  "files": ["src/main/preload.ts"]
+}
