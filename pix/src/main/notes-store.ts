@@ -1,0 +1,376 @@
+/**
+ * Reader notes storage: <workspace root>/.pix-read/notes.json
+ *
+ * 叶子模块（不 import electron，与 library-root.ts 同），数据只进工作区目录。
+ * 主进程是唯一写者：读-改-写全用同步 fs，同一函数体内不得出现 await，
+ * 因此两次 IPC 交错不会丢写；不需要写队列。
+ * 写入协议：mkdir → 写 <target>.tmp → renameSync 覆盖；失败清理 tmp、原文件不动。
+ */
+
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { getLibraryRoot, isLibraryFilePath } from "./library-root.js";
+import type {
+  ReaderNote,
+  ReaderNoteDraft,
+  ReaderNotesErrorCode,
+  ReaderNotesExportResult,
+  ReaderNotesFile,
+  ReaderNotesLoadResult,
+  ReaderNotesMutationResult,
+  ReaderNotesResetResult,
+} from "../shared/types.js";
+
+const NOTES_DIR_NAME = ".pix-read";
+const NOTES_FILE_NAME = "notes.json";
+const NOTES_MARKDOWN_NAME = "notes.md";
+const SCHEMA_VERSION = 1;
+/** 单条原文上限（N18 验收 7）：超限拒绝保存，不静默截断。 */
+const MAX_NOTE_TEXT_LENGTH = 4000;
+
+const ERROR_MESSAGES: Record<ReaderNotesErrorCode, string> = {
+  "no-root": "尚未选择资料库根目录",
+  outside: "该文档不在当前资料库内",
+  "invalid-input": "笔记数据不合法",
+  "too-long": "选中内容过长（超过 4000 字），请分段摘录",
+  "not-found": "笔记不存在（可能已被删除）",
+  corrupt: "笔记文件无法读取（文件已损坏，未被修改）",
+  "version-unsupported": "笔记文件版本不支持",
+  "read-failed": "笔记文件读取失败",
+  "write-failed": "笔记写入失败",
+  empty: "暂无笔记可导出",
+  "not-corrupt": "笔记文件未损坏，无需重建",
+};
+
+interface NotesPaths {
+  file: string;
+  markdown: string;
+}
+
+type NotesRead = { ok: true; file: ReaderNotesFile } | { ok: false; code: ReaderNotesErrorCode; error: string };
+
+type NotesWrite = { ok: true } | { ok: false; error: string };
+
+function notesPaths(): NotesPaths | null {
+  const root = getLibraryRoot();
+  if (!root) return null;
+  const dir = join(root, NOTES_DIR_NAME);
+  return { file: join(dir, NOTES_FILE_NAME), markdown: join(dir, NOTES_MARKDOWN_NAME) };
+}
+
+function emptyNotesFile(): ReaderNotesFile {
+  return { version: SCHEMA_VERSION, notes: [] };
+}
+
+function failure(code: ReaderNotesErrorCode): ReaderNotesMutationResult {
+  return { success: false, notes: [], code, error: ERROR_MESSAGES[code] };
+}
+
+function corruptRead(): NotesRead {
+  return { ok: false, code: "corrupt", error: ERROR_MESSAGES.corrupt };
+}
+
+function isEnoent(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ENOENT";
+}
+
+/** 比较键：小写 + 正斜杠 + 去尾斜杠（与渲染层 docPathKey 同约定）。 */
+function docPathKey(docPath: string): string {
+  return docPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** 写入前的唯一归一化点：去首尾 + 连续空白（含换行）折叠为单个空格。 */
+function normalizeNoteText(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+/** 草稿的绝对路径 → 工作区相对正斜杠路径；越界或落在根上返回 null。 */
+function toRelativeDocPath(filePath: string, root: string): string | null {
+  const resolved = resolve(filePath);
+  if (!isLibraryFilePath(resolved)) return null;
+  const relativePath = relative(root, resolved).split(sep).join("/");
+  if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) return null;
+  return relativePath;
+}
+
+/** 存储态 docPath 必须能安全拼回工作区根：非空、非绝对、正斜杠、无 .. 段。 */
+function isStoredDocPath(value: unknown): value is string {
+  if (typeof value !== "string" || !value) return false;
+  if (isAbsolute(value) || value.includes("\\")) return false;
+  return !value.split("/").some((segment) => segment === "..");
+}
+
+function isReaderNote(value: unknown): value is ReaderNote {
+  if (!value || typeof value !== "object") return false;
+  const note = value as Record<string, unknown>;
+  return (
+    typeof note.id === "string" &&
+    note.id.length > 0 &&
+    (note.kind === "excerpt" || note.kind === "answer") &&
+    isStoredDocPath(note.docPath) &&
+    typeof note.page === "number" &&
+    Number.isInteger(note.page) &&
+    note.page >= 1 &&
+    typeof note.text === "string" &&
+    note.text.length > 0 &&
+    note.text.length <= MAX_NOTE_TEXT_LENGTH &&
+    typeof note.comment === "string" &&
+    Number.isFinite(note.createdAt) &&
+    Number.isFinite(note.updatedAt)
+  );
+}
+
+/** 结构校验；任一条目不合法即判损坏：宁可报错，不静默丢条目。 */
+function parseNotesFile(raw: string): NotesRead {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return corruptRead();
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return corruptRead();
+  const file = parsed as Record<string, unknown>;
+  if (typeof file.version !== "number") return corruptRead();
+  if (file.version !== SCHEMA_VERSION) {
+    return { ok: false, code: "version-unsupported", error: ERROR_MESSAGES["version-unsupported"] };
+  }
+  const candidate: unknown = file.notes;
+  if (!Array.isArray(candidate)) return corruptRead();
+  const notes: unknown[] = candidate;
+  if (!notes.every(isReaderNote)) return corruptRead();
+  // id 重复会让 update/delete 语义歧义，按损坏处理
+  if (new Set(notes.map((note) => note.id)).size !== notes.length) return corruptRead();
+  return { ok: true, file: { version: SCHEMA_VERSION, notes } };
+}
+
+function readNotesFile(filePath: string): NotesRead {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf-8");
+  } catch (err) {
+    // 文件不存在按空库处理：不写盘，首次保存时创建
+    if (isEnoent(err)) return { ok: true, file: emptyNotesFile() };
+    return { ok: false, code: "read-failed", error: ERROR_MESSAGES["read-failed"] };
+  }
+  // BOM 会让 JSON.parse 失败；与 library-read-text 一样先剥掉
+  return parseNotesFile(raw.replace(/^\uFEFF/, ""));
+}
+
+function writeFileAtomic(target: string, content: string): NotesWrite {
+  const tmp = `${target}.tmp`;
+  try {
+    // 目录被用户删掉也能自愈（N18 验收 5）
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(tmp, content, "utf-8");
+  } catch {
+    removeTemp(tmp);
+    return { ok: false, error: ERROR_MESSAGES["write-failed"] };
+  }
+  try {
+    renameSync(tmp, target);
+  } catch {
+    removeTemp(tmp);
+    return { ok: false, error: ERROR_MESSAGES["write-failed"] };
+  }
+  return { ok: true };
+}
+
+function removeTemp(tmp: string): void {
+  try {
+    rmSync(tmp, { force: true });
+  } catch {
+    // 清理失败不该覆盖真正的失败原因：原文件未被触碰
+  }
+}
+
+function serializeNotes(file: ReaderNotesFile): string {
+  return `${JSON.stringify(file, null, 2)}\n`;
+}
+
+/** N23 去重键：归一化文档路径 + 页码 + 归一化原文（页码参与，同页重复才算重复）。 */
+function duplicateKey(docPath: string, page: number, text: string): string {
+  return `${docPathKey(docPath)}\u0000${page}\u0000${text}`;
+}
+
+function pad(value: number, width = 2): string {
+  return String(value).padStart(width, "0");
+}
+
+/** 本地时间、无 locale 依赖：YYYY-MM-DD HH:mm:ss。 */
+function formatStampHuman(ms: number): string {
+  const date = new Date(ms);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    ` ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+/** 备份文件后缀用紧凑格式：yyyyMMdd-HHmmss。 */
+function formatStampDashed(ms: number): string {
+  const date = new Date(ms);
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/**
+ * 备份名必须唯一：Windows 上 renameSync 会静默覆盖同名目标，
+ * 同一秒内二次重建不能覆盖上一份备份（原文件是用户唯一副本）。
+ */
+function uniqueBackupPath(filePath: string, now: number): string {
+  const base = `${filePath}.corrupt-${formatStampDashed(now)}`;
+  if (!existsSync(base)) return base;
+  for (let index = 2; ; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+function workspaceName(root: string): string {
+  const segments = root.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? root;
+}
+
+function renderMarkdownEntry(note: ReaderNote): string {
+  // 原文写入前已归一化为单行；按行加前缀以兼容手工写入的换行
+  const lines = [`### 第 ${note.page} 页`, "", ...note.text.split("\n").map((line) => `> ${line}`)];
+  if (note.comment) {
+    lines.push("", `备注：${note.comment}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * 导出模板（N21）：文档按比较键升序、组内页码升序再创建时间升序。
+ * 不依赖「当前文档」——导出必须与打开哪个文档无关（幂等、可 diff）。
+ */
+function renderNotesMarkdown(file: ReaderNotesFile, name: string, now: number): string {
+  const groups = new Map<string, ReaderNote[]>();
+  for (const note of file.notes) {
+    const key = docPathKey(note.docPath);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(note);
+    else groups.set(key, [note]);
+  }
+  const sections = [
+    `# 阅读笔记 · ${name}`,
+    `> 由 PiX-Read 导出生成，每次导出都会覆盖。资料库：${name}；生成时间：${formatStampHuman(now)}；共 ${file.notes.length} 条。`,
+  ];
+  for (const [, group] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const ordered = [...group].sort((a, b) => a.page - b.page || a.createdAt - b.createdAt);
+    sections.push(`## ${ordered[0].docPath}（${ordered.length} 条）\n\n${ordered.map(renderMarkdownEntry).join("\n\n---\n\n")}`);
+  }
+  return `${sections.join("\n\n")}\n`;
+}
+
+export function loadNotes(): ReaderNotesLoadResult {
+  const paths = notesPaths();
+  if (!paths) return { success: false, notes: [], filePath: "", code: "no-root", error: ERROR_MESSAGES["no-root"] };
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return { success: false, notes: [], filePath: paths.file, code: read.code, error: read.error };
+  return { success: true, notes: read.file.notes, filePath: paths.file };
+}
+
+export function addNote(draft: ReaderNoteDraft): ReaderNotesMutationResult {
+  const paths = notesPaths();
+  if (!paths) return failure("no-root");
+  const root = getLibraryRoot();
+  const docPath = toRelativeDocPath(draft.docFilePath, root);
+  if (!docPath) return failure("outside");
+  const text = normalizeNoteText(draft.text);
+  if (!text || !Number.isInteger(draft.page) || draft.page < 1) return failure("invalid-input");
+  if (text.length > MAX_NOTE_TEXT_LENGTH) return failure("too-long");
+
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return failure(read.code);
+  const key = duplicateKey(docPath, draft.page, text);
+  const existing = read.file.notes.find((note) => duplicateKey(note.docPath, note.page, note.text) === key);
+  if (existing) {
+    // 重复摘录不新增、不写盘，直接回传既有条目 id（N23 验收 1）
+    return { success: true, notes: read.file.notes, duplicateOf: existing.id };
+  }
+
+  const now = Date.now();
+  const note: ReaderNote = {
+    id: randomUUID(),
+    kind: "excerpt",
+    docPath,
+    page: draft.page,
+    text,
+    comment: "",
+    createdAt: now,
+    updatedAt: now,
+  };
+  const next: ReaderNotesFile = { version: SCHEMA_VERSION, notes: [...read.file.notes, note] };
+  const write = writeFileAtomic(paths.file, serializeNotes(next));
+  if (!write.ok) return failure("write-failed");
+  return { success: true, notes: next.notes, note };
+}
+
+export function updateNoteComment(id: string, comment: string): ReaderNotesMutationResult {
+  const paths = notesPaths();
+  if (!paths) return failure("no-root");
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return failure(read.code);
+  const index = read.file.notes.findIndex((note) => note.id === id);
+  if (index < 0) return failure("not-found");
+
+  const updated: ReaderNote = { ...read.file.notes[index], comment, updatedAt: Date.now() };
+  const next: ReaderNotesFile = {
+    version: SCHEMA_VERSION,
+    notes: read.file.notes.map((note, i) => (i === index ? updated : note)),
+  };
+  const write = writeFileAtomic(paths.file, serializeNotes(next));
+  if (!write.ok) return failure("write-failed");
+  return { success: true, notes: next.notes, note: updated };
+}
+
+export function deleteNote(id: string): ReaderNotesMutationResult {
+  const paths = notesPaths();
+  if (!paths) return failure("no-root");
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return failure(read.code);
+  const notes = read.file.notes.filter((note) => note.id !== id);
+  if (notes.length === read.file.notes.length) return failure("not-found");
+
+  const write = writeFileAtomic(paths.file, serializeNotes({ version: SCHEMA_VERSION, notes }));
+  if (!write.ok) return failure("write-failed");
+  return { success: true, notes };
+}
+
+export function exportNotesMarkdown(): ReaderNotesExportResult {
+  const paths = notesPaths();
+  if (!paths) return { success: false, code: "no-root", error: ERROR_MESSAGES["no-root"] };
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return { success: false, code: read.code, error: read.error };
+  if (read.file.notes.length === 0) return { success: false, code: "empty", error: ERROR_MESSAGES.empty };
+
+  const markdown = renderNotesMarkdown(read.file, workspaceName(getLibraryRoot()), Date.now());
+  const write = writeFileAtomic(paths.markdown, markdown);
+  if (!write.ok) return { success: false, code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
+  return { success: true, filePath: paths.markdown, count: read.file.notes.length };
+}
+
+/** 损坏逃生口（N25）：仅用户显式触发；版本不支持与内容损坏同等对待。 */
+export function resetCorruptNotes(): ReaderNotesResetResult {
+  const paths = notesPaths();
+  if (!paths) return { success: false, notes: [], code: "no-root", error: ERROR_MESSAGES["no-root"] };
+  const read = readNotesFile(paths.file);
+  if (read.ok) return { success: false, notes: [], code: "not-corrupt", error: ERROR_MESSAGES["not-corrupt"] };
+  // read-failed 可能是临时占用或权限问题：改名会丢掉仍可恢复的文件，必须拒绝
+  if (read.code !== "corrupt" && read.code !== "version-unsupported") {
+    return { success: false, notes: [], code: read.code, error: read.error };
+  }
+
+  const backupPath = uniqueBackupPath(paths.file, Date.now());
+  try {
+    renameSync(paths.file, backupPath);
+  } catch {
+    return { success: false, notes: [], code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
+  }
+  const write = writeFileAtomic(paths.file, serializeNotes(emptyNotesFile()));
+  if (!write.ok) {
+    // 备份已存在，必须把路径报给渲染层，否则用户无从找回原文件
+    return { success: false, notes: [], backupPath, code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
+  }
+  return { success: true, notes: [], backupPath };
+}

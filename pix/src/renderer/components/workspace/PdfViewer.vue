@@ -185,6 +185,9 @@ async function renderPage(pageNumber: number, generation: number): Promise<void>
   if (generation !== loadGeneration) return;
 
   const viewport = page.getViewport({ scale: readerStore.scale });
+  // pdf.js 文字层 span 的 font-size 按容器上的 --scale-factor 计算；自建 DOM 不设会回退为继承字号，
+  // 使选区高亮框、搜索高亮与选中即问锚点都按错误字高绘制（canvas 才是可见副本）
+  pageEl.style.setProperty("--scale-factor", String(viewport.scale));
   const outputScale = window.devicePixelRatio || 1;
   canvas.width = Math.floor(viewport.width * outputScale);
   canvas.height = Math.floor(viewport.height * outputScale);
@@ -644,7 +647,9 @@ async function loadPdf(filePath: string): Promise<void> {
     await nextTick();
     if (await stale()) return;
     observePages();
-    scrollToPage(1);
+    // 消费跨文档跳页意图；越界页钳制到最后页（N20）
+    const pendingPage = readerStore.takePendingJump(filePath);
+    scrollToPage(pendingPage != null ? Math.min(pendingPage, readerStore.pageCount) : 1);
     rendered = true;
 
     const outline = await doc.getOutline();
@@ -654,6 +659,8 @@ async function loadPdf(filePath: string): Promise<void> {
     readerStore.setOutline(nodes);
   } catch (err) {
     if (generation !== loadGeneration) return;
+    // 加载失败时丢弃跳页意图，避免劫持后续打开（N20 验收 5）
+    readerStore.takePendingJump(filePath);
     console.error("[pdf-viewer] Failed to load PDF", filePath, err);
     // Never trade a document that is already on screen for an error pane.
     if (rendered) return;
@@ -999,6 +1006,8 @@ defineExpose({ gotoPage });
 
 .pdf-page :deep(.textLayer ::selection) {
   background: rgba(49, 66, 79, 0.28);
+  /* 显式保持透明：文字层只贡献选区几何，可见字形由 canvas 提供 */
+  color: transparent;
 }
 
 .pdf-overlay {

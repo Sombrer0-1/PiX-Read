@@ -15,6 +15,7 @@ PiX-Read 是基于 [pi](https://github.com/earendil-works/pi) agent 内核的**�
 
 - 三栏工作区:资料库文件树(懒加载展开)、阅读区、agent 对话面板
 - 内嵌 PDF 连续阅读:竖向滚动、缩放、文字层可选中、书签知识地图跳页、框选页面区域截图并随提问附图
+- 阅读笔记:选中文字一键摘录(重复内容自动识别)、左栏「笔记」面板按文档分组、点击跳回原页、行内备注与「仅看当前文档」过滤、一键导出 Markdown 到工作区 `.pix-read/notes.md`
 - 阅读向 agent 工具:`pdf_read_pages`(按页取正文)、`pdf_outline`(书签与页码),发送时注入文档路径/当前页/选中文本
 - agent 会话能力:流式输出、工具执行展示、steering/follow-up
 - 会话管理:新建与切换,按 workspace 目录隔离存储(删除有主进程接口,尚无界面入口)

@@ -16,6 +16,11 @@ import type {
   LibraryNode,
   McpConfigInfo,
   McpServerInfo,
+  ReaderNoteDraft,
+  ReaderNotesExportResult,
+  ReaderNotesLoadResult,
+  ReaderNotesMutationResult,
+  ReaderNotesResetResult,
   RequestUserInputRequest,
   RpcCommand,
   SessionInfo,
@@ -56,6 +61,14 @@ export interface PixApi {
   libraryShowInFolder: (targetPath: string) => Promise<{ success: boolean }>;
   libraryReadText: (targetPath: string) => Promise<LibraryFileResult & { content?: string; truncated?: boolean }>;
   libraryReadFile: (targetPath: string) => Promise<LibraryFileResult>;
+
+  // Reader notes (workspace .pix-read/notes.json)
+  notesLoad: () => Promise<ReaderNotesLoadResult>;
+  notesAdd: (draft: ReaderNoteDraft) => Promise<ReaderNotesMutationResult>;
+  notesUpdate: (id: string, comment: string) => Promise<ReaderNotesMutationResult>;
+  notesDelete: (id: string) => Promise<ReaderNotesMutationResult>;
+  notesExport: () => Promise<ReaderNotesExportResult>;
+  notesReset: () => Promise<ReaderNotesResetResult>;
 
   // Window controls (frameless window)
   windowMinimize: () => Promise<void>;
@@ -132,6 +145,14 @@ const api: PixApi = {
   libraryShowInFolder: (targetPath: string) => ipcRenderer.invoke("library-show-in-folder", targetPath),
   libraryReadText: (targetPath: string) => ipcRenderer.invoke("library-read-text", targetPath),
   libraryReadFile: (targetPath: string) => ipcRenderer.invoke("library-read-file", targetPath) as Promise<LibraryFileResult>,
+
+  notesLoad: () => ipcRenderer.invoke("notes-load") as Promise<ReaderNotesLoadResult>,
+  notesAdd: (draft: ReaderNoteDraft) => ipcRenderer.invoke("notes-add", draft) as Promise<ReaderNotesMutationResult>,
+  notesUpdate: (id: string, comment: string) =>
+    ipcRenderer.invoke("notes-update", id, comment) as Promise<ReaderNotesMutationResult>,
+  notesDelete: (id: string) => ipcRenderer.invoke("notes-delete", id) as Promise<ReaderNotesMutationResult>,
+  notesExport: () => ipcRenderer.invoke("notes-export") as Promise<ReaderNotesExportResult>,
+  notesReset: () => ipcRenderer.invoke("notes-reset") as Promise<ReaderNotesResetResult>,
 
   windowMinimize: () => ipcRenderer.invoke("window-minimize"),
   windowMaximize: () => ipcRenderer.invoke("window-maximize"),

@@ -327,6 +327,90 @@ export interface PageCapture {
 }
 
 // ============================================================================
+// Reader Notes Types (workspace .pix-read/notes.json)
+// ============================================================================
+
+export type ReaderNoteKind = "excerpt" | "answer";
+
+/**
+ * A saved reading note. `docPath` is workspace-relative with forward slashes
+ * (original case kept); `page` is 1-based and never clamped here - the main
+ * process does not parse PDFs, so an out-of-range page is clamped to the last
+ * page by the jump consumer (reader-store).
+ */
+export interface ReaderNote {
+  id: string;
+  kind: ReaderNoteKind;
+  docPath: string;
+  page: number;
+  text: string;
+  comment: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Renderer draft: absolute document path, normalized/relativized by the main process. */
+export interface ReaderNoteDraft {
+  docFilePath: string;
+  page: number;
+  text: string;
+}
+
+export interface ReaderNotesFile {
+  version: 1;
+  notes: ReaderNote[];
+}
+
+export type ReaderNotesErrorCode =
+  | "no-root"
+  | "outside"
+  | "invalid-input"
+  | "too-long"
+  | "not-found"
+  | "corrupt"
+  | "version-unsupported"
+  | "read-failed"
+  | "write-failed"
+  | "empty"
+  | "not-corrupt";
+
+/** `filePath` is empty only when no workspace root is set; `notes` is empty on failure. */
+export interface ReaderNotesLoadResult {
+  success: boolean;
+  notes: ReaderNote[];
+  filePath: string;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
+/** Mutations return the authoritative full list; `duplicateOf` marks a dedup hit (no new note). */
+export interface ReaderNotesMutationResult {
+  success: boolean;
+  notes: ReaderNote[];
+  note?: ReaderNote;
+  duplicateOf?: string;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
+export interface ReaderNotesExportResult {
+  success: boolean;
+  filePath?: string;
+  count?: number;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
+/** Explicit rebuild of a damaged file: `corrupt` and `version-unsupported` may both be reset. */
+export interface ReaderNotesResetResult {
+  success: boolean;
+  notes: ReaderNote[];
+  backupPath?: string;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
+// ============================================================================
 // GUI Settings Types
 // ============================================================================
 

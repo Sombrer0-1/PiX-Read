@@ -18,7 +18,17 @@ import { resolvePixSessionDir, type SessionBridge } from "./session-bridge.js";
 import { getPixStoragePaths, pixAgentDir, pixSessionsRootDir } from "./pix-paths.js";
 import type { SettingsStore } from "./settings-store.js";
 import { clearLibraryRoot, getLibraryRoot, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
-import type { GuiSettings, LibraryFileResult, LibraryNode, ProjectInfo, RpcCommand, ThinkingLevel } from "../shared/types.js";
+import { addNote, deleteNote, exportNotesMarkdown, loadNotes, resetCorruptNotes, updateNoteComment } from "./notes-store.js";
+import type {
+  GuiSettings,
+  LibraryFileResult,
+  LibraryNode,
+  ProjectInfo,
+  ReaderNoteDraft,
+  ReaderNotesMutationResult,
+  RpcCommand,
+  ThinkingLevel,
+} from "../shared/types.js";
 
 const { autoUpdater } = electronUpdater;
 
@@ -214,6 +224,31 @@ function listLibraryChildren(dir: string, depth: number): LibraryNode[] {
   return nodes;
 }
 
+function isNoteDraft(value: unknown): value is ReaderNoteDraft {
+  if (!value || typeof value !== "object") return false;
+  const draft = value as Record<string, unknown>;
+  return (
+    typeof draft.docFilePath === "string" &&
+    draft.docFilePath.length > 0 &&
+    typeof draft.page === "number" &&
+    Number.isFinite(draft.page) &&
+    typeof draft.text === "string"
+  );
+}
+
+function isNoteId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isNoteComment(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+/** 守卫只做形状；路径归属、归一化、限额与去重都在 notes-store 内完成。 */
+function invalidNotesInput(): ReaderNotesMutationResult {
+  return { success: false, notes: [], code: "invalid-input", error: "笔记数据不合法" };
+}
+
 export function registerIpcHandlers(
   win: BrowserWindow,
   sessionBridge: SessionBridge,
@@ -398,6 +433,24 @@ export function registerIpcHandlers(
       return { success: false, code: "read-failed", error: err instanceof Error ? err.message : String(err) };
     }
   });
+
+  // =========================================================================
+  // Reader notes (workspace .pix-read/notes.json)
+  // =========================================================================
+
+  ipcMain.handle("notes-load", () => loadNotes());
+
+  ipcMain.handle("notes-add", (_event, draft: unknown) => (isNoteDraft(draft) ? addNote(draft) : invalidNotesInput()));
+
+  ipcMain.handle("notes-update", (_event, id: unknown, comment: unknown) =>
+    isNoteId(id) && isNoteComment(comment) ? updateNoteComment(id, comment) : invalidNotesInput()
+  );
+
+  ipcMain.handle("notes-delete", (_event, id: unknown) => (isNoteId(id) ? deleteNote(id) : invalidNotesInput()));
+
+  ipcMain.handle("notes-export", () => exportNotesMarkdown());
+
+  ipcMain.handle("notes-reset", () => resetCorruptNotes());
 
   // =========================================================================
   // Settings

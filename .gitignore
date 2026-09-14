@@ -9,6 +9,9 @@ packages/*/dist/
 # created by the agent kernel when the repo root is used as a session cwd
 .pi/
 
+# written by PiX-Read into a workspace root (e.g. the repo root during development)
+.pix-read/
+
 # Environment
 .env
 

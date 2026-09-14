@@ -12,32 +12,39 @@ import { useRouter } from "vue-router";
 import { useSessionStore } from "../stores/session-store";
 import { useReaderStore } from "../stores/reader-store";
 import { useProjectStore } from "../stores/project-store";
+import { useNotesStore } from "../stores/notes-store";
 import { useRpc } from "../composables/useRpc";
 import AppLayout from "../components/layout/AppLayout.vue";
 import LibraryPanel from "../components/workspace/LibraryPanel.vue";
+import NotesPanel from "../components/workspace/NotesPanel.vue";
 import ReaderPanel from "../components/workspace/ReaderPanel.vue";
 import ChatPanel from "../components/workspace/ChatPanel.vue";
 import type { AgentMessage, RequestUserInputRequest } from "@/types/rpc";
 import type { SessionInfo } from "@/types/session";
+import type { ReaderNote } from "@shared/types";
 import { deriveSessionTitle } from "../utils/session-title";
+import { absoluteDocPath, docPathKey } from "../utils/notes-path";
 
 const router = useRouter();
 const sessionStore = useSessionStore();
 const readerStore = useReaderStore();
 const projectStore = useProjectStore();
+const notesStore = useNotesStore();
 const rpc = useRpc();
 
 const selectedFilePath = ref<string | null>(null);
 const pendingUserInput = ref<RequestUserInputRequest | null>(null);
 const leftCollapsed = ref(false);
+/** 左栏双标签：资料库文件树 / 笔记面板（两个面板都常挂载，切标签不丢展开态）。 */
+const leftTab = ref<"library" | "notes">("library");
 
 let unsubscribeEvent: (() => void) | null = null;
 let unsubscribeUserInput: (() => void) | null = null;
 
 const rootDir = computed(() => projectStore.currentProject?.path ?? "");
-const workspaceName = computed(() => projectStore.currentProject?.name || "PiX-Read");
 const currentSessionPath = computed(() => projectStore.currentSession?.path);
 const selectedFileName = computed(() => selectedFilePath.value?.split(/[/\\]/).pop() ?? "");
+const noteTabLabel = computed(() => (notesStore.totalCount > 0 ? `笔记 ${notesStore.totalCount}` : "笔记"));
 const currentSessionTitle = computed(() => {
   const named = rpc.sessionState.value?.sessionName?.trim();
   if (named) return named;
@@ -85,6 +92,10 @@ onMounted(async () => {
 
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
 
+  // 跨工作区残留防护：先清空本地状态，再读当前工作区的笔记
+  notesStore.resetNotes();
+  await notesStore.loadNotes();
+
   unsubscribeEvent = window.pixApi.onAgentEvent((event) => {
     sessionStore.addEvent(event);
     // A new agent turn started; any stale clarification request is obsolete.
@@ -111,6 +122,7 @@ onUnmounted(() => {
   unsubscribeEvent = null;
   unsubscribeUserInput?.();
   unsubscribeUserInput = null;
+  notesStore.resetNotes();
 });
 
 function onUserInputDone(): void {
@@ -154,6 +166,22 @@ function onSelectFile(path: string): void {
   selectedFilePath.value = path;
 }
 
+function selectLeftTab(tab: "library" | "notes"): void {
+  if (leftTab.value === tab) return;
+  leftTab.value = tab;
+  // 打开面板是允许的读取时机；失败由面板错误态的「重试」处理
+  if (tab === "notes") void notesStore.loadNotes();
+}
+
+function onOpenNote(note: ReaderNote): void {
+  const target = absoluteDocPath(rootDir.value, note.docPath);
+  readerStore.requestJump(target, note.page);
+  // 同文档不重载：比较必须与 requestJump 同口径，否则会整篇重载并落回第 1 页
+  if (docPathKey(selectedFilePath.value ?? "") !== docPathKey(target)) {
+    selectedFilePath.value = target;
+  }
+}
+
 async function goHome(): Promise<void> {
   await rpc.stopSession();
   sessionStore.clearSession();
@@ -163,6 +191,7 @@ async function goHome(): Promise<void> {
   readerStore.setMapOpen(false);
   readerStore.setCaptureMode(false);
   readerStore.setScale(1);
+  notesStore.resetNotes();
   router.push("/");
 }
 </script>
@@ -176,19 +205,38 @@ async function goHome(): Promise<void> {
             <button class="pill-icon-btn" title="返回首页" @click="goHome">
               <v-icon size="16">mdi-home-outline</v-icon>
             </button>
-            <span class="pill-label" :title="`${workspaceName} — ${rootDir}`">
-              资料库 / {{ workspaceName }}
-            </span>
+            <button
+              type="button"
+              class="pill-tab"
+              :class="{ active: leftTab === 'library' }"
+              data-tab="library"
+              :title="rootDir || '资料库'"
+              @click="selectLeftTab('library')"
+            >
+              资料库
+            </button>
+            <button
+              type="button"
+              class="pill-tab"
+              :class="{ active: leftTab === 'notes' }"
+              data-tab="notes"
+              :title="notesStore.notesFilePath || '笔记'"
+              @click="selectLeftTab('notes')"
+            >
+              {{ noteTabLabel }}
+            </button>
             <button class="pill-icon-btn" title="折叠资料库" @click="leftCollapsed = true">
               <v-icon size="16">mdi-chevron-left</v-icon>
             </button>
           </div>
           <LibraryPanel
+            v-show="leftTab === 'library'"
             class="pane-body"
             :root-dir="rootDir"
             :selected-path="selectedFilePath"
             @select-file="onSelectFile"
           />
+          <NotesPanel v-show="leftTab === 'notes'" class="pane-body" @open-note="onOpenNote" />
         </div>
       </template>
       <template #center>
@@ -296,6 +344,34 @@ async function goHome(): Promise<void> {
 
 .pill-icon-btn:hover {
   background: var(--pix-bg-hover, #eef2f6);
+  color: var(--pix-text-primary);
+}
+
+.pill-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pill-tab:hover {
+  background: var(--pix-bg-hover, #eef2f6);
+  color: var(--pix-text-primary);
+}
+
+.pill-tab.active {
+  background: var(--pix-bg-active, #dfeaf4);
   color: var(--pix-text-primary);
 }
 
