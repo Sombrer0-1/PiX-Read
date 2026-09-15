@@ -411,6 +411,56 @@ export interface ReaderNotesResetResult {
 }
 
 // ============================================================================
+// Reader State Types (workspace .pix-read/reader-state.json)
+// ============================================================================
+
+/** 单篇文档的现场：page 1-based；scale 为 reader-store 钳制后的两位小数。 */
+export interface ReaderDocState {
+  page: number;
+  scale: number;
+  updatedAt: number;
+}
+
+/** 状态文件内存模型。documents 以「比较键（小写 + 正斜杠）」为键；lastDocPath 保留原大小写相对路径。 */
+export interface ReaderStateFile {
+  version: 1;
+  lastDocPath: string | null;
+  documents: Record<string, ReaderDocState>;
+}
+
+/** 复用 notes 的词表，避免两套码表分叉；本轮这些码只进日志与取证，不进任何文案。 */
+export type ReaderStateErrorCode = "no-root" | "outside" | "invalid-input" | "read-failed" | "write-failed";
+
+/** 读侧降级原因。degraded === true ⇔ reason !== undefined。 */
+export type ReaderStateDegradeReason = "missing" | "corrupt" | "version-unsupported" | "read-failed";
+
+/** 写入草稿：docFilePath 必须传绝对路径（与 ReaderNoteDraft 同口径）。 */
+export interface ReaderStateSaveDraft {
+  docFilePath: string;
+  page: number;
+  scale: number;
+}
+
+/** success 仅在「无工作区根」时为 false；state 在降级时为空状态。 */
+export interface ReaderStateLoadResult {
+  success: boolean;
+  state: ReaderStateFile;
+  filePath: string;
+  degraded: boolean;
+  reason?: ReaderStateDegradeReason;
+  code?: ReaderStateErrorCode;
+  error?: string;
+}
+
+/** 失败时 state 恒为空状态（与 ReaderNotesMutationResult 的「失败回传空值」同形），渲染层不得消费失败 payload。 */
+export interface ReaderStateSaveResult {
+  success: boolean;
+  state: ReaderStateFile;
+  code?: ReaderStateErrorCode;
+  error?: string;
+}
+
+// ============================================================================
 // GUI Settings Types
 // ============================================================================
 

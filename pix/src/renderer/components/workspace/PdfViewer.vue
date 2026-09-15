@@ -14,7 +14,8 @@ import type { PDFDocumentLoadingTask, PDFDocumentProxy, RenderTask } from "pdfjs
 import PdfJsWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker&inline";
 import { emitRegionCapture } from "../../composables/useRegionCapture";
 import { useProjectStore } from "../../stores/project-store";
-import { useReaderStore } from "../../stores/reader-store";
+import { DEFAULT_SCALE, useReaderStore } from "../../stores/reader-store";
+import { useReaderStateStore } from "../../stores/reader-state-store";
 import { canvasToPngBase64 } from "../../utils/image-capture";
 import {
   LibraryReadError,
@@ -42,6 +43,7 @@ const props = defineProps<{
 }>();
 
 const readerStore = useReaderStore();
+const readerStateStore = useReaderStateStore();
 const projectStore = useProjectStore();
 
 const scrollEl = ref<HTMLDivElement | null>(null);
@@ -614,6 +616,14 @@ async function loadPdf(filePath: string): Promise<void> {
   await destroyDocument();
   if (generation !== loadGeneration) return;
 
+  // 意图消费：紧接在任何 await 之前（try 之外）；显式跳转优先于现场恢复，
+  // 缩放独立于位置优先级，永远取目标文档的恢复值（无记录回 DEFAULT_SCALE）。
+  // 必须在 getDocument 之前生效：此时 pdfDoc === null，缩放 watcher 必然早退，不做全量重排。
+  // 加载窗口内到达的新意图不在这里结算（见落页点的补消费）。
+  const jumpPage = readerStore.takePendingJump(filePath);
+  const restore = readerStore.takeRestore(filePath);
+  readerStore.setScale(restore ? restore.scale : DEFAULT_SCALE);
+
   try {
     if (!hasLibraryReadApi()) {
       throw new LibraryReadError("renderer-unavailable", "preload 未提供 libraryReadFile，无法从主进程读取文件字节");
@@ -647,10 +657,14 @@ async function loadPdf(filePath: string): Promise<void> {
     await nextTick();
     if (await stale()) return;
     observePages();
-    // 消费跨文档跳页意图；越界页钳制到最后页（N20）
-    const pendingPage = readerStore.takePendingJump(filePath);
-    scrollToPage(pendingPage != null ? Math.min(pendingPage, readerStore.pageCount) : 1);
+    // 唯一初始落页点：显式跳转 > 现场恢复 > 第 1 页；越界页钳制到最后页。
+    // 加载窗口内对同一文档的点击只写 pendingJump（此时 pageCount === 0），补消费一次取最后一次点击（N20 验收 3）
+    const lateJump = readerStore.takePendingJump(filePath);
+    const initialPage = lateJump ?? jumpPage ?? restore?.page ?? 1;
+    scrollToPage(Math.min(initialPage, readerStore.pageCount));
     rendered = true;
+    // 落点认领 + 首个快照：此后 noteChange 才有闸门可过
+    readerStateStore.noteLanding(filePath, readerStore.page, readerStore.scale);
 
     const outline = await doc.getOutline();
     if (await stale()) return;
@@ -659,8 +673,7 @@ async function loadPdf(filePath: string): Promise<void> {
     readerStore.setOutline(nodes);
   } catch (err) {
     if (generation !== loadGeneration) return;
-    // 加载失败时丢弃跳页意图，避免劫持后续打开（N20 验收 5）
-    readerStore.takePendingJump(filePath);
+    // 序言已消费的意图在失败路径同样丢弃，避免劫持后续打开；加载窗口内晚到的点击留给重试消费
     console.error("[pdf-viewer] Failed to load PDF", filePath, err);
     // Never trade a document that is already on screen for an error pane.
     if (rendered) return;
@@ -772,6 +785,15 @@ watch(
     await nextTick();
     observePages();
     scrollToPage(readerStore.page);
+  },
+);
+
+// 阅读现场的第二个（也是最后一个）观察点：落点之后的位置/缩放变化。
+// 闸门全在 reader-state-store.noteChange 内，这里不做任何判断。
+watch(
+  () => [readerStore.page, readerStore.scale] as const,
+  () => {
+    readerStateStore.noteChange(props.filePath, readerStore.page, readerStore.scale);
   },
 );
 

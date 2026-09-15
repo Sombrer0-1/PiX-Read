@@ -19,6 +19,7 @@ import { getPixStoragePaths, pixAgentDir, pixSessionsRootDir } from "./pix-paths
 import type { SettingsStore } from "./settings-store.js";
 import { clearLibraryRoot, getLibraryRoot, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
 import { addNote, deleteNote, exportNotesMarkdown, loadNotes, resetCorruptNotes, updateNoteComment } from "./notes-store.js";
+import { loadReaderState, saveReaderState } from "./reader-state-store.js";
 import type {
   GuiSettings,
   LibraryFileResult,
@@ -26,6 +27,8 @@ import type {
   ProjectInfo,
   ReaderNoteDraft,
   ReaderNotesMutationResult,
+  ReaderStateSaveDraft,
+  ReaderStateSaveResult,
   RpcCommand,
   ThinkingLevel,
 } from "../shared/types.js";
@@ -249,6 +252,29 @@ function invalidNotesInput(): ReaderNotesMutationResult {
   return { success: false, notes: [], code: "invalid-input", error: "笔记数据不合法" };
 }
 
+function isReaderStateDraft(value: unknown): value is ReaderStateSaveDraft {
+  if (!value || typeof value !== "object") return false;
+  const draft = value as Record<string, unknown>;
+  return (
+    typeof draft.docFilePath === "string" &&
+    draft.docFilePath.length > 0 &&
+    typeof draft.page === "number" &&
+    Number.isFinite(draft.page) &&
+    typeof draft.scale === "number" &&
+    Number.isFinite(draft.scale)
+  );
+}
+
+/** 守卫只做形状；相对化、越界、取值域与原子写都在 reader-state-store 内完成。 */
+function invalidReaderStateInput(): ReaderStateSaveResult {
+  return {
+    success: false,
+    state: { version: 1, lastDocPath: null, documents: {} },
+    code: "invalid-input",
+    error: "阅读状态数据不合法",
+  };
+}
+
 export function registerIpcHandlers(
   win: BrowserWindow,
   sessionBridge: SessionBridge,
@@ -451,6 +477,16 @@ export function registerIpcHandlers(
   ipcMain.handle("notes-export", () => exportNotesMarkdown());
 
   ipcMain.handle("notes-reset", () => resetCorruptNotes());
+
+  // =========================================================================
+  // Reader state (workspace .pix-read/reader-state.json)
+  // =========================================================================
+
+  ipcMain.handle("reader-state-load", () => loadReaderState());
+
+  ipcMain.handle("reader-state-save", (_event, draft: unknown) =>
+    isReaderStateDraft(draft) ? saveReaderState(draft) : invalidReaderStateInput()
+  );
 
   // =========================================================================
   // Settings

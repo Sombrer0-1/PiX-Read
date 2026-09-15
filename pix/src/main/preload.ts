@@ -21,6 +21,9 @@ import type {
   ReaderNotesLoadResult,
   ReaderNotesMutationResult,
   ReaderNotesResetResult,
+  ReaderStateLoadResult,
+  ReaderStateSaveDraft,
+  ReaderStateSaveResult,
   RequestUserInputRequest,
   RpcCommand,
   SessionInfo,
@@ -69,6 +72,10 @@ export interface PixApi {
   notesDelete: (id: string) => Promise<ReaderNotesMutationResult>;
   notesExport: () => Promise<ReaderNotesExportResult>;
   notesReset: () => Promise<ReaderNotesResetResult>;
+
+  // Reader state (workspace .pix-read/reader-state.json)
+  readerStateLoad: () => Promise<ReaderStateLoadResult>;
+  readerStateSave: (draft: ReaderStateSaveDraft) => Promise<ReaderStateSaveResult>;
 
   // Window controls (frameless window)
   windowMinimize: () => Promise<void>;
@@ -153,6 +160,10 @@ const api: PixApi = {
   notesDelete: (id: string) => ipcRenderer.invoke("notes-delete", id) as Promise<ReaderNotesMutationResult>,
   notesExport: () => ipcRenderer.invoke("notes-export") as Promise<ReaderNotesExportResult>,
   notesReset: () => ipcRenderer.invoke("notes-reset") as Promise<ReaderNotesResetResult>,
+
+  readerStateLoad: () => ipcRenderer.invoke("reader-state-load") as Promise<ReaderStateLoadResult>,
+  readerStateSave: (draft: ReaderStateSaveDraft) =>
+    ipcRenderer.invoke("reader-state-save", draft) as Promise<ReaderStateSaveResult>,
 
   windowMinimize: () => ipcRenderer.invoke("window-minimize"),
   windowMaximize: () => ipcRenderer.invoke("window-maximize"),

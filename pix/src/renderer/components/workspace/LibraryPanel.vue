@@ -7,6 +7,7 @@
  */
 import { computed, ref, watch } from "vue";
 import type { LibraryNode } from "@/types/rpc";
+import { useReaderStateStore } from "../../stores/reader-state-store";
 
 const props = defineProps<{
   rootDir: string;
@@ -27,7 +28,19 @@ const expanded = ref<Set<string>>(new Set());
 const isLoading = ref(false);
 const errorText = ref<string | null>(null);
 
+const readerStateStore = useReaderStateStore();
+
 const rows = computed(() => flattenVisible(tree.value, 0, expanded.value));
+/** 行徽标：只有 PDF 行有阅读现场；键用树节点自己的 path（不引入第二套键实现）。 */
+const progressMap = computed(() => {
+  const map = new Map<string, number>();
+  for (const row of rows.value) {
+    if (row.node.type !== "file" || !row.node.name.toLowerCase().endsWith(".pdf")) continue;
+    const page = readerStateStore.progressPageFor(row.node.path);
+    if (page !== null) map.set(row.node.path, page);
+  }
+  return map;
+});
 
 watch(
   () => props.rootDir,
@@ -149,6 +162,9 @@ function chevronFor(node: LibraryNode): string {
           <span v-else class="row-chevron-spacer"></span>
           <v-icon size="16" class="row-icon">{{ iconFor(row.node) }}</v-icon>
           <span class="row-label">{{ row.node.name }}</span>
+          <span v-if="progressMap.has(row.node.path)" class="row-progress">
+            第 {{ progressMap.get(row.node.path) }} 页
+          </span>
         </button>
 
         <div v-if="errorText && !isLoading" class="empty-hint">
@@ -236,6 +252,20 @@ function chevronFor(node: LibraryNode): string {
 .row-label {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 进度徽标不参与收缩（min-width + flex-shrink），否则窄栏下会被行名挤没 */
+.row-progress {
+  min-width: 46px;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--pix-bg-active, #dfeaf4);
+  color: var(--pix-text-secondary);
+  font-size: 11px;
+  text-align: center;
   white-space: nowrap;
 }
 

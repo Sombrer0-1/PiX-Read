@@ -13,6 +13,7 @@ import { useSessionStore } from "../stores/session-store";
 import { useReaderStore } from "../stores/reader-store";
 import { useProjectStore } from "../stores/project-store";
 import { useNotesStore } from "../stores/notes-store";
+import { useReaderStateStore } from "../stores/reader-state-store";
 import { useRpc } from "../composables/useRpc";
 import AppLayout from "../components/layout/AppLayout.vue";
 import LibraryPanel from "../components/workspace/LibraryPanel.vue";
@@ -30,6 +31,7 @@ const sessionStore = useSessionStore();
 const readerStore = useReaderStore();
 const projectStore = useProjectStore();
 const notesStore = useNotesStore();
+const readerStateStore = useReaderStateStore();
 const rpc = useRpc();
 
 const selectedFilePath = ref<string | null>(null);
@@ -92,9 +94,14 @@ onMounted(async () => {
 
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
 
-  // 跨工作区残留防护：先清空本地状态，再读当前工作区的笔记
+  // 跨工作区残留防护：先清空本地状态，再读当前工作区的笔记与阅读现场
   notesStore.resetNotes();
   await notesStore.loadNotes();
+  readerStateStore.resetState();
+  await readerStateStore.loadReaderState();
+  // 安全点 d：监听生命周期与工作区页面严格对齐；窗口可能只是被隐藏，所以只 flush 不 reset
+  document.addEventListener("visibilitychange", onDocumentVisibilityChange);
+  window.addEventListener("pagehide", onWindowPageHide);
 
   unsubscribeEvent = window.pixApi.onAgentEvent((event) => {
     sessionStore.addEvent(event);
@@ -118,12 +125,25 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  // 安全点 c：顺序固定 flush → resetState（resetState 会清掉快照，反了会丢最后一次现场）
+  readerStateStore.flush();
+  document.removeEventListener("visibilitychange", onDocumentVisibilityChange);
+  window.removeEventListener("pagehide", onWindowPageHide);
   unsubscribeEvent?.();
   unsubscribeEvent = null;
   unsubscribeUserInput?.();
   unsubscribeUserInput = null;
+  readerStateStore.resetState();
   notesStore.resetNotes();
 });
+
+function onDocumentVisibilityChange(): void {
+  if (document.hidden === true) readerStateStore.flush();
+}
+
+function onWindowPageHide(): void {
+  readerStateStore.flush();
+}
 
 function onUserInputDone(): void {
   pendingUserInput.value = null;
@@ -163,6 +183,13 @@ async function onDeleteSession(session: SessionInfo): Promise<void> {
 }
 
 function onSelectFile(path: string): void {
+  openDocumentFromLibrary(path);
+}
+
+/** 树行与续读入口共用的打开路径：同一性判定用比较键，命中才登记现场恢复意图。 */
+function openDocumentFromLibrary(path: string): void {
+  if (docPathKey(selectedFilePath.value ?? "") === docPathKey(path)) return;
+  readerStateStore.requestRestoreFor(path);
   selectedFilePath.value = path;
 }
 
@@ -176,6 +203,8 @@ function selectLeftTab(tab: "library" | "notes"): void {
 function onOpenNote(note: ReaderNote): void {
   const target = absoluteDocPath(rootDir.value, note.docPath);
   readerStore.requestJump(target, note.page);
+  // 位置走显式跳转；缩放取目标文档的恢复值（跳转页覆盖恢复页，无记录回默认缩放）
+  readerStateStore.requestRestoreFor(target);
   // 同文档不重载：比较必须与 requestJump 同口径，否则会整篇重载并落回第 1 页
   if (docPathKey(selectedFilePath.value ?? "") !== docPathKey(target)) {
     selectedFilePath.value = target;
@@ -183,6 +212,9 @@ function onOpenNote(note: ReaderNote): void {
 }
 
 async function goHome(): Promise<void> {
+  // 安全点 b：必须是第一条语句。session-stop 的 handler 末尾会 clearLibraryRoot()，
+  // 之后发出的 save 只会拿到 no-root 并把最后现场静默丢掉。
+  readerStateStore.flush();
   await rpc.stopSession();
   sessionStore.clearSession();
   pendingUserInput.value = null;
@@ -192,6 +224,7 @@ async function goHome(): Promise<void> {
   readerStore.setCaptureMode(false);
   readerStore.setScale(1);
   notesStore.resetNotes();
+  readerStateStore.resetState();
   router.push("/");
 }
 </script>
@@ -252,7 +285,11 @@ async function goHome(): Promise<void> {
             </button>
             <span class="pill-label">{{ selectedFileName || "阅读区" }}</span>
           </div>
-          <ReaderPanel class="pane-body reader-under-pill" :file-path="selectedFilePath" />
+          <ReaderPanel
+            class="pane-body reader-under-pill"
+            :file-path="selectedFilePath"
+            @open-document="openDocumentFromLibrary"
+          />
         </div>
       </template>
       <template #right>

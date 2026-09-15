@@ -8,15 +8,18 @@
  * - filePath / page / pageCount / selectedText / outline / mapOpen / captureMode / gotoPage / pendingJump
  * Write `gotoPage` to ask PdfViewer to scroll; it is cleared after the jump.
  * Cross-document jumps go through the consume-once pair requestJump / takePendingJump.
+ * Cross-document restore (阅读现场) goes through the consume-once pair requestRestore / takeRestore;
+ * the only registration point is reader-state-store.requestRestoreFor.
  */
 
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { ReaderOutlineNode } from "@shared/types";
 
-const MIN_SCALE = 0.5;
-const MAX_SCALE = 3;
-const DEFAULT_SCALE = 1;
+/** 缩放的唯一取值域：渲染层不得在别处复制这些字面量（reader-state-store 与 PdfViewer 复用）。 */
+export const MIN_SCALE = 0.5;
+export const MAX_SCALE = 3;
+export const DEFAULT_SCALE = 1;
 
 export const useReaderStore = defineStore("reader", () => {
   const filePath = ref<string | null>(null);
@@ -35,6 +38,8 @@ export const useReaderStore = defineStore("reader", () => {
    * once the page nodes exist. openDocument clears it unless the paths match.
    */
   const pendingJump = ref<{ filePath: string; page: number } | null>(null);
+  /** 现场恢复意图（页码 + 缩放）；只由 reader-state-store.requestRestoreFor 登记。 */
+  const pendingRestore = ref<{ filePath: string; page: number; scale: number } | null>(null);
 
   function clampPage(next: number, count: number): number {
     if (count <= 0) return Math.max(1, Math.round(next));
@@ -57,6 +62,9 @@ export const useReaderStore = defineStore("reader", () => {
     if (!path || !pendingJump.value || !samePath(path, pendingJump.value.filePath)) {
       pendingJump.value = null;
     }
+    if (!path || !pendingRestore.value || !samePath(path, pendingRestore.value.filePath)) {
+      pendingRestore.value = null;
+    }
   }
 
   /**
@@ -78,6 +86,24 @@ export const useReaderStore = defineStore("reader", () => {
     if (!intent || !samePath(intent.filePath, targetPath)) return null;
     pendingJump.value = null;
     return intent.page;
+  }
+
+  /**
+   * 恢复意图：目标已是当前已加载文档 → 直接丢弃（页码/缩放保持现状，不重载）。
+   * 未命中不产生任何意图之外的效果：越界页与缩放钳制仍由消费方与 setScale 负责。
+   */
+  function requestRestore(targetPath: string, page: number, scale: number): void {
+    const current = filePath.value;
+    if (current && pageCount.value > 0 && samePath(current, targetPath)) return;
+    pendingRestore.value = { filePath: targetPath, page, scale };
+  }
+
+  /** 消费式读取：路径匹配则清除意图并返回恢复值，否则返回 null；必须在 getDocument 之前调用。 */
+  function takeRestore(targetPath: string): { page: number; scale: number } | null {
+    const intent = pendingRestore.value;
+    if (!intent || !samePath(intent.filePath, targetPath)) return null;
+    pendingRestore.value = null;
+    return { page: intent.page, scale: intent.scale };
   }
 
   function setPage(next: number): void {
@@ -123,9 +149,12 @@ export const useReaderStore = defineStore("reader", () => {
     scale,
     gotoPage,
     pendingJump,
+    pendingRestore,
     openDocument,
     requestJump,
     takePendingJump,
+    requestRestore,
+    takeRestore,
     setPage,
     setPageCount,
     setSelectedText,

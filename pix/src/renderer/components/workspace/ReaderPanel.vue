@@ -11,6 +11,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { renderMarkdown } from "../../utils/markdown";
 import { useProjectStore } from "../../stores/project-store";
 import { useReaderStore } from "../../stores/reader-store";
+import { useReaderStateStore } from "../../stores/reader-state-store";
+import { absoluteDocPath, docDisplayName } from "../../utils/notes-path";
 import {
   failureFromIpcError,
   libraryReadFailureMessage,
@@ -29,7 +31,12 @@ const props = defineProps<{
   filePath: string | null;
 }>();
 
+const emit = defineEmits<{
+  "open-document": [path: string];
+}>();
+
 const readerStore = useReaderStore();
+const readerStateStore = useReaderStateStore();
 const projectStore = useProjectStore();
 const pdfViewer = ref<InstanceType<typeof PdfViewer> | null>(null);
 const mapToggleReady = ref(false);
@@ -53,6 +60,16 @@ const fileName = computed(() => props.filePath?.split(/[/\\]/).pop() ?? "");
 const failureMessage = computed(() => (failure.value ? libraryReadFailureMessage(failure.value) : ""));
 const mapFits = computed(() => stageWidth.value >= MIN_STAGE_WIDTH_FOR_MAP);
 const showMap = computed(() => readerStore.mapOpen && isPdf.value && mapFits.value);
+/** 续读入口：status 未加载完不渲染（不出现「无页码的半截入口」），无记录同理。 */
+const resumeEntry = computed(() => {
+  const last = readerStateStore.lastDoc;
+  if (!readerStateStore.ready || !last) return null;
+  return {
+    path: absoluteDocPath(projectStore.currentProject?.path ?? "", last.docPath),
+    name: docDisplayName(last.docPath),
+    page: last.page,
+  };
+});
 
 const renderedHtml = computed(() => {
   if (!isTextFile.value || !content.value) return "";
@@ -109,6 +126,9 @@ function retryTextLoad(): void {
 watch(
   () => props.filePath,
   async (path) => {
+    // 安全点 a：文档切换（PDF→PDF / PDF→文本 / 文档→空态）前先把上一篇的现场落盘，
+    // 必须早于 openDocument 的复位（复位会把页码置 1 并清空 pageCount）
+    readerStateStore.flush();
     readerStore.openDocument(path);
     content.value = "";
     truncated.value = false;
@@ -124,6 +144,11 @@ async function openExternal(): Promise<void> {
   if (props.filePath) {
     await window.pixApi.libraryOpenPath(props.filePath);
   }
+}
+
+function openResumeEntry(): void {
+  if (!resumeEntry.value) return;
+  emit("open-document", resumeEntry.value.path);
 }
 
 function toggleKnowledgeMap(): void {
@@ -188,6 +213,10 @@ onBeforeUnmount(() => {
           <v-icon size="48" class="empty-icon">mdi-book-open-page-variant-outline</v-icon>
           <p class="empty-title">选择左侧文件开始阅读</p>
           <p class="empty-subtitle">支持 PDF 连续阅读、Markdown 与文本预览</p>
+          <button v-if="resumeEntry" type="button" class="reader-resume" @click="openResumeEntry">
+            <v-icon size="15">mdi-history</v-icon>
+            继续阅读：{{ resumeEntry.name }} · 第 {{ resumeEntry.page }} 页
+          </button>
         </div>
 
         <div v-else-if="isPdf && filePath" class="reader-pdf">
@@ -207,7 +236,7 @@ onBeforeUnmount(() => {
           </v-btn>
         </div>
 
-        <div v-else-if="failure" class="reader-empty">
+        <div v-else-if="failure" class="reader-empty reader-empty-error">
           <v-icon size="48" class="empty-icon">
             {{ failure === "no-library-root" ? "mdi-folder-key-outline" : "mdi-alert-circle-outline" }}
           </v-icon>
@@ -346,6 +375,28 @@ onBeforeUnmount(() => {
   margin: 0;
   font-size: 15px;
   font-weight: 500;
+  color: var(--pix-text-primary);
+}
+
+.reader-resume {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-top: 2px;
+  padding: 6px 12px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 999px;
+  background: var(--pix-bg-elevated, #ffffff);
+  box-shadow: var(--pix-shadow-xs);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.reader-resume:hover {
+  background: var(--pix-bg-hover, #eef2f6);
   color: var(--pix-text-primary);
 }
 
