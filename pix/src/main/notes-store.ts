@@ -14,6 +14,7 @@ import { getLibraryRoot, isLibraryFilePath } from "./library-root.js";
 import type {
   ReaderNote,
   ReaderNoteDraft,
+  ReaderNoteKind,
   ReaderNotesErrorCode,
   ReaderNotesExportResult,
   ReaderNotesFile,
@@ -42,6 +43,9 @@ const ERROR_MESSAGES: Record<ReaderNotesErrorCode, string> = {
   empty: "暂无笔记可导出",
   "not-corrupt": "笔记文件未损坏，无需重建",
 };
+
+/** answer 超长文案；不能按 kind 给 ERROR_MESSAGES 加键（码表与 ReaderNotesErrorCode 一一对应，N35 验收 7）。 */
+const ANSWER_TOO_LONG_MESSAGE = "回答过长（超过 4000 字），无法存为笔记";
 
 interface NotesPaths {
   file: string;
@@ -188,9 +192,9 @@ function serializeNotes(file: ReaderNotesFile): string {
   return `${JSON.stringify(file, null, 2)}\n`;
 }
 
-/** N23 去重键：归一化文档路径 + 页码 + 归一化原文（页码参与，同页重复才算重复）。 */
-function duplicateKey(docPath: string, page: number, text: string): string {
-  return `${docPathKey(docPath)}\u0000${page}\u0000${text}`;
+/** N23 去重键扩一维 kind：同一段文字既摘录又存为结论时是两条独立资产（需求 §0.2）。 */
+function duplicateKey(docPath: string, page: number, kind: ReaderNoteKind, text: string): string {
+  return `${docPathKey(docPath)}\u0000${page}\u0000${kind}\u0000${text}`;
 }
 
 function pad(value: number, width = 2): string {
@@ -232,7 +236,8 @@ function workspaceName(root: string): string {
 
 function renderMarkdownEntry(note: ReaderNote): string {
   // 原文写入前已归一化为单行；按行加前缀以兼容手工写入的换行
-  const lines = [`### 第 ${note.page} 页`, "", ...note.text.split("\n").map((line) => `> ${line}`)];
+  const title = note.kind === "answer" ? `### 第 ${note.page} 页 · AI 结论` : `### 第 ${note.page} 页`;
+  const lines = [title, "", ...note.text.split("\n").map((line) => `> ${line}`)];
   if (note.comment) {
     lines.push("", `备注：${note.comment}`);
   }
@@ -273,17 +278,27 @@ export function loadNotes(): ReaderNotesLoadResult {
 export function addNote(draft: ReaderNoteDraft): ReaderNotesMutationResult {
   const paths = notesPaths();
   if (!paths) return failure("no-root");
+  // kind 白名单必须在一切读写盘之前：非法取值一旦落盘，读侧的 isReaderNote 会把整库判成损坏
+  if (draft.kind !== "excerpt" && draft.kind !== "answer") return failure("invalid-input");
   const root = getLibraryRoot();
   const docPath = toRelativeDocPath(draft.docFilePath, root);
   if (!docPath) return failure("outside");
   const text = normalizeNoteText(draft.text);
   if (!text || !Number.isInteger(draft.page) || draft.page < 1) return failure("invalid-input");
-  if (text.length > MAX_NOTE_TEXT_LENGTH) return failure("too-long");
+  if (text.length > MAX_NOTE_TEXT_LENGTH) {
+    // 超限按 kind 分叉文案，但不截断
+    return {
+      success: false,
+      notes: [],
+      code: "too-long",
+      error: draft.kind === "answer" ? ANSWER_TOO_LONG_MESSAGE : ERROR_MESSAGES["too-long"],
+    };
+  }
 
   const read = readNotesFile(paths.file);
   if (!read.ok) return failure(read.code);
-  const key = duplicateKey(docPath, draft.page, text);
-  const existing = read.file.notes.find((note) => duplicateKey(note.docPath, note.page, note.text) === key);
+  const key = duplicateKey(docPath, draft.page, draft.kind, text);
+  const existing = read.file.notes.find((note) => duplicateKey(note.docPath, note.page, note.kind, note.text) === key);
   if (existing) {
     // 重复摘录不新增、不写盘，直接回传既有条目 id（N23 验收 1）
     return { success: true, notes: read.file.notes, duplicateOf: existing.id };
@@ -292,7 +307,7 @@ export function addNote(draft: ReaderNoteDraft): ReaderNotesMutationResult {
   const now = Date.now();
   const note: ReaderNote = {
     id: randomUUID(),
-    kind: "excerpt",
+    kind: draft.kind,
     docPath,
     page: draft.page,
     text,

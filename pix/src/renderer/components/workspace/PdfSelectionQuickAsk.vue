@@ -150,7 +150,7 @@ async function onExcerptClick(): Promise<void> {
   const text = cachedText;
   if (page == null || !docFilePath || !text || pending.value) return;
   pending.value = true;
-  const result = await notesStore.addNote({ docFilePath, page, text });
+  const result = await notesStore.addNote({ kind: "excerpt", docFilePath, page, text });
   pending.value = false;
   // 选区已变（或浮层已隐藏）时不再显示旧结果的反馈
   if (!visible.value || cachedText !== text) return;

@@ -24,6 +24,7 @@
  */
 import { app, BrowserWindow } from "electron";
 import { createServer } from "vite";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -176,6 +177,17 @@ function seedNotes() {
       createdAt: now - 26 * HOUR,
       updatedAt: now - 26 * HOUR,
     },
+    // N39 验收 3 的排序样本：与 n-current-2 同页，createdAt 更晚 ⇒ 排在其后并带「AI」徽标
+    {
+      id: "n-current-3",
+      kind: "answer",
+      docPath: "sample-paper.pdf",
+      page: 2,
+      text: "结论：稀疏注意力在三分之一的预算下保持召回，位置先验是关键。",
+      comment: "由一次提问总结",
+      createdAt: now - 1 * MINUTE,
+      updatedAt: now - 1 * MINUTE,
+    },
   ];
 }
 
@@ -198,7 +210,8 @@ function writeFixtures() {
   );
   writeFileSync(
     join(LIBRARY_DIR, ".pix-read", "notes.json"),
-    JSON.stringify({ version: 1, notes: seedNotes() }, null, 2),
+    // 空空：空态截图（场景 B）必须先于种子出现；种子由场景 C 的 seedNotes 写穿同一个文件
+    JSON.stringify({ version: 1, notes: [] }, null, 2) + "\n",
   );
 }
 
@@ -229,12 +242,16 @@ const path = require("node:path");
 const CONFIG = ${configJson};
 const NOTES_FILE = CONFIG.notesFilePath;
 
-// 起始为空：空态截图必须先于 seedNotes 出现（种子数据由场景显式写入）
-let notes = [];
 let loadDelayMs = 0;
 let loadFailure = null;
 // PDF 字节读取的注入延迟：只为「加载窗口内连点」场景造出确定的在途加载窗口
 let libraryReadDelayMs = 0;
+// 笔记：五个口（load/add/update/delete/reset + seed）共用同一个 fixture 文件，内存数组不再是事实源
+let notesAddDelayMs = 0;
+let notesAddFailure = null;
+const notesAddCalls = [];
+let agentEventHandlers = [];
+let stubMessages = [];
 
 function clone(list) {
   return list.map(function (note) { return Object.assign({}, note); });
@@ -243,6 +260,48 @@ function clone(list) {
 function sleep(ms) {
   return new Promise(function (done) { setTimeout(done, ms); });
 }
+
+// --- 笔记文件：真读真写 -------------------------------------------------------
+// 解析失败/缺文件按空数组降级（stub 专用；主进程同情形判 corrupt，差异见开发档）。
+function readNotesFile() {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(NOTES_FILE, "utf8"));
+  } catch (err) {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.notes)) return [];
+  return clone(parsed.notes);
+}
+
+function writeNotesFile(list) {
+  fs.mkdirSync(path.dirname(NOTES_FILE), { recursive: true });
+  fs.writeFileSync(NOTES_FILE, JSON.stringify({ version: 1, notes: list }, null, 2) + "\\n", "utf8");
+}
+
+function normalizeNoteText(value) {
+  return String(value == null ? "" : value).replace(/\\s+/g, " ").trim();
+}
+
+/** 越界判据与 library-root 的前缀归属口径一致（不校验文件是否存在，场景 36 依赖这一点）。 */
+function isInsideNotesRoot(target) {
+  const root = String(CONFIG.root).replace(/\\\\/g, "/").replace(/\\/+$/, "").toLowerCase();
+  const full = String(target == null ? "" : target).replace(/\\\\/g, "/").toLowerCase();
+  return full.indexOf(root + "/") === 0;
+}
+
+const NOTES_ERRORS = {
+  "no-root": "尚未选择资料库根目录",
+  outside: "该文档不在当前资料库内",
+  "invalid-input": "笔记数据不合法",
+  "too-long": "选中内容过长（超过 4000 字），请分段摘录",
+  corrupt: "笔记文件无法读取（文件已损坏，未被修改）",
+  "version-unsupported": "笔记文件版本不支持",
+  "read-failed": "笔记文件读取失败",
+  "write-failed": "笔记写入失败",
+};
+
+const ANSWER_TOO_LONG_MESSAGE = "回答过长（超过 4000 字），无法存为笔记";
 
 const MODELS = [
   { provider: "anthropic", id: "claude-sonnet-4-20250514", contextWindow: 200000, reasoning: true, thinkingLevels: ["off", "low", "medium", "high"], input: ["text", "image"] },
@@ -284,7 +343,7 @@ function handleCommand(command) {
   if (type === "get_available_models") return { success: true, data: { models: MODELS } };
   if (type === "get_commands") return { success: true, data: { commands: [] } };
   if (type === "get_session_stats") return { success: true, data: SESSION_STATS };
-  if (type === "get_messages") return { success: true, data: [] };
+  if (type === "get_messages") return { success: true, data: stubMessages };
   if (type === "new_session" || type === "switch_session" || type === "clone" || type === "fork") {
     return { success: true, data: { cancelled: false } };
   }
@@ -469,7 +528,12 @@ const api = {
     };
   },
 
-  onAgentEvent: function () { return function () {}; },
+  onAgentEvent: function (handler) {
+    agentEventHandlers.push(handler);
+    return function () {
+      agentEventHandlers = agentEventHandlers.filter(function (item) { return item !== handler; });
+    };
+  },
   onAgentReady: function () { return function () {}; },
   onAgentExit: function () { return function () {}; },
   onAgentError: function () { return function () {}; },
@@ -492,42 +556,81 @@ const api = {
     if (loadFailure) {
       return { success: false, notes: [], filePath: NOTES_FILE, code: loadFailure.code, error: loadFailure.error };
     }
-    return { success: true, notes: clone(notes), filePath: NOTES_FILE };
+    return { success: true, notes: readNotesFile(), filePath: NOTES_FILE };
   },
   notesAdd: async function (draft) {
-    const docPath = relativeDocPath(draft.docFilePath);
-    const existing = notes.find(function (note) {
-      return note.docPath === docPath && note.page === draft.page && note.text === draft.text;
-    });
-    if (existing) return { success: true, notes: clone(notes), duplicateOf: existing.id };
-    const note = {
-      id: "n-" + Date.now(),
-      kind: "excerpt",
-      docPath: docPath,
-      page: draft.page,
-      text: draft.text,
-      comment: "",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+    const payload = {
+      docFilePath: draft ? draft.docFilePath : null,
+      page: draft ? draft.page : null,
+      text: draft ? draft.text : null,
+      kind: draft ? draft.kind : null,
     };
-    notes = notes.concat([note]);
-    return { success: true, notes: clone(notes), note: note };
+    notesAddCalls.push(payload);
+    if (notesAddDelayMs) await sleep(notesAddDelayMs);
+    if (notesAddFailure === "throw") throw new Error("stub notesAdd 注入异常");
+    if (notesAddFailure) {
+      return {
+        success: false,
+        notes: [],
+        code: notesAddFailure,
+        error: NOTES_ERRORS[notesAddFailure] || notesAddFailure,
+      };
+    }
+    if (payload.kind !== "excerpt" && payload.kind !== "answer") {
+      return { success: false, notes: [], code: "invalid-input", error: NOTES_ERRORS["invalid-input"] };
+    }
+    if (!isInsideNotesRoot(payload.docFilePath)) {
+      return { success: false, notes: [], code: "outside", error: NOTES_ERRORS.outside };
+    }
+    const text = normalizeNoteText(payload.text);
+    if (!text) return { success: false, notes: [], code: "invalid-input", error: NOTES_ERRORS["invalid-input"] };
+    if (text.length > 4000) {
+      return {
+        success: false,
+        notes: [],
+        code: "too-long",
+        error: payload.kind === "answer" ? ANSWER_TOO_LONG_MESSAGE : NOTES_ERRORS["too-long"],
+      };
+    }
+    const docPath = relativeDocPath(payload.docFilePath);
+    const current = readNotesFile();
+    const existing = current.filter(function (note) {
+      return note.docPath === docPath && note.page === payload.page && note.kind === payload.kind && note.text === text;
+    })[0];
+    if (existing) return { success: true, notes: clone(current), duplicateOf: existing.id };
+    const now = Date.now();
+    const note = {
+      id: "n-" + now + "-" + Math.random().toString(36).slice(2, 7),
+      kind: payload.kind,
+      docPath: docPath,
+      page: payload.page,
+      text: text,
+      comment: "",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const next = current.concat([note]);
+    writeNotesFile(next);
+    return { success: true, notes: clone(next), note: Object.assign({}, note) };
   },
   notesUpdate: async function (id, comment) {
-    notes = notes.map(function (note) {
+    const next = readNotesFile().map(function (note) {
       return note.id === id ? Object.assign({}, note, { comment: comment, updatedAt: Date.now() }) : note;
     });
-    return { success: true, notes: clone(notes) };
+    writeNotesFile(next);
+    return { success: true, notes: clone(next) };
   },
   notesDelete: async function (id) {
-    notes = notes.filter(function (note) { return note.id !== id; });
-    return { success: true, notes: clone(notes) };
+    const next = readNotesFile().filter(function (note) { return note.id !== id; });
+    writeNotesFile(next);
+    return { success: true, notes: clone(next) };
   },
   notesExport: async function () {
-    return { success: true, filePath: path.join(CONFIG.root, ".pix-read", "notes.md"), count: notes.length };
+    // 与 notesLoad 同源（文件），避免「内存数组 vs 文件」两套事实源；stub 不生成 notes.md 内容
+    return { success: true, filePath: path.join(CONFIG.root, ".pix-read", "notes.md"), count: readNotesFile().length };
   },
   notesReset: async function () {
-    notes = [];
+    writeNotesFile([]);
     return { success: true, notes: [], backupPath: NOTES_FILE + ".bak" };
   },
 
@@ -579,7 +682,23 @@ const api = {
 contextBridge.exposeInMainWorld("pixApi", api);
 
 contextBridge.exposeInMainWorld("__pixStub", {
-  seedNotes: function (list) { notes = list.map(function (note) { return Object.assign({}, note); }); },
+  seedNotes: function (list) {
+    writeNotesFile(clone(list));
+    return NOTES_FILE;
+  },
+  notesAddCalls: function () {
+    return { count: notesAddCalls.length, payloads: notesAddCalls.slice(-8) };
+  },
+  setNotesAddFailure: function (code) { notesAddFailure = code || null; },
+  setNotesAddDelay: function (ms) { notesAddDelayMs = ms || 0; },
+  setMessages: function (list) {
+    stubMessages = Array.isArray(list) ? list.map(function (message) { return Object.assign({}, message); }) : [];
+  },
+  emitAgentEvent: function (event) {
+    agentEventHandlers.slice().forEach(function (handler) {
+      handler(event);
+    });
+  },
   setLoadDelay: function (ms) { loadDelayMs = ms; },
   setLibraryReadDelay: function (ms) { libraryReadDelayMs = ms; },
   setLoadFailure: function (code, error) { loadFailure = code ? { code: code, error: error } : null; },
@@ -1623,6 +1742,872 @@ async function runReaderStateScenarios(win, log) {
       : [`续读入口未恢复：${backEntry}`]),
     ...(backRow && backRow.progress === "第 2 页" ? [] : [`树徽标未恢复：${JSON.stringify(backRow)}`]),
   ]);
+
+  // -------------------------------------------------------------------------
+  // 场景 30–36：回答块「存为笔记」（R7 / N35–N42）
+  //
+  // 挂载位置：本函数末尾。record / removeState / waitPage / goHome / enterWorkspace /
+  // openRow / clickNext / openNotesTab 只在本作用域内，换到 runScenario 会引入第二份口径。
+  // 资源顺序：36 末段的 rmSync(archive/older-paper.pdf) 是该文件的最后一次使用；
+  // 30–36 里所有打开或断言它的步骤都在 rmSync 之前。
+  // -------------------------------------------------------------------------
+
+  const NOTES_FILE = join(LIBRARY_DIR, ".pix-read", "notes.json");
+  const readNotes = () => JSON.parse(readFileSync(NOTES_FILE, "utf8")).notes;
+  const notesHash = () => createHash("sha256").update(readFileSync(NOTES_FILE)).digest("hex");
+  const notesAddCalls = () => js("window.__pixStub.notesAddCalls()");
+  const emit = (event) => js(`window.__pixStub.emitAgentEvent(${JSON.stringify(event)}), true`);
+  const clearStateA = () => removeState(STATE_FILE_A);
+  const userBlocks = () => countOf(".chat-messages .message-block");
+
+  const titleOfLastAnswer = () => js(`(() => {
+    const blocks = Array.from(document.querySelectorAll(".agent-message"));
+    const block = blocks[blocks.length - 1];
+    const wrap = block ? block.querySelector(".answer-save-wrap") : null;
+    return wrap ? wrap.getAttribute("title") : null;
+  })()`);
+  const textOfLastAnswer = () => js(`(() => {
+    const blocks = Array.from(document.querySelectorAll(".agent-message"));
+    const block = blocks[blocks.length - 1];
+    const body = block ? block.querySelector(".agent-markdown") : null;
+    return body ? body.textContent.trim() : null;
+  })()`);
+  const feedbackOfLast = () => js(`(() => {
+    const nodes = Array.from(document.querySelectorAll(".answer-note-feedback"));
+    const el = nodes[nodes.length - 1];
+    return el ? { state: el.getAttribute("data-state"), text: el.textContent.replace(/\\s+/g, " ").trim() } : null;
+  })()`);
+  /** 反馈期按钮被 v-if/v-else 移除：同一块第二次点击前必须等按钮回位（2500ms 上限内）。 */
+  const waitFeedbackGone = () => waitFor("反馈回位", `(() => {
+    if (document.querySelectorAll(".answer-note-feedback").length !== 0) return false;
+    const blocks = document.querySelectorAll(".agent-message");
+    const last = blocks[blocks.length - 1];
+    return !!last && !!last.querySelector(".answer-save-btn");
+  })()`);
+
+  // --- 驱动原语（设计档 §7.4.1）：hover 与 composer 都走真驱动 ---
+
+  /** 指针移动首选 CDP：走浏览器输入管线，:hover 必然更新；attach 一次复用，不 per-call detach。 */
+  const cdpMove = async (x, y) => {
+    if (!win.webContents.debugger.isAttached()) await win.webContents.debugger.attach("1.3");
+    await win.webContents.debugger.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+      button: "none",
+      clickCount: 0,
+      modifiers: 0,
+    });
+  };
+
+  const pointOf = (selector, index, probe) => js(`(() => {
+    const nodes = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
+    const el = ${index} < 0 ? nodes[nodes.length + ${index}] : nodes[${index}];
+    if (!el) return null;
+    const inView = (point) => point.x > 0 && point.x < window.innerWidth && point.y > 0 && point.y < window.innerHeight;
+    const centerOf = (node) => {
+      const box = node.getBoundingClientRect();
+      return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+    };
+    const scrollTo = (node) => {
+      node.scrollIntoView({ block: "center" });
+      return centerOf(node);
+    };
+    // 动作区所在行优先：整块滚到居中时动作区会被滚出视口（超长回答），所以先滚动作区自身
+    const target = ${probe ? `el.querySelector(${JSON.stringify(probe)})` : "el"};
+    if (target) {
+      const point = scrollTo(target);
+      if (inView(point)) return point;
+    }
+    // 回落：块内首行（再不行就整块）
+    const body = el.querySelector(".agent-markdown");
+    const first = body ? (body.firstElementChild || body) : el;
+    const fallback = scrollTo(first);
+    return inView(fallback) ? fallback : scrollTo(el);
+  })()`);
+
+  const readProbe = (selector, index, probe) => js(`(() => {
+    const nodes = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
+    const el = ${index} < 0 ? nodes[nodes.length + ${index}] : nodes[${index}];
+    const target = ${probe ? `el && el.querySelector(${JSON.stringify(probe)})` : "el"};
+    if (!target) return null;
+    const box = target.getBoundingClientRect();
+    return {
+      opacity: getComputedStyle(target).opacity,
+      rect: { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) },
+    };
+  })()`);
+
+  /**
+   * 真 hover：scrollIntoView + 落点校验 + 指针移动 + 等过渡（0.15s）后返回 probe 的 opacity。
+   * 判定顺序（must-fix 8）：CDP 首选 → sendInputEvent 兜底（CDP 抛错或复读仍非 1）→ forced。
+   * index 默认 -1：一个会话里可能有多个回答块，默认取最后一个（本轮新块）。
+   */
+  const moveMouse = async (selector, index = -1, probe = null) => {
+    const point = await pointOf(selector, index, probe);
+    if (!point) throw new Error(`moveMouse 找不到落点：${selector}${probe ? " / " + probe : ""}`);
+    const hit = await js(`(() => {
+      const nodes = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
+      const el = ${index} < 0 ? nodes[nodes.length + ${index}] : nodes[${index}];
+      const found = document.elementFromPoint(${point.x}, ${point.y});
+      return { inTarget: !!el && !!found && el.contains(found), found: found ? String(found.className) : null };
+    })()`);
+    if (!hit.inTarget) throw new Error(`moveMouse 落点不在目标元素内：${hit.found}`);
+    let driver = "forced";
+    let cdpError = null;
+    let sendInputError = null;
+    let state = null;
+    try {
+      await cdpMove(point.x, point.y);
+      await sleep(250);
+      state = await readProbe(selector, index, probe);
+      if (state && state.opacity === "1") driver = "cdp";
+    } catch (err) {
+      cdpError = String(err).slice(0, 200);
+    }
+    if (driver !== "cdp") {
+      try {
+        win.webContents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+        await sleep(250);
+        state = await readProbe(selector, index, probe);
+        if (state && state.opacity === "1") driver = "sendInputEvent";
+      } catch (err) {
+        sendInputError = String(err).slice(0, 200);
+      }
+    }
+    return { driver, opacity: state ? state.opacity : null, point, cdpError, sendInputError };
+  };
+
+  /** 中性落点：读「未 hover」的 opacity 之前必须先把指针移出动作区，否则读到的是上一次的 hover 态。 */
+  const moveNeutral = async () => {
+    const point = await js(`(() => {
+      const el = document.querySelector(".chat-header");
+      if (!el) return { x: 8, y: 8 };
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + 6) };
+    })()`);
+    try {
+      await cdpMove(point.x, point.y);
+    } catch {
+      win.webContents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+    }
+    await sleep(250);
+    return point;
+  };
+
+  /** 同理：一个会话里可能有多个同类元素，默认点最后一个（本轮新块）。 */
+  const clickLast = (selector, index = -1) => js(`(() => {
+    const nodes = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
+    const el = ${index} < 0 ? nodes[nodes.length + ${index}] : nodes[${index}];
+    if (!el) throw new Error("clickLast 找不到元素：" + ${JSON.stringify(selector)});
+    el.click();
+    return true;
+  })()`);
+
+  /** composer 驱动：原生 setter 写值 + 派发 input → 等 .composer-send 可点 → click（不依赖键盘与焦点）。 */
+  const typeAndSend = async (text) => {
+    await js(`(() => {
+      const input = document.querySelector(".input-area");
+      if (!input) throw new Error("composer input not found");
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+      setter.call(input, ${JSON.stringify(text)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    })()`);
+    await waitFor("发送按钮可点", `(() => { const b = document.querySelector(".composer-send"); return !!b && !b.disabled; })()`);
+    await js(`document.querySelector(".composer-send").click(), true`);
+  };
+
+  /** 一轮事件序列：确认用户消息 → agent_start → 回答流 → message_end → agent_end。 */
+  const runTurn = async (userText, answerText, confirmText = userText) => {
+    const now = Date.now();
+    await emit({ type: "message_start", message: { role: "user", content: confirmText, displayText: confirmText, timestamp: now } });
+    await emit({ type: "agent_start" });
+    await emit({ type: "message_start", message: { role: "assistant", content: answerText, timestamp: now + 1 } });
+    await emit({ type: "message_update", message: { role: "assistant", content: answerText, timestamp: now + 2 } });
+    await emit({ type: "message_end", message: { role: "assistant", content: answerText, timestamp: now + 3 } });
+    await emit({ type: "agent_end", messages: [] });
+  };
+
+  const rectOfSelector = async (selector, pad = 0) => {
+    const rect = await js(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    })()`);
+    if (!rect) return null;
+    const x = Math.max(0, rect.x - pad);
+    const y = Math.max(0, rect.y - pad);
+    return {
+      x,
+      y,
+      width: Math.min(WINDOW.width - x, rect.width + pad * 2),
+      height: Math.min(WINDOW.height - y, rect.height + pad * 2),
+    };
+  };
+
+  /** 行定位子串：空白归一化后仍保留，DOM 与 fixture 两侧共用。 */
+  const ANSWER1_TEXT = [
+    "## 结论",
+    "",
+    "- 稀疏注意力在 1/3 预算下保持召回",
+    "- 位置先验是消融中的关键变量",
+    "",
+    "```python",
+    "def sparse_attention(tokens, budget):",
+    "    return tokens[:budget]",
+    "```",
+  ].join("\n");
+  const ROW_FROM_31 = "def sparse_attention";
+
+  // --- 30 情形 (a)：锚点优先（hover 双动作 + 标题指向发送时页码）------------------
+  log("30 情形 (a)：第 2 页发送 → 翻页与换文档后目标仍是第 2 页");
+  const TURN1_TEXT = "这篇论文的结论是什么？";
+  await goHome();
+  clearStateA();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(4);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await clickNext();
+  await waitPage(2, 3);
+  const userBase30 = await userBlocks();
+  await typeAndSend(TURN1_TEXT);
+  await emit({ type: "message_start", message: { role: "user", content: TURN1_TEXT, displayText: TURN1_TEXT, timestamp: Date.now() } });
+  await emit({ type: "agent_start" });
+  await emit({ type: "message_start", message: { role: "assistant", content: "结论：", timestamp: Date.now() } });
+  await emit({ type: "message_update", message: { role: "assistant", content: ANSWER1_TEXT, timestamp: Date.now() } });
+  await sleep(250);
+  const streaming = { btnCount: await countOf(".answer-save-btn"), wrapCount: await countOf(".answer-save-wrap") };
+  await capturePage(win, "30b-answer-streaming.png");
+  record("answer-save", { phase: "streaming", ...streaming }, [
+    ...(streaming.btnCount === 0 ? [] : [`流式中不应渲染保存按钮：${streaming.btnCount}`]),
+  ]);
+  await emit({ type: "message_end", message: { role: "assistant", content: ANSWER1_TEXT, timestamp: Date.now() } });
+  await emit({ type: "agent_end", messages: [] });
+  await sleep(200);
+  const idle = { btnCount: await countOf(".answer-save-btn") };
+  record("answer-save", { phase: "idle", ...idle }, [
+    ...(idle.btnCount === 1 ? [] : [`回答完成后应有 1 个保存按钮：${idle.btnCount}`]),
+  ]);
+  await moveNeutral();
+  const beforeHover = await readProbe(".agent-message", -1, ".answer-save-wrap");
+  const hover = await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  const hoverState = await js(`(() => {
+    const blocks = Array.from(document.querySelectorAll(".agent-message"));
+    const block = blocks[blocks.length - 1];
+    const wrap = block ? block.querySelector(".answer-save-wrap") : null;
+    const copy = block ? block.querySelector(".message-copy-btn") : null;
+    const a = wrap ? wrap.getBoundingClientRect() : null;
+    const b = copy ? copy.getBoundingClientRect() : null;
+    const overlap = !!a && !!b && !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
+    return {
+      wrapOpacity: wrap ? getComputedStyle(wrap).opacity : null,
+      title: wrap ? wrap.getAttribute("title") : null,
+      copyBtnCount: block ? block.querySelectorAll(".message-copy-btn").length : 0,
+      saveBtnCount: block ? block.querySelectorAll(".answer-save-btn").length : 0,
+      overlap,
+    };
+  })()`);
+  const forced = hover.driver === "forced";
+  if (forced) {
+    // 降级（must-fix 8）：两级驱动都拿不到 opacity 1 时才走这里，只影响截图与 opacity 断言
+    await js(`(() => {
+      const blocks = Array.from(document.querySelectorAll(".agent-message"));
+      const wrap = blocks.length ? blocks[blocks.length - 1].querySelector(".answer-save-wrap") : null;
+      if (wrap) wrap.style.opacity = "1";
+      return true;
+    })()`);
+  }
+  record(
+    "answer-save",
+    {
+      phase: "hover-before",
+      wrapOpacity: beforeHover ? beforeHover.opacity : null,
+      hoverDriver: hover.driver,
+      cdpError: hover.cdpError,
+      sendInputError: hover.sendInputError,
+    },
+    [...(beforeHover && beforeHover.opacity === "0" ? [] : [`未 hover 时动作区应隐藏：${JSON.stringify(beforeHover)}`])],
+  );
+  record(
+    "answer-save",
+    { phase: "hover", hoverDriver: hover.driver, forcedVisible: forced, ...hoverState },
+    [
+      ...(forced || hoverState.wrapOpacity === "1" ? [] : [`hover 后动作区应显形：${hoverState.wrapOpacity}`]),
+      ...(hoverState.copyBtnCount === 1 && hoverState.saveBtnCount === 1
+        ? []
+        : ["hover 后应同时出现复制与存为笔记两个动作"]),
+      ...(hoverState.overlap === false ? [] : ["动作区与复制按钮重叠"]),
+      ...(hoverState.title && hoverState.title.includes("sample-paper.pdf") && hoverState.title.includes("第 2 页")
+        ? []
+        : [`提示未指向发送时的文档与页码：${hoverState.title}`]),
+    ],
+  );
+  await capturePage(win, "30-answer-save-btn.png");
+  const userAfter30 = await userBlocks();
+  record("answer-save", { phase: "confirm", base: userBase30, userBlocks: userAfter30 }, [
+    ...(userAfter30 === userBase30 + 1 ? [] : [`确认命中不应新增无锚点用户块：${userBase30} → ${userAfter30}`]),
+  ]);
+  await clickNext();
+  await waitPage(3, 3);
+  await sleep(150);
+  const afterFlip = await titleOfLastAnswer();
+  record("answer-anchor", { phase: "flip-page", title: afterFlip }, [
+    ...(afterFlip && afterFlip.includes("第 2 页") ? [] : [`翻页后提示应仍指向第 2 页：${afterFlip}`]),
+  ]);
+  await openRow("older-paper.pdf");
+  await waitPage(1, 2);
+  await sleep(150);
+  const afterSwitch = await titleOfLastAnswer();
+  record("answer-anchor", { phase: "switch-doc", title: afterSwitch }, [
+    ...(afterSwitch && afterSwitch.includes("sample-paper.pdf") && afterSwitch.includes("第 2 页")
+      ? []
+      : [`换文档后锚点目标应不变：${afterSwitch}`]),
+  ]);
+
+  // --- 31 保存成功 ------------------------------------------------------------
+  log("31 保存成功：payload 带锚点页码与 kind，入库文本是回答原文");
+  const callsBase31 = (await notesAddCalls()).count;
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  await clickLast(".answer-save-btn");
+  await waitFor("保存成功反馈", `document.querySelector('.answer-note-feedback[data-state="ok"]')`);
+  const hash31 = notesHash();
+  const calls31 = await notesAddCalls();
+  const payload31 = calls31.payloads.slice(-1)[0];
+  const feedback31 = await feedbackOfLast();
+  const file31 = readNotes();
+  const saved31 = file31.filter((note) => note.kind === "answer" && note.docPath === "sample-paper.pdf" && note.page === 2).slice(-1)[0];
+  const tabLabel31 = await textOf('.pill-tab[data-tab="notes"]');
+  await capturePage(win, "31-answer-save-ok.png");
+  record(
+    "answer-anchor",
+    {
+      phase: "payload",
+      delta: calls31.count - callsBase31,
+      lastPayload: payload31,
+      saved: saved31
+        ? {
+            docPath: saved31.docPath,
+            page: saved31.page,
+            kind: saved31.kind,
+            hasFence: saved31.text.includes("```python"),
+            hasRenderArtifact: /<div|<p |class=/.test(saved31.text),
+          }
+        : null,
+    },
+    [
+      ...(calls31.count - callsBase31 === 1 ? [] : [`一次点击应恰好发 1 次 notesAdd：+${calls31.count - callsBase31}`]),
+      ...(payload31 && payload31.kind === "answer" && payload31.page === 2 && String(payload31.docFilePath).endsWith("sample-paper.pdf")
+        ? []
+        : [`payload 异常：${JSON.stringify(payload31)}`]),
+      ...(saved31 ? [] : ["fixture 内缺少 sample-paper 第 2 页的 answer 条目"]),
+      ...(saved31 && saved31.text.includes("```python") ? [] : ["入库文本应是回答原文（保留 markdown 围栏）"]),
+      ...(saved31 && !/<div|<p |class=/.test(saved31.text) ? [] : ["入库文本混入了渲染产物"]),
+    ],
+  );
+  record(
+    "answer-feedback",
+    { phase: "ok", state: feedback31 ? feedback31.state : null, text: feedback31 ? feedback31.text : null, tabLabel: tabLabel31 },
+    [
+      ...(feedback31 && feedback31.state === "ok" && feedback31.text.includes("已存为笔记") && feedback31.text.includes("第 2 页")
+        ? []
+        : [`成功反馈异常：${JSON.stringify(feedback31)}`]),
+      ...(tabLabel31 === `笔记 ${file31.length}` ? [] : [`左栏计数应与文件自洽：${tabLabel31} vs ${file31.length}`]),
+    ],
+  );
+
+  // --- 31b 重复保存（先等反馈过期再点，反馈期按钮被 v-if 移除）------------------
+  log("31b 重复保存：去重命中、零写入");
+  await waitFeedbackGone();
+  const hash31b = notesHash();
+  const callsBase31b = (await notesAddCalls()).count;
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  await clickLast(".answer-save-btn");
+  await waitFor("去重反馈", `document.querySelector('.answer-note-feedback[data-state="duplicate"]')`);
+  const feedback31b = await feedbackOfLast();
+  const calls31b = (await notesAddCalls()).count;
+  await capturePage(win, "31b-answer-save-duplicate.png");
+  record(
+    "answer-feedback",
+    {
+      phase: "duplicate",
+      state: feedback31b ? feedback31b.state : null,
+      text: feedback31b ? feedback31b.text : null,
+      callsDelta: calls31b - callsBase31b,
+      bytesUnchanged: notesHash() === hash31b && hash31b === hash31,
+    },
+    [
+      ...(feedback31b && feedback31b.state === "duplicate" && feedback31b.text === "已在笔记中"
+        ? []
+        : [`去重反馈异常：${JSON.stringify(feedback31b)}`]),
+      ...(calls31b - callsBase31b === 1 ? [] : [`重复保存也应只有 1 次 IPC：+${calls31b - callsBase31b}`]),
+      ...(notesHash() === hash31b ? [] : ["重复保存改动了 notes.json 字节"]),
+      ...(hash31b === hash31 ? [] : ["跨 31/31b 的字节基线不一致"]),
+    ],
+  );
+
+  // --- 31b2 在途连点（同一同步段两次点击 → pending 守卫只放一次）----------------
+  log("31b2 在途连点：setNotesAddDelay(600) 造窗口，两次点击只发一次 notesAdd");
+  const TURN2_TEXT = "换一篇文档再问一次";
+  await waitFeedbackGone();
+  await typeAndSend(TURN2_TEXT);
+  await runTurn(TURN2_TEXT, "第二轮回答");
+  await waitFor("第二轮回答块", `document.querySelectorAll(".agent-message").length >= 2`);
+  await sleep(200);
+  const callsBase31b2 = (await notesAddCalls()).count;
+  await js("window.__pixStub.setNotesAddDelay(600), true");
+  await js(`(() => {
+    const nodes = document.querySelectorAll(".answer-save-btn");
+    const target = nodes[nodes.length - 1];
+    target.click();
+    target.click();
+    return true;
+  })()`);
+  await waitFor("在途反馈", `document.querySelector(".answer-note-feedback")`);
+  await js("window.__pixStub.setNotesAddDelay(0), true");
+  const calls31b2 = await notesAddCalls();
+  const payload31b2 = calls31b2.payloads.slice(-1)[0];
+  const file31b2 = readNotes();
+  record(
+    "answer-save",
+    {
+      phase: "reentrant",
+      delta: calls31b2.count - callsBase31b2,
+      payloads: calls31b2.payloads.slice(-2),
+      inFile: file31b2.some((note) => note.docPath === "archive/older-paper.pdf" && note.page === 1 && note.text === "第二轮回答"),
+    },
+    [
+      ...(calls31b2.count - callsBase31b2 === 1 ? [] : [`在途连点应只发 1 次：+${calls31b2.count - callsBase31b2}`]),
+      ...(payload31b2 &&
+      payload31b2.kind === "answer" &&
+      payload31b2.page === 1 &&
+      String(payload31b2.docFilePath).endsWith("older-paper.pdf") &&
+      payload31b2.text === "第二轮回答"
+        ? []
+        : [`payload 异常：${JSON.stringify(payload31b2)}`]),
+      ...(file31b2.some((note) => note.docPath === "archive/older-paper.pdf" && note.page === 1 && note.text === "第二轮回答")
+        ? []
+        : ["fixture 内缺少第二轮的 answer 条目"]),
+    ],
+  );
+
+  // --- 31c 超长拒绝 + 空白回答不渲染按钮 ---------------------------------------
+  log("31c 超长回答：answer 文案逐字、零写入；空白回答不渲染动作");
+  const TURN3_TEXT = "给一段超长的回答";
+  const TURN4_TEXT = "再给一段空白回答";
+  await waitFeedbackGone();
+  await typeAndSend(TURN3_TEXT);
+  await runTurn(TURN3_TEXT, "长".repeat(4001));
+  await waitFor("第三轮回答块", `document.querySelectorAll(".agent-message").length >= 3`);
+  await sleep(200);
+  const title31c = await titleOfLastAnswer();
+  record("answer-save", { phase: "turn-3", title: title31c }, [
+    ...(title31c && title31c.includes("older-paper.pdf") && title31c.includes("第 1 页")
+      ? []
+      : [`本轮锚点应为 older-paper.pdf 第 1 页：${title31c}`]),
+  ]);
+  const hash31c = notesHash();
+  const callsBase31c = (await notesAddCalls()).count;
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  await clickLast(".answer-save-btn");
+  await waitFor("超长反馈", `document.querySelector('.answer-note-feedback[data-state="error"]')`);
+  const feedback31c = await feedbackOfLast();
+  await capturePage(win, "31c-answer-save-too-long.png");
+  record(
+    "answer-feedback",
+    {
+      phase: "too-long",
+      state: feedback31c ? feedback31c.state : null,
+      text: feedback31c ? feedback31c.text : null,
+      calls: (await notesAddCalls()).count - callsBase31c,
+      bytesUnchanged: notesHash() === hash31c,
+    },
+    [
+      ...(feedback31c && feedback31c.text === "保存失败：回答过长（超过 4000 字），无法存为笔记"
+        ? []
+        : [`超长文案异常：${JSON.stringify(feedback31c)}`]),
+      ...(notesHash() === hash31c ? [] : ["超长拒绝不应写盘"]),
+    ],
+  );
+  await waitFeedbackGone();
+  await typeAndSend(TURN4_TEXT);
+  await runTurn(TURN4_TEXT, "   ");
+  await waitFor("第四轮回答块", `document.querySelectorAll(".agent-message").length >= 4`);
+  await sleep(200);
+  const blank = {
+    // 与设计档同名的 saveBtnCount 定位在「最后一个 .agent-message」（前面几轮的按钮仍在，故不用全局计数）
+    saveBtnCount: await js(`(() => {
+      const blocks = document.querySelectorAll(".agent-message");
+      const last = blocks[blocks.length - 1];
+      return last ? last.querySelectorAll(".answer-save-btn").length : -1;
+    })()`),
+    globalSaveBtnCount: await countOf(".answer-save-btn"),
+    lastBlockSaveWrapCount: await js(`(() => {
+      const blocks = document.querySelectorAll(".agent-message");
+      const last = blocks[blocks.length - 1];
+      return last ? last.querySelectorAll(".answer-save-wrap").length : -1;
+    })()`),
+    lastBlockTextTrim: await textOfLastAnswer(),
+  };
+  record("answer-save", { phase: "blank-content", ...blank }, [
+    ...(blank.saveBtnCount === 0 ? [] : [`空白回答不应有保存按钮：${blank.saveBtnCount}`]),
+    ...(blank.lastBlockSaveWrapCount === 0 ? [] : [`空白回答不应渲染动作容器：${blank.lastBlockSaveWrapCount}`]),
+    ...(blank.lastBlockTextTrim === "" ? [] : [`最后一块应为空白：${JSON.stringify(blank.lastBlockTextTrim)}`]),
+  ]);
+
+  // --- 32 徽标与排序 + answer 行的备注/删除/跳回 ---------------------------------
+  log("32 徽标与排序（answer 与 excerpt 同组混排）");
+  await openNotesTab();
+  await waitFor("笔记列表", `document.querySelectorAll(".note-row").length >= 3`);
+  await js(`document.querySelector(".notes-panel").scrollTop = 0, true`);
+  const file32 = readNotes();
+  const badgeProbe = await js(`(() => {
+    const badges = Array.from(document.querySelectorAll(".note-ai-badge"));
+    const groupHead = Array.from(document.querySelectorAll(".notes-group-head")).find((el) =>
+      (el.getAttribute("title") || "").includes("sample-paper.pdf"));
+    const groupRows = groupHead ? Array.from(groupHead.parentElement.querySelectorAll(".note-row")) : [];
+    const page2 = groupRows.filter((row) => {
+      const badge = row.querySelector(".note-page-badge");
+      return !!badge && badge.textContent.replace(/\\s+/g, " ").trim() === "第 2 页";
+    });
+    const textOfRow = (row) => {
+      const el = row.querySelector(".note-text");
+      return el ? el.textContent : null;
+    };
+    return {
+      badgeCount: badges.length,
+      badgeTexts: badges.map((el) => el.textContent.replace(/\\s+/g, " ").trim()),
+      page2Texts: page2.map(textOfRow),
+      page2BadgeCounts: page2.map((row) => row.querySelectorAll(".note-ai-badge").length),
+      excerptRowHasNoBadge: groupRows.some((row) => {
+        const text = textOfRow(row);
+        return !!text && text.includes("attention budget is the binding constraint") && row.querySelectorAll(".note-ai-badge").length === 0;
+      }),
+      headOverflow: groupRows.map((row) => {
+        const head = row.querySelector(".note-head");
+        return head ? head.scrollWidth <= head.clientWidth : null;
+      }),
+    };
+  })()`);
+  const fileAnswerCount = file32.filter((note) => note.kind === "answer").length;
+  const page2Texts = badgeProbe ? badgeProbe.page2Texts : [];
+  const page2Ids = page2Texts.map((text) => {
+    const hit = file32.find((note) => note.text === text);
+    return hit ? hit.id : null;
+  });
+  const excerptIndex = page2Ids.indexOf("n-current-2");
+  const answerIndex = page2Ids.indexOf("n-current-3");
+  await capturePage(win, "32-answer-note-badge.png");
+  const leftRect = await rectOfSelector(".layout-left", 2);
+  if (leftRect) await capturePage(win, "32b-answer-note-badge-left-pane.png", leftRect);
+  record(
+    "answer-notes-list",
+    {
+      phase: "badges",
+      badgeCount: badgeProbe ? badgeProbe.badgeCount : null,
+      fileAnswerCount,
+      badgeTexts: badgeProbe ? badgeProbe.badgeTexts : null,
+      page2Ids,
+      page2BadgeCounts: badgeProbe ? badgeProbe.page2BadgeCounts : null,
+      excerptRowHasNoBadge: badgeProbe ? badgeProbe.excerptRowHasNoBadge : null,
+      headOverflow: badgeProbe ? badgeProbe.headOverflow : null,
+    },
+    [
+      ...(badgeProbe && badgeProbe.badgeCount === fileAnswerCount
+        ? []
+        : [`徽标数应等于文件内 answer 条数：${badgeProbe ? badgeProbe.badgeCount : null} vs ${fileAnswerCount}`]),
+      ...(badgeProbe && badgeProbe.badgeTexts.every((text) => text === "AI") ? [] : ["徽标文本应为 AI"]),
+      ...(excerptIndex >= 0 && answerIndex >= 0 && excerptIndex < answerIndex
+        ? []
+        : [`同页顺序异常（excerpt 应在 answer 之前）：${JSON.stringify(page2Ids)}`]),
+      ...(badgeProbe && badgeProbe.excerptRowHasNoBadge ? [] : ["excerpt 行不应有 AI 徽标"]),
+      ...(badgeProbe && badgeProbe.headOverflow.every((value) => value === true) ? [] : ["answer 行头部横向溢出"]),
+    ],
+  );
+
+  const rowFinder = (needle, exact) => `Array.from(document.querySelectorAll(".note-row")).find((row) => {
+    const el = row.querySelector(".note-text");
+    if (!el) return false;
+    return ${exact ? `el.textContent.trim() === ${JSON.stringify(needle)}` : `el.textContent.includes(${JSON.stringify(needle)})`};
+  })`;
+
+  // (a) 备注：等价断言的另一半是 fixture 文件的 comment 字段
+  await js(`(() => {
+    const row = ${rowFinder(ROW_FROM_31, false)};
+    if (!row) throw new Error("31 写入的 answer 行未找到");
+    const trigger = row.querySelector(".comment-trigger");
+    if (!trigger) throw new Error("备注入口未找到");
+    trigger.click();
+    return true;
+  })()`);
+  await waitFor("备注编辑态", `document.querySelector(".note-comment textarea")`);
+  await js(`(() => {
+    const area = document.querySelector(".note-comment textarea");
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    setter.call(area, "由回答入库");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  await js(`(() => {
+    const actions = Array.from(document.querySelectorAll(".comment-actions .v-btn"));
+    const save = actions.find((el) => (el.textContent || "").includes("保存"));
+    if (!save) throw new Error("备注保存按钮未找到");
+    save.click();
+    return true;
+  })()`);
+  await waitFor("备注回显", `(() => {
+    const row = ${rowFinder(ROW_FROM_31, false)};
+    const text = row ? row.querySelector(".comment-text") : null;
+    return !!text && text.textContent.trim() === "由回答入库";
+  })()`);
+  const comment31 = readNotes().filter((note) => note.kind === "answer" && note.text.includes(ROW_FROM_31)).slice(-1)[0];
+  record(
+    "answer-note-row",
+    { phase: "comment", domComment: "由回答入库", fileComment: comment31 ? comment31.comment : null },
+    [...(comment31 && comment31.comment === "由回答入库" ? [] : [`fixture 内的备注未写入：${comment31 ? comment31.comment : null}`])],
+  );
+
+  // (b) 删除二次确认
+  const rowsBefore32 = await countOf(".note-row");
+  const fileBefore32 = readNotes().length;
+  await js(`(() => {
+    const row = ${rowFinder("第二轮回答", true)};
+    if (!row) throw new Error("31b2 写入的 answer 行未找到");
+    row.querySelector(".note-delete").click();
+    return true;
+  })()`);
+  await waitFor("删除二次确认", `(() => {
+    const row = ${rowFinder("第二轮回答", true)};
+    return !!row && row.classList.contains("confirming");
+  })()`);
+  await js(`(() => {
+    const row = ${rowFinder("第二轮回答", true)};
+    if (!row) throw new Error("确认行已消失");
+    row.querySelector(".note-delete").click();
+    return true;
+  })()`);
+  await waitFor("删除完成", `(() => {
+    const row = ${rowFinder("第二轮回答", true)};
+    return !row && document.querySelectorAll(".note-ai-badge").length === ${file32.filter((note) => note.kind === "answer").length - 1};
+  })()`);
+  const deleteState = {
+    confirming: true,
+    rowsDelta: (await countOf(".note-row")) - rowsBefore32,
+    fileDelta: readNotes().length - fileBefore32,
+    badgeCountEqFile: (await countOf(".note-ai-badge")) === readNotes().filter((note) => note.kind === "answer").length,
+  };
+  record("answer-note-row", { phase: "delete-confirm", ...deleteState }, [
+    ...(deleteState.rowsDelta === -1 ? [] : [`删除后行数应 -1：${deleteState.rowsDelta}`]),
+    ...(deleteState.fileDelta === -1 ? [] : [`删除后文件条数应 -1：${deleteState.fileDelta}`]),
+    ...(deleteState.badgeCountEqFile ? [] : ["删除后徽标数应与文件自洽"]),
+  ]);
+
+  // (c) 跳回原文（跳转后停在 sample-paper.pdf 第 2 页）
+  await js(`(() => {
+    const row = ${rowFinder(ROW_FROM_31, false)};
+    if (!row) throw new Error("跳回行的定位失败");
+    row.click();
+    return true;
+  })()`);
+  await waitPdfLoaded();
+  await waitPage(2, 3);
+  const jump32 = { pageLabel: await pageLabel() };
+  record("answer-note-row", { phase: "jump", ...jump32 }, [
+    ...(jump32.pageLabel === "第 2 / 3 页" ? [] : [`跳回原文页异常：${jump32.pageLabel}`]),
+  ]);
+
+  // --- 33 情形 (b)：历史消息无锚点 → 按当前阅读位置 -----------------------------
+  log("33 情形 (b)：历史会话 + 当前阅读位置回退");
+  await js(
+    `window.__pixStub.setMessages(${JSON.stringify([
+      { role: "user", content: "这篇论文的结论是什么？", timestamp: Date.now() - 60000 },
+      { role: "assistant", content: [{ type: "text", text: "结论：稀疏注意力在 1/3 预算下保持召回。" }], timestamp: Date.now() - 50000 },
+    ])}), true`,
+  );
+  await goHome();
+  clearStateA();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(4);
+  await waitFor("历史回答块", `document.querySelector(".agent-message")`);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await clickNext();
+  await waitPage(2, 3);
+  await clickNext();
+  await waitPage(3, 3);
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  const title33 = await titleOfLastAnswer();
+  const callsBase33 = (await notesAddCalls()).count;
+  await clickLast(".answer-save-btn");
+  await waitFor("回退保存反馈", `document.querySelector('.answer-note-feedback[data-state="ok"]')`);
+  await capturePage(win, "33-answer-history-fallback.png");
+  const calls33 = await notesAddCalls();
+  const payload33 = calls33.payloads.slice(-1)[0];
+  const inFile33 = readNotes().some((note) => note.docPath === "sample-paper.pdf" && note.page === 3 && note.kind === "answer");
+  record("answer-save", { phase: "fallback", title: title33 }, [
+    ...(title33 && title33.includes("（按当前阅读位置）") && title33.includes("sample-paper.pdf") && title33.includes("第 3 页")
+      ? []
+      : [`回退提示异常：${title33}`]),
+  ]);
+  record(
+    "answer-anchor",
+    { phase: "fallback-payload", delta: calls33.count - callsBase33, lastPayload: payload33, inFile: inFile33 },
+    [
+      ...(payload33 && payload33.page === 3 ? [] : [`回退目标页码异常：${JSON.stringify(payload33)}`]),
+      ...(inFile33 ? [] : ["fixture 内缺少第 3 页的 answer 条目"]),
+    ],
+  );
+
+  // --- 34 情形 (c)：无锚点且未打开文档 → 禁用 -----------------------------------
+  log("34 情形 (c)：无锚点 + 无打开文档 → 按钮禁用，点击不产生 IPC");
+  await goHome();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitFor("历史回答块", `document.querySelector(".agent-message")`);
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  const disabled34 = await js(`(() => {
+    const blocks = Array.from(document.querySelectorAll(".agent-message"));
+    const block = blocks[blocks.length - 1];
+    const btn = block ? block.querySelector(".answer-save-btn") : null;
+    const wrap = block ? block.querySelector(".answer-save-wrap") : null;
+    return { disabled: btn ? btn.disabled : null, title: wrap ? wrap.getAttribute("title") : null };
+  })()`);
+  const callsBase34 = (await notesAddCalls()).count;
+  await js(`document.querySelector(".answer-save-btn").click(), true`);
+  await sleep(300);
+  await capturePage(win, "34-answer-save-disabled.png");
+  record(
+    "answer-save",
+    { phase: "disabled", ...disabled34, deltaAfterClick: (await notesAddCalls()).count - callsBase34 },
+    [
+      ...(disabled34.disabled === true ? [] : ["无目标时按钮应禁用"]),
+      ...(disabled34.title && disabled34.title.includes("无法存为笔记") && disabled34.title.includes("当前没有打开文档")
+        ? []
+        : [`不可用提示异常：${disabled34.title}`]),
+      ...((await notesAddCalls()).count - callsBase34 === 0 ? [] : ["禁用按钮点击不应产生 IPC"]),
+    ],
+  );
+
+  // --- 35 锚点不跨轮：确认不匹配 → 无锚点（不许回溯上一轮）----------------------
+  log("35 锚点不跨轮：确认不匹配 ⇒ 回答块显示「按当前阅读位置」的第 2 页");
+  await js("window.__pixStub.setMessages([]), true");
+  await goHome();
+  clearStateA();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(4);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const userBase35 = await userBlocks();
+  const TURN35A = "第一次提问";
+  const TURN35B = "第二次提问";
+  await typeAndSend(TURN35A);
+  await runTurn(TURN35A, "第一轮回答");
+  await sleep(200);
+  // 第二轮故意让确认文本与乐观文本不同 ⇒ 追加一条无锚点用户块
+  const confirmed35B = `<reading_context>\npath: ${join(LIBRARY_DIR, "sample-paper.pdf")}\npage: 1\npageCount: 3\n</reading_context>\n\n${TURN35B}`;
+  await typeAndSend(TURN35B);
+  await runTurn(TURN35B, "第二轮回答", confirmed35B);
+  await sleep(200);
+  await clickNext();
+  await waitPage(2, 3);
+  await sleep(200);
+  const title35 = await titleOfLastAnswer();
+  const users35 = await userBlocks();
+  await capturePage(win, "35-answer-anchor-strict.png");
+  record("answer-save", { phase: "strict", title: title35, base: userBase35, userBlocks: users35 }, [
+    ...(title35 && title35.includes("（按当前阅读位置）") && title35.includes("第 2 页")
+      ? []
+      : [`应回退到当前阅读位置：${title35}`]),
+    ...(title35 && !title35.includes("第 1 页") ? [] : [`不应回落到上一轮锚点：${title35}`]),
+    ...(users35 === userBase35 + 3 ? [] : [`用户块应为基线 + 3：${userBase35} → ${users35}`]),
+  ]);
+
+  // --- 36 失败注入（三种 error state）+ 锚点文档已删除仍成功 --------------------
+  log("36 失败注入：outside / corrupt / throw 三态与原位回位");
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  const target36 = await titleOfLastAnswer();
+  if (!(target36 && target36.includes("（按当前阅读位置）") && target36.includes("第 2 页"))) {
+    throw new Error(`36 的靶子不是 35 的第二轮回答块（无锚点 + 第 2 页）：${target36}`);
+  }
+  const hash36 = notesHash();
+  const callsBase36 = (await notesAddCalls()).count;
+  await js('window.__pixStub.setNotesAddFailure("outside"), true');
+  await clickLast(".answer-save-btn");
+  await waitFor("outside 反馈", `document.querySelector('.answer-note-feedback[data-state="error"]')`);
+  const outside36 = await feedbackOfLast();
+  await capturePage(win, "36-answer-save-failure.png");
+  record(
+    "answer-feedback",
+    {
+      phase: "outside",
+      state: outside36 ? outside36.state : null,
+      text: outside36 ? outside36.text : null,
+      callsDelta: (await notesAddCalls()).count - callsBase36,
+      bytesUnchanged: notesHash() === hash36,
+    },
+    [
+      ...(outside36 && outside36.text === "保存失败：该文档不在当前资料库内"
+        ? []
+        : [`outside 反馈异常：${JSON.stringify(outside36)}`]),
+      ...(notesHash() === hash36 ? [] : ["outside 不应写盘"]),
+      ...((await notesAddCalls()).count - callsBase36 === 1 ? [] : ["outside 应恰好 1 次 IPC"]),
+    ],
+  );
+  await waitFeedbackGone();
+  await js('window.__pixStub.setNotesAddFailure("corrupt"), true');
+  await clickLast(".answer-save-btn");
+  await waitFor("corrupt 反馈", `document.querySelector('.answer-note-feedback[data-state="error"]')`);
+  const corrupt36 = await feedbackOfLast();
+  record("answer-feedback", { phase: "corrupt", state: corrupt36 ? corrupt36.state : null, text: corrupt36 ? corrupt36.text : null }, [
+    ...(corrupt36 && corrupt36.text === "保存失败：笔记文件无法读取（文件已损坏，未被修改）"
+      ? []
+      : [`corrupt 反馈异常：${JSON.stringify(corrupt36)}`]),
+  ]);
+  await waitFeedbackGone();
+  await js('window.__pixStub.setNotesAddFailure("throw"), true');
+  await clickLast(".answer-save-btn");
+  await waitFor("throw 反馈", `document.querySelector('.answer-note-feedback[data-state="error"]')`);
+  const throw36 = await feedbackOfLast();
+  record("answer-feedback", { phase: "throw", state: throw36 ? throw36.state : null, text: throw36 ? throw36.text : null }, [
+    ...(throw36 && throw36.text && throw36.text.startsWith("保存失败：主进程调用异常：")
+      ? []
+      : [`throw 反馈异常：${JSON.stringify(throw36)}`]),
+  ]);
+  await waitFeedbackGone();
+  await js("window.__pixStub.setNotesAddFailure(null), true");
+  await clickLast(".answer-save-btn");
+  await waitFor("恢复后的成功反馈", `document.querySelector('.answer-note-feedback[data-state="ok"]')`);
+  const recovered36 = await feedbackOfLast();
+  record("answer-feedback", { phase: "recovered", state: recovered36 ? recovered36.state : null, text: recovered36 ? recovered36.text : null }, [
+    ...(recovered36 && recovered36.text && recovered36.text.includes("已存为笔记") ? [] : ["失败后按钮应回到可点"]) ,
+  ]);
+  // 末段：锚点文档已被删除但仍在资料库路径内 ⇒ 保存成功（§5 第 3 行；该文件最后一次使用）
+  await waitFeedbackGone();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await typeAndSend("第三次提问");
+  await runTurn("第三次提问", "第三轮回答");
+  await waitFor("第三轮回答块", `document.querySelectorAll(".agent-message").length >= 3`);
+  await sleep(200);
+  rmSync(join(LIBRARY_DIR, "archive", "older-paper.pdf"), { force: true });
+  await moveMouse(".agent-message", -1, ".answer-save-wrap");
+  await clickLast(".answer-save-btn");
+  await waitFor("删除文档后的成功反馈", `document.querySelector('.answer-note-feedback[data-state="ok"]')`);
+  const deletedDoc36 = await feedbackOfLast();
+  const inFile36 = readNotes().some((note) => note.docPath === "archive/older-paper.pdf" && note.page === 1 && note.text === "第三轮回答");
+  record(
+    "answer-feedback",
+    { phase: "deleted-doc", state: deletedDoc36 ? deletedDoc36.state : null, text: deletedDoc36 ? deletedDoc36.text : null, inFile: inFile36 },
+    [
+      ...(deletedDoc36 && deletedDoc36.text && deletedDoc36.text.includes("已存为笔记") ? [] : ["文件被删除不影响入库（前缀归属校验）"]),
+      ...(inFile36 ? [] : ["fixture 内缺少第三轮的 answer 条目"]),
+    ],
+  );
 }
 
 // ---------------------------------------------------------------------------

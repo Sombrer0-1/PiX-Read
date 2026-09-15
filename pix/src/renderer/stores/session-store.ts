@@ -12,6 +12,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { AgentMessage, AgentSessionEvent } from "@/types/rpc";
 import type { ChatMessageAttachment, DisplayBlock, ToolWorkItem } from "@/types/session";
+import type { ReadingAnchor } from "@shared/types";
 
 function nextBlockId(): string {
   return `block_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -243,7 +244,15 @@ export const useSessionStore = defineStore("session", () => {
     }
   }
 
-  function appendOptimisticUserMessage(text: string, filePaths: string[] = []): string | null {
+  /**
+   * 第三参：本轮发送时刻的阅读位置快照；null = 无锚点（不写该字段）。
+   * 锚点是值拷贝、不落任何文件，随块被 clearSession / 裁剪 / 发送失败一起消失。
+   */
+  function appendOptimisticUserMessage(
+    text: string,
+    filePaths: string[] = [],
+    anchor: ReadingAnchor | null = null,
+  ): string | null {
     const attachments = filePaths.map(attachmentFromPath);
     if (!text.trim() && attachments.length === 0) return null;
 
@@ -256,6 +265,7 @@ export const useSessionStore = defineStore("session", () => {
       text: text.trim(),
       attachments,
       timestamp,
+      ...(anchor ? { readingAnchor: anchor } : {}),
     };
     displayBlocks.value.push(block);
     optimisticUserMessages.push({
@@ -265,6 +275,23 @@ export const useSessionStore = defineStore("session", () => {
       separatorId,
     });
     return block.id;
+  }
+
+  /**
+   * 回答块的轮次锚点（唯一读取处）：向前跳过非 user-message 块，遇第一个 user-message 即终止
+   * —— 它有锚点就返回，没有就返回 null。绝不回溯到更早一个带锚点的用户块（那会把上一轮的
+   * 锚点当成本轮目标）；块被裁剪或本就不在列表里时同样返回 null，不抛错。
+   */
+  function readingAnchorFor(blockId: string): ReadingAnchor | null {
+    const blocks = displayBlocks.value;
+    const index = blocks.findIndex((block) => block.id === blockId);
+    if (index < 0) return null;
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const block = blocks[i];
+      if (block.type !== "user-message") continue;
+      return block.readingAnchor ?? null;
+    }
+    return null;
   }
 
   function failOptimisticUserMessage(blockId: string | null, message: string): void {
@@ -732,6 +759,7 @@ export const useSessionStore = defineStore("session", () => {
     addEvent,
     addEvents,
     appendOptimisticUserMessage,
+    readingAnchorFor,
     failOptimisticUserMessage,
     appendError,
     appendGuide,

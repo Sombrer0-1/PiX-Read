@@ -11,6 +11,7 @@ import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { registerQuickAskConsumer } from "../../composables/useQuickAsk";
 import { registerRegionCaptureConsumer } from "../../composables/useRegionCapture";
+import { useNotesStore } from "../../stores/notes-store";
 import { useReaderStore } from "../../stores/reader-store";
 import { useSessionStore } from "../../stores/session-store";
 import { buildReadingUserMessage } from "../../utils/reading-context";
@@ -18,6 +19,7 @@ import { renderMarkdown } from "../../utils/markdown";
 import { preparePastedImage } from "../../utils/image-capture";
 import type { RequestUserInputRequest } from "@/types/rpc";
 import type { DisplayBlock, SessionInfo } from "@/types/session";
+import type { ReadingAnchor } from "@shared/types";
 import { deriveSessionTitle, formatSessionTime } from "../../utils/session-title";
 import MessageBlock from "../session/MessageBlock.vue";
 import ToolExecutionBlock from "../session/ToolExecutionBlock.vue";
@@ -44,6 +46,7 @@ const emit = defineEmits<{
 
 const rpc = useRpc();
 const sessionStore = useSessionStore();
+const notesStore = useNotesStore();
 const readerStore = useReaderStore();
 const router = useRouter();
 
@@ -289,8 +292,22 @@ async function send(): Promise<void> {
   if ((!text && attachments.value.length === 0 && clipboardImages.value.length === 0) || clarifying.value) return;
   // Snapshot for this send; resetExcludedContexts() swaps in a new Set below.
   const excluded = excludedContexts.value;
+  // --- 本轮唯一快照：filePath/page 各只读一次，既作锚点又作 <reading_context> 的实参 ---
+  // 锚点登记不受 chip 排除分支约束：排除只影响「注入什么」，不影响「发送时读了哪一篇哪一页」。
+  // 锚点与实参共用同一份快照对象：快照里 filePath / page 两个字段各只赋值一次（判定口径见设计档 §7.5 no.2）。
+  const readFilePath = readerStore.filePath;
+  const readPage = readerStore.page;
+  const readContext = {
+    filePath: readFilePath,
+    page: readPage,
+    pageCount: readerStore.pageCount,
+    selectedText: excluded.has("selection") ? "" : readerStore.selectedText,
+  };
+  const anchor: ReadingAnchor | null = readContext.filePath
+    ? { docFilePath: readContext.filePath, page: readContext.page }
+    : null;
   const filePaths = attachments.value.map((a) => a.path);
-  optimisticBlockId.value = sessionStore.appendOptimisticUserMessage(text, filePaths);
+  optimisticBlockId.value = sessionStore.appendOptimisticUserMessage(text, filePaths, anchor);
   draft.value = "";
   attachments.value = [];
   const pastedImages = clipboardImages.value;
@@ -300,14 +317,7 @@ async function send(): Promise<void> {
     const sendImages = pastedImages.length > 0 ? pastedImages : undefined;
     // Excluding the document chip sends the raw text; excluding the selection
     // chip keeps the document context but drops selectedText.
-    const message = excluded.has("document")
-      ? text
-      : buildReadingUserMessage(text, {
-          filePath: readerStore.filePath,
-          page: readerStore.page,
-          pageCount: readerStore.pageCount,
-          selectedText: excluded.has("selection") ? "" : readerStore.selectedText,
-        });
+    const message = excluded.has("document") ? text : buildReadingUserMessage(text, readContext);
     // `message` carries the injected <reading_context>; the bubble shows `text`.
     // While the agent is running, Enter queues a steer instead of a duplicate prompt.
     if (isStreaming.value) {
@@ -399,6 +409,105 @@ async function copyAgentMessage(block: Extract<DisplayBlock, { type: "agent-mess
     copiedMessageId.value = null;
     messageCopyTimer = null;
   }, COPY_FEEDBACK_MS);
+}
+
+// --- Message action: 存为笔记（入库原文 markdown + 该轮锚点） ---
+
+const ANSWER_FEEDBACK_MS = 2500;
+
+/** 三态原位反馈（不弹对话框）；键 = 回答块 id。 */
+type AnswerSaveState = "ok" | "duplicate" | "error";
+
+interface AnswerSaveFeedback {
+  state: AnswerSaveState;
+  text: string;
+}
+
+/** 三分支目标：锚点原值 > 点击时刻的当前阅读位置 > 不可用。 */
+interface AnswerSaveTarget {
+  docFilePath: string;
+  page: number;
+  fromAnchor: boolean;
+}
+
+const answerFeedback = ref<Record<string, AnswerSaveFeedback>>({});
+/** 键 = 回答块 id；IPC 在途守卫（同一同步段内连点只发一次）。 */
+const answerSavePending = ref<ReadonlySet<string>>(new Set());
+const answerFeedbackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** 反馈文案里的文件名取法：最后一个分隔符之后（与 documentChip 同口径）。 */
+function answerDocName(filePath: string): string {
+  return filePath.split(/[/\\]/).pop() || filePath;
+}
+
+function answerSaveTarget(block: Extract<DisplayBlock, { type: "agent-message" }>): AnswerSaveTarget | null {
+  const anchor = sessionStore.readingAnchorFor(block.id);
+  if (anchor) return { docFilePath: anchor.docFilePath, page: anchor.page, fromAnchor: true };
+  const filePath = readerStore.filePath;
+  if (filePath) return { docFilePath: filePath, page: readerStore.page, fromAnchor: false };
+  return null;
+}
+
+function answerSaveTitle(block: Extract<DisplayBlock, { type: "agent-message" }>): string {
+  const target = answerSaveTarget(block);
+  if (!target) return "无法存为笔记：这条回答没有发送时的文档锚点，且当前没有打开文档";
+  const location = `存为笔记 · ${answerDocName(target.docFilePath)} 第 ${target.page} 页`;
+  return target.fromAnchor ? location : `${location}（按当前阅读位置）`;
+}
+
+/** 空白回答不渲染动作；流式中的半截回答也不入库（判定用块自身的 isStreaming）。 */
+function canShowAnswerSave(block: Extract<DisplayBlock, { type: "agent-message" }>): boolean {
+  return block.content.trim() !== "" && !block.isStreaming;
+}
+
+function answerSaveDisabled(block: Extract<DisplayBlock, { type: "agent-message" }>): boolean {
+  return answerSaveTarget(block) === null || answerSavePending.value.has(block.id);
+}
+
+function showAnswerFeedback(blockId: string, state: AnswerSaveState, text: string): void {
+  const timer = answerFeedbackTimers.get(blockId);
+  if (timer) clearTimeout(timer);
+  answerFeedback.value = { ...answerFeedback.value, [blockId]: { state, text } };
+  answerFeedbackTimers.set(
+    blockId,
+    setTimeout(() => {
+      answerFeedbackTimers.delete(blockId);
+      const next = { ...answerFeedback.value };
+      delete next[blockId];
+      answerFeedback.value = next;
+    }, ANSWER_FEEDBACK_MS),
+  );
+}
+
+async function saveAnswerNote(block: Extract<DisplayBlock, { type: "agent-message" }>): Promise<void> {
+  // 守卫必须在首个同步段内先判后置：反馈期不渲染按钮，这里只拦 IPC 在途窗口
+  if (answerSavePending.value.has(block.id)) return;
+  const target = answerSaveTarget(block);
+  if (!target) return;
+  const pending = new Set(answerSavePending.value);
+  pending.add(block.id);
+  answerSavePending.value = pending;
+  try {
+    const result = await notesStore.addNote({
+      kind: "answer",
+      docFilePath: target.docFilePath,
+      page: target.page,
+      text: block.content,
+    });
+    if (!result.ok) {
+      showAnswerFeedback(block.id, "error", `保存失败：${result.message}`);
+      return;
+    }
+    if (result.duplicate) {
+      showAnswerFeedback(block.id, "duplicate", "已在笔记中");
+      return;
+    }
+    showAnswerFeedback(block.id, "ok", `已存为笔记 · ${answerDocName(target.docFilePath)} 第 ${result.page} 页`);
+  } finally {
+    const next = new Set(answerSavePending.value);
+    next.delete(block.id);
+    answerSavePending.value = next;
+  }
 }
 
 // --- Delegated clicks in .chat-messages: code copy + [[pN]] page-jump badges ---
@@ -639,6 +748,8 @@ onUnmounted(() => {
     clearTimeout(messageCopyTimer);
     messageCopyTimer = null;
   }
+  for (const timer of answerFeedbackTimers.values()) clearTimeout(timer);
+  answerFeedbackTimers.clear();
   if (codeCopyTimer) {
     clearTimeout(codeCopyTimer);
     codeCopyTimer = null;
@@ -761,6 +872,26 @@ onUnmounted(() => {
             <v-icon size="14">{{ copiedMessageId === block.id ? "mdi-check" : "mdi-content-copy" }}</v-icon>
             <span v-if="copiedMessageId === block.id">已复制</span>
           </button>
+          <!-- title 挂在容器上：禁用控件在 Chromium 下不派发鼠标事件，提示会拿不到 -->
+          <span
+            v-if="canShowAnswerSave(block)"
+            class="answer-save-wrap"
+            :class="{ 'has-feedback': !!answerFeedback[block.id] }"
+            :title="answerSaveTitle(block)"
+          >
+            <button
+              v-if="!answerFeedback[block.id]"
+              type="button"
+              class="answer-save-btn"
+              :disabled="answerSaveDisabled(block)"
+              @click="saveAnswerNote(block)"
+            >
+              存为笔记
+            </button>
+            <span v-else class="answer-note-feedback" :data-state="answerFeedback[block.id].state">
+              {{ answerFeedback[block.id].text }}
+            </span>
+          </span>
           <!-- eslint-disable-next-line vue/no-v-html — markdown is sanitized by renderMarkdown -->
           <div class="agent-markdown" v-html="renderAgentMarkdown(block)" />
         </div>
@@ -1092,6 +1223,62 @@ onUnmounted(() => {
 
 .message-copy-btn.copied {
   color: var(--pix-accent, #31424f);
+}
+
+/* 复制按钮最宽态（图标 14 + 间距 4 +「已复制」≈33 + 内边距 12 + 边框 2 ≈ 65px）之外；冻结值。 */
+.answer-save-wrap {
+  position: absolute;
+  top: 2px;
+  right: 80px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.agent-message:hover .answer-save-wrap,
+.answer-save-wrap.has-feedback {
+  opacity: 1;
+}
+
+.answer-save-btn {
+  padding: 2px 6px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 6px;
+  background: var(--pix-bg-elevated, #ffffff);
+  color: var(--pix-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.answer-save-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.answer-note-feedback {
+  padding: 2px 6px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 6px;
+  background: var(--pix-bg-elevated, #ffffff);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.answer-note-feedback[data-state="ok"] {
+  color: var(--pix-success, #3f855f);
+}
+
+.answer-note-feedback[data-state="duplicate"] {
+  color: var(--pix-text-secondary, #52606d);
+}
+
+.answer-note-feedback[data-state="error"] {
+  color: var(--pix-error, #b75a55);
 }
 
 .agent-markdown {

@@ -318,6 +318,7 @@ onBeforeUnmount(() => {
         >
           <div class="note-head">
             <span class="note-page-badge">第 {{ note.page }} 页</span>
+            <span v-if="note.kind === 'answer'" class="note-ai-badge">AI</span>
             <span class="note-time">{{ relativeTime(note.createdAt) }}</span>
             <button
               type="button"
@@ -677,6 +678,23 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* AI 结论的区分标记：只区分来源，不改变排序/筛选/计数口径。 */
+.note-ai-badge {
+  flex-shrink: 0;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--pix-accent, #31424f);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+.note-row.confirming .note-ai-badge {
+  background: var(--pix-error, #b75a55);
 }
 
 .note-delete {

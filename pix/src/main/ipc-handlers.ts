@@ -231,6 +231,7 @@ function isNoteDraft(value: unknown): value is ReaderNoteDraft {
   if (!value || typeof value !== "object") return false;
   const draft = value as Record<string, unknown>;
   return (
+    (draft.kind === "excerpt" || draft.kind === "answer") &&
     typeof draft.docFilePath === "string" &&
     draft.docFilePath.length > 0 &&
     typeof draft.page === "number" &&

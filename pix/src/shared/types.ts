@@ -260,7 +260,8 @@ export interface TurnDiffSummary extends DiffSummary {
 }
 
 export type DisplayBlock =
-  | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number }
+  | { id: string; type: "user-message"; text: string; attachments?: ChatMessageAttachment[]; timestamp: number;
+      readingAnchor?: ReadingAnchor }   // 新增可选；「缺省」即该轮没有锚点
   | { id: string; type: "agent-message"; content: string; isStreaming: boolean; timestamp: number }
   | { id: string; type: "thinking"; timestamp: number }
   | { id: string; type: "vision-status"; provider: string; modelId: string; imageCount: number; status: "running" | "success" | "error"; timestamp: number }
@@ -349,8 +350,12 @@ export interface ReaderNote {
   updatedAt: number;
 }
 
-/** Renderer draft: absolute document path, normalized/relativized by the main process. */
+/**
+ * Renderer draft: absolute document path, normalized/relativized by the main process.
+ * kind 必填、无默认值：不做向后兼容层，避免「忘了传」被静默写成长文本摘录。
+ */
 export interface ReaderNoteDraft {
+  kind: ReaderNoteKind;
   docFilePath: string;
   page: number;
   text: string;
@@ -408,6 +413,19 @@ export interface ReaderNotesResetResult {
   backupPath?: string;
   code?: ReaderNotesErrorCode;
   error?: string;
+}
+
+// ============================================================================
+// Reading Anchor (renderer-only: 提问时刻的阅读位置快照)
+// ============================================================================
+
+/**
+ * 提问发送时刻的阅读位置快照。只存在于渲染层内存的 display block 上：
+ * 不落任何文件（会话文件、notes.json、reader-state.json 都不写）。
+ */
+export interface ReadingAnchor {
+  docFilePath: string;   // 绝对路径（与 ReaderNoteDraft.docFilePath 同口径）
+  page: number;          // 1-based
 }
 
 // ============================================================================
