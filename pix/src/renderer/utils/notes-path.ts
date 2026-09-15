@@ -74,3 +74,17 @@ export function groupNotesByDocument(
   // currentKey 为 null 时所有 isCurrentDoc 均为 false，过滤结果为空数组
   return onlyCurrent ? list.filter((group) => group.isCurrentDoc) : list;
 }
+
+/**
+ * 注入顺序（R8 需求 §0.2 / 设计档 §1.2）：docPathKey 升序 → page 升序 → createdAt 升序 → id 升序，
+ * 与面板分组顺序（groupNotesByDocument）无关；排序实现点唯一在此（reading-context 顶层 import）。
+ */
+export function sortNotesForContext(notes: ReaderNote[]): ReaderNote[] {
+  return [...notes].sort(
+    (a, b) =>
+      docPathKey(a.docPath).localeCompare(docPathKey(b.docPath)) ||
+      a.page - b.page ||
+      a.createdAt - b.createdAt ||
+      a.id.localeCompare(b.id)
+  );
+}

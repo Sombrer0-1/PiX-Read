@@ -9,12 +9,12 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
-import { registerQuickAskConsumer } from "../../composables/useQuickAsk";
+import { registerNotesAskConsumer, registerQuickAskConsumer } from "../../composables/useQuickAsk";
 import { registerRegionCaptureConsumer } from "../../composables/useRegionCapture";
 import { useNotesStore } from "../../stores/notes-store";
 import { useReaderStore } from "../../stores/reader-store";
 import { useSessionStore } from "../../stores/session-store";
-import { buildReadingUserMessage } from "../../utils/reading-context";
+import { MAX_CONTEXT_NOTES_CHARS, buildReadingUserMessage, selectNotesForContext } from "../../utils/reading-context";
 import { renderMarkdown } from "../../utils/markdown";
 import { preparePastedImage } from "../../utils/image-capture";
 import type { RequestUserInputRequest } from "@/types/rpc";
@@ -67,12 +67,13 @@ const COMPACTION_REASON_LABELS: Record<string, string> = {
 
 // --- Reading-context chips: what the AI will see for the next send ---
 
-type ContextChipKind = "document" | "selection";
+type ContextChipKind = "document" | "selection" | "notes";
 
 interface ContextChip {
   kind: ContextChipKind;
   icon: string;
   label: string;
+  title?: string;
 }
 
 const SELECTED_TEXT_PREVIEW_MAX = 24;
@@ -107,8 +108,33 @@ const selectionChip = computed<ContextChip | null>(() => {
   return { kind: "selection", icon: "mdi-text-selection", label: `选中文本：${preview}` };
 });
 
+/** 本次发送是否会输出 <reading_context>：文档 chip 被排除时 buildReadingUserMessage 早退。 */
+const readingContextWillSend = computed(
+  () => documentChip.value !== null && !excludedContexts.value.has("document"),
+);
+
+/**
+ * 摘录 chip：与注入载荷同源（selectNotesForContext），可见 ⇔ 本次会输出 reader_notes 段。
+ * N/M/P 全部取选择结果，不在本组件内做排序/裁剪/长度判定。
+ */
+const notesChip = computed<ContextChip | null>(() => {
+  if (!readingContextWillSend.value || notesStore.selectedCount === 0) return null;
+  const picked = selectNotesForContext(notesStore.selectedNotes);
+  const total = picked.injected.length + picked.dropped.length;
+  const dropped = picked.dropped.length;
+  if (dropped === 0) {
+    return { kind: "notes", icon: "mdi-notebook-outline", label: `摘录 ${total} 条`, title: `本次注入 ${picked.injected.length} 条笔记` };
+  }
+  return {
+    kind: "notes",
+    icon: "mdi-notebook-outline",
+    label: `摘录 ${total} 条 · 超出上限未注入 ${dropped} 条`,
+    title: `本次注入 ${picked.injected.length} 条笔记；${dropped} 条因超过 ${MAX_CONTEXT_NOTES_CHARS} 字符上限未注入`,
+  };
+});
+
 const contextChips = computed<ContextChip[]>(() =>
-  [documentChip.value, selectionChip.value].filter(
+  [documentChip.value, selectionChip.value, notesChip.value].filter(
     (chip): chip is ContextChip => chip !== null && !excludedContexts.value.has(chip.kind),
   ),
 );
@@ -274,6 +300,33 @@ function onQuickAsk(): void {
   composerInput.value?.focus();
 }
 
+// --- Notes ask: NotesPanel 的选择条与行内「追问」（useQuickAsk 的第二套 seam） ---
+
+const NOTES_ASK_TEMPLATE = "请结合我选中的摘录回答：";
+const NOTES_ASK_NOTICE_MS = 2500;
+
+const notesAskNotice = ref("");
+let notesAskNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * 两个入口共用的唯一处理函数：选择集与替换语义已由 NotesPanel / store 就位。
+ * 硬要求（R8 设计档 §1.4）：不把笔记原文写进输入框；草稿非空时一个字符都不改。
+ */
+function onNotesAsk(): void {
+  if (draft.value.trim() === "") {
+    draft.value = NOTES_ASK_TEMPLATE;
+    composerInput.value?.focus();
+    return;
+  }
+  composerInput.value?.focus();
+  notesAskNotice.value = `已加入 ${notesStore.selectedCount} 条摘录，草稿已保留`;
+  if (notesAskNoticeTimer) clearTimeout(notesAskNoticeTimer);
+  notesAskNoticeTimer = setTimeout(() => {
+    notesAskNoticeTimer = null;
+    notesAskNotice.value = "";
+  }, NOTES_ASK_NOTICE_MS);
+}
+
 async function pickFiles(): Promise<void> {
   if (!window.pixApi) return;
   const files = await window.pixApi.selectChatFiles();
@@ -297,11 +350,15 @@ async function send(): Promise<void> {
   // 锚点与实参共用同一份快照对象：快照里 filePath / page 两个字段各只赋值一次（判定口径见设计档 §7.5 no.2）。
   const readFilePath = readerStore.filePath;
   const readPage = readerStore.page;
+  // 发送瞬间的笔记选择集快照（派生结果，新数组）；发送在途的清单/选择变化只影响下一回合，不回溯本次载荷
+  // 与「选中文本」同范式：chip 被移除只停用本次注入，不动选择集（设计档 §4 第 3 行）
+  const notesSnapshot = excluded.has("notes") ? [] : [...notesStore.selectedNotes];
   const readContext = {
     filePath: readFilePath,
     page: readPage,
     pageCount: readerStore.pageCount,
     selectedText: excluded.has("selection") ? "" : readerStore.selectedText,
+    notes: notesSnapshot,
   };
   const anchor: ReadingAnchor | null = readContext.filePath
     ? { docFilePath: readContext.filePath, page: readContext.page }
@@ -430,6 +487,15 @@ interface AnswerSaveTarget {
   fromAnchor: boolean;
 }
 
+/** 每帧每块的解析结果（N49-4）：模板与事件处理器共用同一份，不再各自查一次锚点表。 */
+interface AnswerActionView {
+  target: AnswerSaveTarget | null;
+  title: string;
+  disabled: boolean;
+}
+
+const ANSWER_SAVE_UNAVAILABLE_TITLE = "无法存为笔记：这条回答没有发送时的文档锚点，且当前没有打开文档";
+
 const answerFeedback = ref<Record<string, AnswerSaveFeedback>>({});
 /** 键 = 回答块 id；IPC 在途守卫（同一同步段内连点只发一次）。 */
 const answerSavePending = ref<ReadonlySet<string>>(new Set());
@@ -440,28 +506,57 @@ function answerDocName(filePath: string): string {
   return filePath.split(/[/\\]/).pop() || filePath;
 }
 
-function answerSaveTarget(block: Extract<DisplayBlock, { type: "agent-message" }>): AnswerSaveTarget | null {
-  const anchor = sessionStore.readingAnchorFor(block.id);
-  if (anchor) return { docFilePath: anchor.docFilePath, page: anchor.page, fromAnchor: true };
-  const filePath = readerStore.filePath;
-  if (filePath) return { docFilePath: filePath, page: readerStore.page, fromAnchor: false };
-  return null;
-}
-
-function answerSaveTitle(block: Extract<DisplayBlock, { type: "agent-message" }>): string {
-  const target = answerSaveTarget(block);
-  if (!target) return "无法存为笔记：这条回答没有发送时的文档锚点，且当前没有打开文档";
-  const location = `存为笔记 · ${answerDocName(target.docFilePath)} 第 ${target.page} 页`;
-  return target.fromAnchor ? location : `${location}（按当前阅读位置）`;
-}
-
 /** 空白回答不渲染动作；流式中的半截回答也不入库（判定用块自身的 isStreaming）。 */
 function canShowAnswerSave(block: Extract<DisplayBlock, { type: "agent-message" }>): boolean {
   return block.content.trim() !== "" && !block.isStreaming;
 }
 
+function buildAnswerActionView(block: Extract<DisplayBlock, { type: "agent-message" }>): AnswerActionView {
+  const anchor = sessionStore.readingAnchorFor(block.id);
+  const target: AnswerSaveTarget | null = anchor
+    ? { docFilePath: anchor.docFilePath, page: anchor.page, fromAnchor: true }
+    : readerStore.filePath
+      ? { docFilePath: readerStore.filePath, page: readerStore.page, fromAnchor: false }
+      : null;
+  if (!target) return { target: null, title: ANSWER_SAVE_UNAVAILABLE_TITLE, disabled: true };
+  const location = `存为笔记 · ${answerDocName(target.docFilePath)} 第 ${target.page} 页`;
+  return {
+    target,
+    title: target.fromAnchor ? location : `${location}（按当前阅读位置）`,
+    disabled: answerSavePending.value.has(block.id),
+  };
+}
+
+/**
+ * 锚点解析单点（N49-4）：每帧每块至多一次；流式中与空白回答不参与解析。
+ * 模板与事件处理器一律经下面三个访问器取这份视图。
+ */
+const answerActionViews = computed<Record<string, AnswerActionView>>(() => {
+  const views: Record<string, AnswerActionView> = {};
+  for (const block of blocks.value) {
+    if (block.type !== "agent-message" || !canShowAnswerSave(block)) continue;
+    views[block.id] = buildAnswerActionView(block);
+  }
+  return views;
+});
+
+function answerSaveView(block: Extract<DisplayBlock, { type: "agent-message" }>): AnswerActionView | null {
+  return answerActionViews.value[block.id] ?? null;
+}
+
+function answerSaveTitle(block: Extract<DisplayBlock, { type: "agent-message" }>): string {
+  const view = answerSaveView(block);
+  return view ? view.title : ANSWER_SAVE_UNAVAILABLE_TITLE;
+}
+
 function answerSaveDisabled(block: Extract<DisplayBlock, { type: "agent-message" }>): boolean {
-  return answerSaveTarget(block) === null || answerSavePending.value.has(block.id);
+  const view = answerSaveView(block);
+  return view ? view.disabled : true;
+}
+
+function answerSaveTarget(block: Extract<DisplayBlock, { type: "agent-message" }>): AnswerSaveTarget | null {
+  const view = answerSaveView(block);
+  return view ? view.target : null;
 }
 
 function showAnswerFeedback(blockId: string, state: AnswerSaveState, text: string): void {
@@ -720,12 +815,14 @@ onMounted(() => {
   scrollToEnd();
   composerInput.value?.focus();
   registerQuickAskConsumer(onQuickAsk);
+  registerNotesAskConsumer(onNotesAsk);
   registerRegionCaptureConsumer(onRegionCapture);
   messagesEl.value?.addEventListener("click", onMessagesClick);
 });
 
 onUnmounted(() => {
   registerQuickAskConsumer(null);
+  registerNotesAskConsumer(null);
   registerRegionCaptureConsumer(null);
   messagesEl.value?.removeEventListener("click", onMessagesClick);
   if (elapsedTimer) {
@@ -753,6 +850,10 @@ onUnmounted(() => {
   if (codeCopyTimer) {
     clearTimeout(codeCopyTimer);
     codeCopyTimer = null;
+  }
+  if (notesAskNoticeTimer) {
+    clearTimeout(notesAskNoticeTimer);
+    notesAskNoticeTimer = null;
   }
 });
 </script>
@@ -968,12 +1069,14 @@ onUnmounted(() => {
       />
 
       <div v-if="contextChips.length > 0" class="context-row">
-        <span v-for="chip in contextChips" :key="chip.kind" class="context-chip">
+        <span v-for="chip in contextChips" :key="chip.kind" class="context-chip" :title="chip.title">
           <v-icon size="12" class="context-chip-icon">{{ chip.icon }}</v-icon>
           <span class="context-chip-label">{{ chip.label }}</span>
           <button class="context-chip-remove" title="本次发送不使用" @click="excludeContext(chip.kind)">×</button>
         </span>
       </div>
+
+      <div v-if="notesAskNotice" class="notes-ask-notice">{{ notesAskNotice }}</div>
 
       <div v-if="attachments.length > 0 || clipboardImages.length > 0" class="attachment-row">
         <span v-for="(attachment, index) in attachments" :key="attachment.path" class="attachment-chip">
@@ -1489,6 +1592,14 @@ onUnmounted(() => {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 6px;
+}
+
+/* 草稿保护提示行（R8 设计档 §1.5）：位于 .context-row 与 .attachment-row 之间，2500ms 后自行消失 */
+.notes-ask-notice {
+  margin-bottom: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
 }
 
 .context-chip {

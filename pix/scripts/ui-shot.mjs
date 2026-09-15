@@ -249,8 +249,14 @@ let libraryReadDelayMs = 0;
 // 笔记：五个口（load/add/update/delete/reset + seed）共用同一个 fixture 文件，内存数组不再是事实源
 let notesAddDelayMs = 0;
 let notesAddFailure = null;
+let notesDeleteFailure = null;
 const notesAddCalls = [];
+// 发送类命令（prompt/steer）的记录：notes-context / notes-chip 断言的事实源（N50 验收 1）
+const sendCalls = [];
+let sendFailure = null;
 let agentEventHandlers = [];
+// onUserInputRequest 的保留回调（与 onAgentEvent 同形）：emitUserInputRequest 逐个投递
+let userInputHandlers = [];
 let stubMessages = [];
 
 function clone(list) {
@@ -339,6 +345,18 @@ const SESSION_STATS = {
 
 function handleCommand(command) {
   const type = command ? command.type : "";
+  // prompt/steer：记录 + 三种发送结果注入（throw/fail/null 复位），其余命令不受影响
+  if (type === "prompt" || type === "steer") {
+    sendCalls.push({
+      type: type,
+      message: typeof command.message === "string" ? command.message : "",
+      displayText: typeof command.displayText === "string" ? command.displayText : "",
+    });
+    if (sendCalls.length > 8) sendCalls.shift();
+    if (sendFailure === "throw") throw new Error("stub 发送注入异常");
+    if (sendFailure === "fail") return { success: false, error: "stub 发送被拒绝" };
+    return { success: true, data: {} };
+  }
   if (type === "get_state") return { success: true, data: SESSION_STATE };
   if (type === "get_available_models") return { success: true, data: { models: MODELS } };
   if (type === "get_commands") return { success: true, data: { commands: [] } };
@@ -537,7 +555,12 @@ const api = {
   onAgentReady: function () { return function () {}; },
   onAgentExit: function () { return function () {}; },
   onAgentError: function () { return function () {}; },
-  onUserInputRequest: function () { return function () {}; },
+  onUserInputRequest: function (handler) {
+    userInputHandlers.push(handler);
+    return function () {
+      userInputHandlers = userInputHandlers.filter(function (item) { return item !== handler; });
+    };
+  },
 
   listSessions: async function () { return []; },
   deleteSession: async function () { return { success: true }; },
@@ -621,6 +644,16 @@ const api = {
     return { success: true, notes: clone(next) };
   },
   notesDelete: async function (id) {
+    // 失败注入：只影响返回/抛出，不写盘（与 notesAdd 同形）
+    if (notesDeleteFailure === "throw") throw new Error("stub notesDelete 注入异常");
+    if (notesDeleteFailure) {
+      return {
+        success: false,
+        notes: [],
+        code: notesDeleteFailure,
+        error: NOTES_ERRORS[notesDeleteFailure] || notesDeleteFailure,
+      };
+    }
     const next = readNotesFile().filter(function (note) { return note.id !== id; });
     writeNotesFile(next);
     return { success: true, notes: clone(next) };
@@ -690,6 +723,17 @@ contextBridge.exposeInMainWorld("__pixStub", {
     return { count: notesAddCalls.length, payloads: notesAddCalls.slice(-8) };
   },
   setNotesAddFailure: function (code) { notesAddFailure = code || null; },
+  setNotesDeleteFailure: function (code) { notesDeleteFailure = code || null; },
+  sendCalls: function () {
+    return { count: sendCalls.length, payloads: sendCalls.slice(-8) };
+  },
+  clearSendCalls: function () { sendCalls.length = 0; },
+  setSendFailure: function (mode) { sendFailure = mode || null; },
+  emitUserInputRequest: function (request) {
+    userInputHandlers.slice().forEach(function (handler) {
+      handler(request);
+    });
+  },
   setNotesAddDelay: function (ms) { notesAddDelayMs = ms || 0; },
   setMessages: function (list) {
     stubMessages = Array.isArray(list) ? list.map(function (message) { return Object.assign({}, message); }) : [];
@@ -1760,12 +1804,14 @@ async function runReaderStateScenarios(win, log) {
   const clearStateA = () => removeState(STATE_FILE_A);
   const userBlocks = () => countOf(".chat-messages .message-block");
 
-  const titleOfLastAnswer = () => js(`(() => {
+  /** 末尾第 n 个回答块的保存提示（n = 1 即最后一块）；唯一写法，不留第二份定位口径。 */
+  const answerTitleFromEnd = (n) => js(`(() => {
     const blocks = Array.from(document.querySelectorAll(".agent-message"));
-    const block = blocks[blocks.length - 1];
+    const block = blocks.length >= ${n} ? blocks[blocks.length - ${n}] : null;
     const wrap = block ? block.querySelector(".answer-save-wrap") : null;
     return wrap ? wrap.getAttribute("title") : null;
   })()`);
+  const titleOfLastAnswer = () => answerTitleFromEnd(1);
   const textOfLastAnswer = () => js(`(() => {
     const blocks = Array.from(document.querySelectorAll(".agent-message"));
     const block = blocks[blocks.length - 1];
@@ -1904,8 +1950,8 @@ async function runReaderStateScenarios(win, log) {
     return true;
   })()`);
 
-  /** composer 驱动：原生 setter 写值 + 派发 input → 等 .composer-send 可点 → click（不依赖键盘与焦点）。 */
-  const typeAndSend = async (text) => {
+  /** composer 写值原语：原生 setter + 派发 input；typeAndSend 与 sendViaEnter 共用，不留第二份写法。 */
+  const setDraft = async (text) => {
     await js(`(() => {
       const input = document.querySelector(".input-area");
       if (!input) throw new Error("composer input not found");
@@ -1914,8 +1960,19 @@ async function runReaderStateScenarios(win, log) {
       input.dispatchEvent(new Event("input", { bubbles: true }));
       return true;
     })()`);
+  };
+
+  /** composer 驱动：写值 → 等 .composer-send 可点 → click（不依赖键盘与焦点）。 */
+  const typeAndSend = async (text) => {
+    await setDraft(text);
     await waitFor("发送按钮可点", `(() => { const b = document.querySelector(".composer-send"); return !!b && !b.disabled; })()`);
     await js(`document.querySelector(".composer-send").click(), true`);
+  };
+
+  /** 流式中（isStreaming）`.composer-send` 被 `.composer-stop` 替换：steer 路径只能走 Enter。 */
+  const sendViaEnter = async (text) => {
+    await setDraft(text);
+    await js(`document.querySelector(".input-area").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })), true`);
   };
 
   /** 一轮事件序列：确认用户消息 → agent_start → 回答流 → message_end → agent_end。 */
@@ -2608,6 +2665,983 @@ async function runReaderStateScenarios(win, log) {
       ...(inFile36 ? [] : ["fixture 内缺少第三轮的 answer 条目"]),
     ],
   );
+
+  // -------------------------------------------------------------------------
+  // 场景 40–46：笔记作为对话上下文（R8 / N43–N50）
+  //
+  // 挂载位置：本函数末尾（R7 场景 36 之后）。36 末段已 rmSync(archive/older-paper.pdf)
+  // ⇒ 40–46 一律不打开该文件，它只经 seedNotes 出现在笔记清单里（场景 43 的跨文档条目）。
+  // 数据准备一律「seedNotes 写穿 + 切标签触发 loadNotes」，不新增刷新入口；
+  // 每个场景先切标签再选（切标签会按生命周期清空选择集）。
+  // -------------------------------------------------------------------------
+
+  const sendCalls = () => js("window.__pixStub.sendCalls()");
+  const clearSendCalls = () => js("window.__pixStub.clearSendCalls(), true");
+  const setSendFailure = (mode) => js(`window.__pixStub.setSendFailure(${JSON.stringify(mode)}), true`);
+  const setNotesDeleteFailure = (code) => js(`window.__pixStub.setNotesDeleteFailure(${JSON.stringify(code)}), true`);
+  const emitUserInputRequest = (request) =>
+    js(`window.__pixStub.emitUserInputRequest(${JSON.stringify(request)}), true`);
+  const lastSend = async () => (await sendCalls()).payloads.slice(-1)[0] ?? null;
+  /** 最后一个错误块的正文（发送失败两种模式共用）。 */
+  const lastErrorText = () => js(`(() => {
+    const nodes = Array.from(document.querySelectorAll(".error-block .error-message"));
+    const el = nodes[nodes.length - 1];
+    return el ? el.textContent.replace(/\\s+/g, " ").trim() : null;
+  })()`);
+  const waitSendCalls = (count) => waitFor(`sendCalls ≥ ${count}`, `window.__pixStub.sendCalls().count >= ${count}`);
+  const missingLines = (text, needles) => needles.filter((needle) => text.indexOf(needle) < 0);
+
+  /** 行内控件点击：按 .note-text 子串定位行（跨组可用），再点行内选择器。 */
+  const clickInRow = (needle, selector) => js(`(() => {
+    const row = ${rowFinder(needle, false)};
+    if (!row) throw new Error("note row not found: " + ${JSON.stringify(needle)});
+    const target = row.querySelector(${JSON.stringify(selector)});
+    if (!target) throw new Error("row control not found: " + ${JSON.stringify(selector)});
+    target.click();
+    return true;
+  })()`);
+
+  /** 选择条 / 行态 / 两个追问入口的快照（选择器均为设计档 §1.5 冻结值）。 */
+  const selectionSnapshot = () => js(`(() => {
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const bar = document.querySelector(".notes-selection-bar");
+    const header = document.querySelector(".notes-header");
+    const filter = document.querySelector(".notes-filter");
+    const ask = bar ? bar.querySelector(".notes-ask-btn") : null;
+    const askWrap = bar ? bar.querySelector(".notes-ask-btn-wrap") : null;
+    const clear = bar ? bar.querySelector(".notes-selection-clear") : null;
+    const rowAsk = document.querySelector(".note-row .note-ask");
+    const rowAskWrap = document.querySelector(".note-row .note-ask-wrap");
+    const rowSelect = document.querySelector(".note-row .note-select");
+    const rowSelectWrap = document.querySelector(".note-row .note-select-wrap");
+    return {
+      barCount: document.querySelectorAll(".notes-selection-bar").length,
+      countText: text(bar ? bar.querySelector(".notes-selection-count") : null),
+      askText: text(ask),
+      askDisabled: ask ? ask.disabled : null,
+      askWrapTitle: askWrap ? askWrap.getAttribute("title") : null,
+      clearText: text(clear),
+      clearDisabled: clear ? clear.disabled : null,
+      rowAskDisabled: rowAsk ? rowAsk.disabled : null,
+      rowAskWrapTitle: rowAskWrap ? rowAskWrap.getAttribute("title") : null,
+      rowSelectDisabled: rowSelect ? rowSelect.disabled : null,
+      rowSelectWrapTitle: rowSelectWrap ? rowSelectWrap.getAttribute("title") : null,
+      barInHeader: !!bar && !!header && header.contains(bar),
+      barAfterFilter: !!bar && !!filter && (filter.compareDocumentPosition(bar) & 4) === 4,
+      selectedRows: document.querySelectorAll(".note-row.selected").length,
+    };
+  })()`);
+
+  /** chip 行快照：labels / 摘录 chip 的 label 与 title / 首个移除按钮的 title。 */
+  const chipSnapshot = () => js(`(() => {
+    const labelOf = (el) => {
+      const label = el.querySelector(".context-chip-label");
+      return label ? label.textContent.replace(/\\s+/g, " ").trim() : null;
+    };
+    const chips = Array.from(document.querySelectorAll(".context-chip"));
+    const notes = chips.find((el) => {
+      const value = labelOf(el);
+      return !!value && value.indexOf("摘录") === 0;
+    });
+    const remove = chips.length ? chips[0].querySelector(".context-chip-remove") : null;
+    return {
+      count: chips.length,
+      labels: chips.map(labelOf),
+      notesLabel: notes ? labelOf(notes) : null,
+      notesTitle: notes ? notes.getAttribute("title") : null,
+      removeTitle: remove ? remove.getAttribute("title") : null,
+    };
+  })()`);
+
+  /** composer / 选择条计数 / 提示行的联读（追问场景共用）。 */
+  const composerSnapshot = () => js(`(() => {
+    const input = document.querySelector(".input-area");
+    const bar = document.querySelector(".notes-selection-bar");
+    const count = bar ? bar.querySelector(".notes-selection-count") : null;
+    const chip = Array.from(document.querySelectorAll(".context-chip-label")).find((el) => (el.textContent || "").indexOf("摘录") === 0);
+    const notice = document.querySelector(".notes-ask-notice");
+    return {
+      value: input ? input.value : null,
+      activeHasInputArea: document.activeElement === input,
+      countText: count ? count.textContent.replace(/\\s+/g, " ").trim() : null,
+      chip: chip ? chip.textContent.replace(/\\s+/g, " ").trim() : null,
+      hasNotice: !!notice,
+      noticeText: notice ? notice.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+
+  /** 阅读区联读：中间 pill 的文档名与页码徽标（点追问不得跳回原文）。 */
+  const readerSnapshot = () => js(`(() => {
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    return {
+      pillLabel: text(document.querySelector(".center-pill .pill-label")),
+      pageLabel: text(document.querySelector(".page-label")),
+    };
+  })()`);
+
+  /** 条数上限样本：12 条同文档、page 唯一升序 ⇒ 面板行序 = 1..12，第 11 条恒为「容量样本 11」。 */
+  const capSeed = () => {
+    const now = Date.now();
+    return Array.from({ length: 12 }, (_, index) => {
+      const page = index + 1;
+      return {
+        id: "cap-" + page,
+        kind: "excerpt",
+        docPath: "sample-paper.pdf",
+        page: page,
+        text: "容量样本 " + page,
+        comment: "",
+        createdAt: now - (13 - page) * MINUTE,
+      };
+    });
+  };
+
+  /** 字符上限样本：骨架 ≈61 字符/条 ⇒ 2 条 ≤ 8000、3 条 > 8000 ⇒ 恰好丢 1 条。 */
+  const overflowSeed = () => {
+    const now = Date.now();
+    return Array.from({ length: 3 }, (_, index) => {
+      const page = index + 1;
+      return {
+        id: "big-" + page,
+        kind: "excerpt",
+        docPath: "sample-paper.pdf",
+        page: page,
+        text: "摘".repeat(3000),
+        comment: "",
+        createdAt: now - (4 - page) * MINUTE,
+      };
+    });
+  };
+
+  /** 40–46 共用入口序列：清会话与三个失败注入 → 回首页 → 清 A 现场 → 进工作区 → 写种子（停在资料库标签）。 */
+  const enterCleanWorkspace = async (seed) => {
+    await js("window.__pixStub.setMessages([]), true");
+    await setSendFailure(null);
+    await js("window.__pixStub.setNotesAddFailure(null), true");
+    await setNotesDeleteFailure(null);
+    await goHome();
+    await clearStateA();
+    await enterWorkspace(LIBRARY_NAME);
+    await waitTreeRows(4);
+    await js(`window.__pixStub.seedNotes(${JSON.stringify(seed)}), true`);
+  };
+
+  /** 切到笔记标签并等行数就绪（每次切标签都会触发 loadNotes）。 */
+  const openNotesPanel = async (rows) => {
+    await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+    await waitFor("笔记列表就绪", `document.querySelectorAll(".note-row").length === ${rows}`);
+  };
+
+  /** 恢复标准种子（40c / 42b 末段）：写穿 + 切标签切回，行数回到 4。 */
+  const restoreStandardSeed = async () => {
+    await js(`window.__pixStub.seedNotes(${JSON.stringify(seedNotes())}), true`);
+    await js(`document.querySelector('.pill-tab[data-tab="library"]').click(), true`);
+    await openNotesPanel(4);
+  };
+
+  const T42 = "42：这条提问带上摘录。";
+  const T42B = "42b：文档 chip 被移除后发送。";
+  const T42C = "42c：清空选择后发送。";
+  const T42D = "42d：无文档时发送。";
+  const ASK43 = "请对比这两处的结论。";
+  const ASK43_STEER = "43：steer 相位再补一句。";
+  const ASK44 = "44：删除后按剩余选择注入。";
+  const ASK45 = "45：发送注入异常。";
+  const ASK45B = "45b：发送被拒绝。";
+  const ASK45C = "45c：恢复后重发。";
+  const T46A = "46A：第 2 页提问。";
+  const T46B = "46B：第 3 页提问。";
+  const T46C = "46C：失败一轮。";
+  const T46D = "46D：回滚后重发。";
+
+  // --- 40 选择条：点复选框本体与包裹元素各一次（不打开文档） ----------------------
+  log("40 选择条：勾选两条（无文档 ⇒ 无摘录 chip）");
+  await enterCleanWorkspace(seedNotes());
+  await openNotesPanel(4);
+  const base40 = { addCalls: (await notesAddCalls()).count, hash: notesHash() };
+  // must-fix 3 判别：点 .note-select 本体（本体 0 处 @click，靠冒泡命中包裹元素的唯一处理器）
+  await js(`(() => {
+    const input = document.querySelectorAll(".note-row")[0].querySelector(".note-select");
+    if (!input) throw new Error("note-select not found");
+    input.click();
+    return true;
+  })()`);
+  const nativeCheck40 = await js(`(() => {
+    const input = document.querySelectorAll(".note-row")[0].querySelector(".note-select");
+    const bar = document.querySelector(".notes-selection-bar");
+    const count = bar ? bar.querySelector(".notes-selection-count") : null;
+    return {
+      countText: count ? count.textContent.replace(/\\s+/g, " ").trim() : null,
+      checked: input ? input.checked : null,
+    };
+  })()`);
+  await js(`(() => {
+    const wrap = document.querySelectorAll(".note-row")[1].querySelector(".note-select-wrap");
+    if (!wrap) throw new Error("note-select-wrap not found");
+    wrap.click();
+    return true;
+  })()`);
+  const bar40 = await selectionSnapshot();
+  const chips40 = await chipSnapshot();
+  const noWrite40 = {
+    addCallsSame: (await notesAddCalls()).count === base40.addCalls,
+    hashSame: notesHash() === base40.hash,
+  };
+  await capturePage(win, "40-notes-select-bar.png");
+  const leftPane40 = await rectOfSelector(".layout-left", 2);
+  if (leftPane40) await capturePage(win, "40-notes-select-bar-left-pane.png", leftPane40);
+  record(
+    "notes-select",
+    {
+      phase: "bar",
+      nativeCheck: nativeCheck40,
+      countText: bar40.countText,
+      askText: bar40.askText,
+      clearText: bar40.clearText,
+      selectedRows: bar40.selectedRows,
+      chipCount: chips40.count,
+      hasNotesChip: chips40.notesLabel !== null,
+      barInHeader: bar40.barInHeader,
+      barAfterFilter: bar40.barAfterFilter,
+      noWrite: noWrite40,
+    },
+    [
+      ...(nativeCheck40.countText === "已选 1 条" && nativeCheck40.checked === true
+        ? []
+        : [`点复选框本体应恰好选中 1 条：${JSON.stringify(nativeCheck40)}`]),
+      ...(bar40.countText === "已选 2 条" ? [] : [`计数异常：${bar40.countText}`]),
+      ...(bar40.askText === "问 AI" ? [] : [`「问 AI」文案异常：${bar40.askText}`]),
+      ...(bar40.clearText === "清空" ? [] : [`「清空」文案异常：${bar40.clearText}`]),
+      ...(bar40.selectedRows === 2 ? [] : [`选中行数异常：${bar40.selectedRows}`]),
+      ...(chips40.count === 0 ? [] : [`无文档时不应有 chip：${JSON.stringify(chips40.labels)}`]),
+      ...(chips40.notesLabel === null ? [] : [`无文档时不应有摘录 chip：${chips40.notesLabel}`]),
+      ...(bar40.barInHeader ? [] : ["选择条不在 .notes-header 内"]),
+      ...(bar40.barAfterFilter ? [] : ["选择条未渲染在 .notes-filter 之后"]),
+      ...(noWrite40.addCallsSame && noWrite40.hashSame ? [] : ["选择不得写盘"]),
+    ],
+  );
+
+  // --- 40b 清空选择条 ---------------------------------------------------------
+  log("40b 清空：选择条 / 行态 / chip 一起归零");
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+  const cleared40 = await selectionSnapshot();
+  const chips40b = await chipSnapshot();
+  await capturePage(win, "40b-notes-select-clear.png");
+  record(
+    "notes-select",
+    {
+      phase: "cleared",
+      barCount: cleared40.barCount,
+      selectedRows: cleared40.selectedRows,
+      notesChipCount: chips40b.count,
+      noWrite: {
+        addCallsSame: (await notesAddCalls()).count === base40.addCalls,
+        hashSame: notesHash() === base40.hash,
+      },
+    },
+    [
+      ...(cleared40.barCount === 0 ? [] : [`清空后不应渲染选择条：${JSON.stringify(cleared40)}`]),
+      ...(cleared40.selectedRows === 0 ? [] : [`清空后不应有选中行：${cleared40.selectedRows}`]),
+      ...(chips40b.count === 0 ? [] : [`清空后不应有 chip：${chips40b.count}`]),
+    ],
+  );
+
+  // --- 40c 条数上限：第 11 条不可选（同文档 page 1..12 升序，文本定位不依赖索引） -----
+  log("40c 条数上限：第 11 条禁用 + 上限 title + 取消后可再选");
+  await enterCleanWorkspace(capSeed());
+  await openNotesPanel(12);
+  await js(`(() => {
+    const rows = Array.from(document.querySelectorAll(".note-row"));
+    if (rows.length < 10) throw new Error("cap 样本不足 10 行");
+    for (let index = 0; index < 10; index += 1) {
+      const wrap = rows[index].querySelector(".note-select-wrap");
+      if (!wrap) throw new Error("note-select-wrap not found");
+      wrap.click();
+    }
+    return true;
+  })()`);
+  await waitFor("计数到 10", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 10 条") >= 0; })()`);
+  const cap10 = await selectionSnapshot();
+  const capRow11 = await js(`(() => {
+    const row = ${rowFinder("容量样本 11", true)};
+    if (!row) return null;
+    const input = row.querySelector(".note-select");
+    const wrap = row.querySelector(".note-select-wrap");
+    return {
+      disabled: input ? input.disabled : null,
+      wrapTitle: wrap ? wrap.getAttribute("title") : null,
+    };
+  })()`);
+  await clickInRow("容量样本 11", ".note-select-wrap");
+  const afterCapClick = (await selectionSnapshot()).countText;
+  await clickInRow("容量样本 1", ".note-select-wrap");
+  await waitFor("计数回到 9", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 9 条") >= 0; })()`);
+  const capRow11After = await js(`(() => {
+    const row = ${rowFinder("容量样本 11", true)};
+    if (!row) return null;
+    const input = row.querySelector(".note-select");
+    const wrap = row.querySelector(".note-select-wrap");
+    return {
+      disabled: input ? input.disabled : null,
+      wrapTitle: wrap ? wrap.getAttribute("title") : null,
+    };
+  })()`);
+  await capturePage(win, "40c-notes-select-cap.png");
+  const leftPane40c = await rectOfSelector(".layout-left", 2);
+  if (leftPane40c) await capturePage(win, "40c-notes-select-cap-left-pane.png", leftPane40c);
+  await restoreStandardSeed();
+  const restoredRows40c = await countOf(".note-row");
+  record(
+    "notes-select",
+    {
+      phase: "cap",
+      countText: cap10.countText,
+      selectedRows: cap10.selectedRows,
+      row11: capRow11,
+      afterCapClick,
+      afterUncheck: capRow11After,
+      restoredRows: restoredRows40c,
+    },
+    [
+      ...(cap10.countText === "已选 10 条" ? [] : [`上限计数异常：${cap10.countText}`]),
+      ...(cap10.selectedRows === 10 ? [] : [`上限选中行数异常：${cap10.selectedRows}`]),
+      ...(capRow11 && capRow11.disabled === true ? [] : [`第 11 条应禁用：${JSON.stringify(capRow11)}`]),
+      ...(capRow11 && capRow11.wrapTitle === "最多可注入 10 条笔记，请先取消其它选择"
+        ? []
+        : [`上限 title 异常：${JSON.stringify(capRow11)}`]),
+      ...(afterCapClick === "已选 10 条" ? [] : [`第 11 条点击应零效果：${afterCapClick}`]),
+      ...(capRow11After && capRow11After.disabled === false && capRow11After.wrapTitle === null
+        ? []
+        : [`取消一条后第 11 条应可用：${JSON.stringify(capRow11After)}`]),
+      ...(restoredRows40c === 4 ? [] : [`恢复标准种子后行数异常：${restoredRows40c}`]),
+    ],
+  );
+
+  // --- 41 行内追问：替换为 1 条 + 模板填入（另一篇文档的行不得跳回原文） ----------
+  log("41 行内追问：n-other-1 的 .note-ask ⇒ 模板填入且阅读区不动");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  await setDraft("");
+  await clickInRow("Section 4. Reproducibility", ".note-ask");
+  const ask41 = await composerSnapshot();
+  const reader41 = await readerSnapshot();
+  await capturePage(win, "41-note-ask.png");
+  record(
+    "note-ask",
+    {
+      phase: "template",
+      value: ask41.value,
+      activeHasInputArea: ask41.activeHasInputArea,
+      chip: ask41.chip,
+      pillLabel: reader41.pillLabel,
+      pageLabel: reader41.pageLabel,
+    },
+    [
+      ...(ask41.value === "请结合我选中的摘录回答：" ? [] : [`模板文案异常：${JSON.stringify(ask41.value)}`]),
+      ...(ask41.activeHasInputArea ? [] : ["追问后焦点应在 .input-area"]),
+      ...(ask41.chip === "摘录 1 条" ? [] : [`摘录 chip 异常：${ask41.chip}`]),
+      ...(reader41.pillLabel === "sample-paper.pdf" ? [] : [`点追问不得换文档：${reader41.pillLabel}`]),
+      ...(reader41.pageLabel === "第 1 / 3 页" ? [] : [`点追问不得跳页：${reader41.pageLabel}`]),
+    ],
+  );
+
+  // --- 41b 草稿非空：替换为 1 条 + 草稿保留 + 提示行 -----------------------------
+  log("41b 草稿非空：先选 2 条再点第 3 行的追问 ⇒ 已选 1 条 + 草稿一字不改");
+  await setDraft("我的草稿");
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await clickInRow("结论：稀疏注意力", ".note-ask");
+  const keep41b = await composerSnapshot();
+  await capturePage(win, "41b-note-ask-keep-draft.png");
+  await sleep(2600);
+  const noticeGone41b = await js(`!document.querySelector(".notes-ask-notice")`);
+  record(
+    "note-ask",
+    {
+      phase: "keep-draft",
+      value: keep41b.value,
+      countText: keep41b.countText,
+      chip: keep41b.chip,
+      noticeText: keep41b.noticeText,
+      noticeGone: noticeGone41b,
+    },
+    [
+      ...(keep41b.value === "我的草稿" ? [] : [`草稿必须一字不改：${JSON.stringify(keep41b.value)}`]),
+      ...(keep41b.countText === "已选 1 条" ? [] : [`替换语义异常（应替换不追加）：${keep41b.countText}`]),
+      ...(keep41b.chip === "摘录 1 条" ? [] : [`chip 未同步替换：${keep41b.chip}`]),
+      ...(keep41b.noticeText === "已加入 1 条摘录，草稿已保留" ? [] : [`提示行异常：${JSON.stringify(keep41b.noticeText)}`]),
+      ...(noticeGone41b ? [] : ["提示行应在 2500ms 后消失"]),
+    ],
+  );
+
+  // --- 41c 澄清待答：两个入口都禁用（含选择条入口） -----------------------------
+  log("41c 澄清待答：两个追问入口禁用 + 点击零副作用 + 复位后恢复");
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await clickInRow("Table 2 reports", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await setDraft("我的草稿");
+  await emitUserInputRequest({ id: "clarify-1", questions: [{ id: "q1", header: "澄清", question: "请选择方向" }] });
+  await waitFor("澄清卡片", `document.querySelector(".clarification-card")`);
+  const clarifying41c = await selectionSnapshot();
+  await js(`(() => {
+    const ask = document.querySelector(".note-row .note-ask");
+    if (!ask) throw new Error("note-ask not found");
+    ask.click();
+    return true;
+  })()`);
+  const afterClick41c = await composerSnapshot();
+  await capturePage(win, "41c-note-ask-clarifying.png");
+  await emitUserInputRequest(null);
+  await waitFor("澄清卡片消失", `!document.querySelector(".clarification-card")`);
+  const reenabled41c = await selectionSnapshot();
+  record(
+    "note-ask",
+    {
+      phase: "clarifying",
+      noteAsk: { disabled: clarifying41c.rowAskDisabled, wrapTitle: clarifying41c.rowAskWrapTitle },
+      barAsk: { disabled: clarifying41c.askDisabled, wrapTitle: clarifying41c.askWrapTitle },
+      clearDisabled: clarifying41c.clearDisabled,
+      afterClick: { value: afterClick41c.value, countText: afterClick41c.countText, hasNotice: afterClick41c.hasNotice },
+      reenabled: { noteAskDisabled: reenabled41c.rowAskDisabled },
+    },
+    [
+      ...(clarifying41c.rowAskDisabled === true && clarifying41c.rowAskWrapTitle === "等待澄清回答时无法发起追问"
+        ? []
+        : [`行内入口禁用态异常：${JSON.stringify(clarifying41c.rowAskDisabled)} / ${JSON.stringify(clarifying41c.rowAskWrapTitle)}`]),
+      ...(clarifying41c.askDisabled === true && clarifying41c.askWrapTitle === "等待澄清回答时无法发起追问"
+        ? []
+        : [`选择条入口禁用态异常：${JSON.stringify(clarifying41c.askDisabled)} / ${JSON.stringify(clarifying41c.askWrapTitle)}`]),
+      ...(clarifying41c.clearDisabled === false ? [] : ["清空不受 clarifying 影响"]),
+      ...(afterClick41c.value === "我的草稿" ? [] : [`禁用态点击不得改草稿：${JSON.stringify(afterClick41c.value)}`]),
+      ...(afterClick41c.countText === "已选 2 条" ? [] : [`禁用态点击不得改选择集：${afterClick41c.countText}`]),
+      ...(afterClick41c.hasNotice === false ? [] : ["禁用态点击不得出提示行"]),
+      ...(reenabled41c.rowAskDisabled === false ? [] : ["澄清复位后入口应恢复可用"]),
+    ],
+  );
+
+  // --- 41d 选择条「问 AI」：原样使用当前选择集 -------------------------------
+  log("41d 选择条入口：空草稿 ⇒ 模板填入且选择集保持 2 条");
+  await setDraft("");
+  await js(`(() => {
+    const ask = document.querySelector(".notes-ask-btn");
+    if (!ask) throw new Error("notes-ask-btn not found");
+    ask.click();
+    return true;
+  })()`);
+  const barAsk41d = await composerSnapshot();
+  await capturePage(win, "41d-note-ask-bar.png");
+  record(
+    "note-ask",
+    {
+      phase: "bar-ask",
+      value: barAsk41d.value,
+      activeHasInputArea: barAsk41d.activeHasInputArea,
+      countText: barAsk41d.countText,
+      chip: barAsk41d.chip,
+    },
+    [
+      ...(barAsk41d.value === "请结合我选中的摘录回答：" ? [] : [`模板文案异常：${JSON.stringify(barAsk41d.value)}`]),
+      ...(barAsk41d.activeHasInputArea ? [] : ["追问后焦点应在 .input-area"]),
+      ...(barAsk41d.countText === "已选 2 条" ? [] : [`选择条入口路径选择集异常：${barAsk41d.countText}`]),
+      ...(barAsk41d.chip === "摘录 2 条" ? [] : [`chip 未同步：${barAsk41d.chip}`]),
+    ],
+  );
+
+  // --- 42 摘录 chip：与文档 chip 并排 + title 写明注入条数 ------------------------
+  log("42 摘录 chip：已选 2 条 ⇒ chip 文案与 title");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await clickInRow("Table 2 reports", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  const chips42 = await chipSnapshot();
+  await capturePage(win, "42-notes-chip.png");
+  const composer42 = await rectOfSelector(".composer", 2);
+  if (composer42) await capturePage(win, "42-notes-chip-composer.png", composer42);
+  record(
+    "notes-chip",
+    {
+      phase: "basic",
+      labels: chips42.labels,
+      notesChipTitle: chips42.notesTitle,
+      removeTitle: chips42.removeTitle,
+    },
+    [
+      ...(JSON.stringify(chips42.labels) === JSON.stringify(["当前文档：sample-paper.pdf · 第 1 页", "摘录 2 条"])
+        ? []
+        : [`chip 行异常：${JSON.stringify(chips42.labels)}`]),
+      ...(chips42.notesTitle === "本次注入 2 条笔记" ? [] : [`chip title 异常：${chips42.notesTitle}`]),
+      ...(chips42.removeTitle === "本次发送不使用" ? [] : [`移除按钮 title 异常：${chips42.removeTitle}`]),
+    ],
+  );
+
+  // --- 42b 字符上限：3 条 3000 字 ⇒ 恰好丢 1 条 ---------------------------------
+  log("42b 字符上限：chip 写明丢弃条数（逐字比较）");
+  await enterCleanWorkspace(overflowSeed());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(3);
+  await js(`(() => {
+    const wraps = Array.from(document.querySelectorAll(".note-row .note-select-wrap"));
+    if (wraps.length !== 3) throw new Error("overflow 样本应为 3 行");
+    wraps.forEach((wrap) => wrap.click());
+    return true;
+  })()`);
+  await waitFor("计数到 3", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 3 条") >= 0; })()`);
+  const chips42b = await chipSnapshot();
+  await capturePage(win, "42b-notes-chip-overflow.png");
+  record(
+    "notes-chip",
+    { phase: "overflow", label: chips42b.notesLabel, title: chips42b.notesTitle },
+    [
+      ...(chips42b.notesLabel === "摘录 3 条 · 超出上限未注入 1 条" ? [] : [`溢出 label 异常：${chips42b.notesLabel}`]),
+      ...(chips42b.notesTitle === "本次注入 2 条笔记；1 条因超过 8000 字符上限未注入"
+        ? []
+        : [`溢出 title 异常：${chips42b.notesTitle}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  const restoredRows42b = await countOf(".note-row");
+  record("notes-chip", { phase: "overflow-restored", rows: restoredRows42b }, [
+    ...(restoredRows42b === 4 ? [] : [`恢复标准种子后行数异常：${restoredRows42b}`]),
+  ]);
+
+  // --- 42c chip 移除与级联（42b 的种子恢复会清空选择集，故此处重建「42 结束态」） ---
+  log("42c 移除摘录 chip ⇒ 本次不注入；移除文档 chip ⇒ 摘录 chip 级联消失");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await clickInRow("Table 2 reports", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await clearSendCalls();
+  await js(`(() => {
+    const chips = Array.from(document.querySelectorAll(".context-chip"));
+    const notes = chips.find((el) => {
+      const label = el.querySelector(".context-chip-label");
+      return !!label && label.textContent.indexOf("摘录") === 0;
+    });
+    if (!notes) throw new Error("摘录 chip not found");
+    notes.querySelector(".context-chip-remove").click();
+    return true;
+  })()`);
+  const removed42c = await chipSnapshot();
+  await typeAndSend(T42);
+  await waitSendCalls(1);
+  const payload42c = await lastSend();
+  await capturePage(win, "42c-notes-chip-removed.png");
+  const removedPayload = {
+    hasReadingContext: payload42c.message.includes("<reading_context>"),
+    hasReaderNotes: payload42c.message.includes("reader_notes:"),
+    displayText: payload42c.displayText,
+  };
+  record("notes-chip", { phase: "removed", chips: removed42c.labels, payload: removedPayload }, [
+    ...(JSON.stringify(removed42c.labels) === JSON.stringify(["当前文档：sample-paper.pdf · 第 1 页"])
+      ? []
+      : [`移除后 chip 行异常：${JSON.stringify(removed42c.labels)}`]),
+    ...(removedPayload.hasReadingContext ? [] : ["移除摘录 chip 只应停用 reader_notes"]),
+    ...(removedPayload.hasReaderNotes === false ? [] : ["本次发送不得注入 reader_notes"]),
+    ...(removedPayload.displayText === T42 ? [] : [`气泡文案应逐字等于输入：${removedPayload.displayText}`]),
+  ]);
+  await waitFor("摘录 chip 恢复", `(() => {
+    const chips = Array.from(document.querySelectorAll(".context-chip-label"));
+    return chips.some((el) => el.textContent.replace(/\\s+/g, " ").trim() === "摘录 2 条");
+  })()`);
+  const restored42c = await chipSnapshot();
+  record("notes-chip", { phase: "restored", chip: restored42c.notesLabel }, [
+    ...(restored42c.notesLabel === "摘录 2 条" ? [] : [`发送后 chip 应恢复：${restored42c.notesLabel}`]),
+  ]);
+  await js(`(() => {
+    const chips = Array.from(document.querySelectorAll(".context-chip"));
+    const doc = chips.find((el) => {
+      const label = el.querySelector(".context-chip-label");
+      return !!label && label.textContent.indexOf("当前文档") === 0;
+    });
+    if (!doc) throw new Error("document chip not found");
+    doc.querySelector(".context-chip-remove").click();
+    return true;
+  })()`);
+  const cascade42c = await chipSnapshot();
+  await typeAndSend(T42B);
+  await waitSendCalls(2);
+  const cascadePayload = await lastSend();
+  record(
+    "notes-chip",
+    {
+      phase: "doc-cascade",
+      hasNotesChip: cascade42c.notesLabel !== null,
+      chipCount: cascade42c.count,
+      payload: {
+        hasReadingContext: cascadePayload.message.includes("<reading_context>"),
+        hasReaderNotes: cascadePayload.message.includes("reader_notes:"),
+      },
+    },
+    [
+      ...(cascade42c.notesLabel === null ? [] : [`文档 chip 被移除时摘录 chip 必须一起消失：${cascade42c.notesLabel}`]),
+      ...(cascade42c.count === 0 ? [] : [`文档 chip 被移除后 chip 行应为空：${JSON.stringify(cascade42c.labels)}`]),
+      ...(cascadePayload.message.includes("<reading_context>") === false ? [] : ["排除文档 chip 后不得发 <reading_context>"]),
+    ],
+  );
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+  await typeAndSend(T42C);
+  await waitSendCalls(3);
+  const r7Payload = await lastSend();
+  const r7Lines = r7Payload.message.split("\n");
+  record(
+    "notes-context",
+    {
+      phase: "r7-regression",
+      lines: {
+        "<reading_context>": r7Payload.message.includes("<reading_context>"),
+        "page: 1": r7Payload.message.includes("page: 1"),
+        "pageCount: 3": r7Payload.message.includes("pageCount: 3"),
+        "</reading_context>": r7Payload.message.includes("</reading_context>"),
+        pathSuffix: r7Lines.find((line) => line.indexOf("path: ") === 0) ? /sample-paper\.pdf$/.test(r7Lines.find((line) => line.indexOf("path: ") === 0)) : false,
+        selectedTextLine: r7Payload.message.includes("selectedText:"),
+      },
+      hasReaderNotes: r7Payload.message.includes("reader_notes:"),
+      displayText: r7Payload.displayText,
+    },
+    [
+      ...(r7Payload.message.includes("<reading_context>") ? [] : ["清空选择后仍应输出 <reading_context>"]),
+      ...(r7Payload.message.includes("page: 1") ? [] : ["页码行缺失"]),
+      ...(r7Payload.message.includes("pageCount: 3") ? [] : ["总页数行缺失"]),
+      ...(r7Payload.message.includes("</reading_context>") ? [] : ["收尾行缺失"]),
+      ...(r7Lines.find((line) => line.indexOf("path: ") === 0) && /sample-paper\.pdf$/.test(r7Lines.find((line) => line.indexOf("path: ") === 0))
+        ? []
+        : [`path 行应为绝对路径且以文件名结尾：${r7Lines.find((line) => line.indexOf("path: ") === 0)}`]),
+      ...(r7Payload.message.includes("selectedText:") === false ? [] : ["无选区时不应输出 selectedText: 行"]),
+      ...(r7Payload.message.includes("reader_notes:") === false ? [] : ["清空选择后不应输出 reader_notes:"]),
+      ...(r7Payload.displayText === T42C ? [] : [`气泡文案应逐字等于输入：${r7Payload.displayText}`]),
+    ],
+  );
+
+  // --- 42d 无文档：两个追问入口禁用 + 不渲染摘录 chip + 载荷无 reading_context -----
+  log("42d 无文档：入口禁用（可见反馈）而非静默空转");
+  await enterCleanWorkspace(seedNotes());
+  await openNotesPanel(4);
+  await js(`(() => {
+    const wraps = Array.from(document.querySelectorAll(".note-row .note-select-wrap")).slice(0, 2);
+    wraps.forEach((wrap) => wrap.click());
+    return true;
+  })()`);
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await setDraft("");
+  const noDoc42d = await selectionSnapshot();
+  await js(`document.querySelector(".notes-ask-btn").click(), true`);
+  const afterClick42d = await composerSnapshot();
+  const chips42d = await chipSnapshot();
+  await capturePage(win, "42d-notes-chip-no-doc.png");
+  record(
+    "note-ask",
+    {
+      phase: "no-doc",
+      barAsk: { disabled: noDoc42d.askDisabled, wrapTitle: noDoc42d.askWrapTitle },
+      rowAsk: { disabled: noDoc42d.rowAskDisabled, wrapTitle: noDoc42d.rowAskWrapTitle },
+      afterClick: { value: afterClick42d.value, countText: afterClick42d.countText, hasNotice: afterClick42d.hasNotice },
+    },
+    [
+      ...(noDoc42d.askDisabled === true && noDoc42d.askWrapTitle === "请先打开文档，摘录才会随提问注入"
+        ? []
+        : [`选择条入口无文档态异常：${JSON.stringify(noDoc42d.askDisabled)} / ${JSON.stringify(noDoc42d.askWrapTitle)}`]),
+      ...(noDoc42d.rowAskDisabled === true && noDoc42d.rowAskWrapTitle === "请先打开文档，摘录才会随提问注入"
+        ? []
+        : [`行内入口无文档态异常：${JSON.stringify(noDoc42d.rowAskDisabled)} / ${JSON.stringify(noDoc42d.rowAskWrapTitle)}`]),
+      ...(afterClick42d.value === "" ? [] : [`禁用态点击不得改草稿：${JSON.stringify(afterClick42d.value)}`]),
+      ...(afterClick42d.countText === "已选 2 条" ? [] : [`禁用态点击不得改选择集：${afterClick42d.countText}`]),
+      ...(afterClick42d.hasNotice === false ? [] : ["禁用态点击不得出提示行"]),
+    ],
+  );
+  record("notes-chip", { phase: "no-doc", chipCount: chips42d.count, hasNotesChip: chips42d.notesLabel !== null }, [
+    ...(chips42d.count === 0 ? [] : [`无文档时 chip 行应为空：${JSON.stringify(chips42d.labels)}`]),
+    ...(chips42d.notesLabel === null ? [] : [`无文档时不得渲染摘录 chip：${chips42d.notesLabel}`]),
+  ]);
+  await typeAndSend(T42D);
+  await waitSendCalls(1);
+  const noDocPayload = await lastSend();
+  record(
+    "notes-context",
+    {
+      phase: "no-doc",
+      message: noDocPayload.message,
+      hasReadingContext: noDocPayload.message.includes("<reading_context>"),
+      hasReaderNotes: noDocPayload.message.includes("reader_notes:"),
+    },
+    [
+      ...(noDocPayload.message === T42D ? [] : [`无文档时载荷应逐字等于输入：${noDocPayload.message}`]),
+      ...(noDocPayload.message.includes("<reading_context>") === false ? [] : ["无文档时不得输出 <reading_context>"]),
+    ],
+  );
+
+  // --- 43 注入载荷：跨文档两条 + 选区 + steer 相位 ------------------------------
+  log("43 注入载荷：reader_notes 逐行字面量 + 顺序判据 + steer 相位");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await clickNext();
+  await waitPage(2, 3);
+  // 选区必须晚于 textarea 写值：向聚焦中的 .input-area 写入值会把 document 选区收进输入框，
+  // readerStore.selectedText 随之被 PdfViewer 的 selectionchange 清空（既有行为，R8 不改）。
+  await setDraft(ASK43);
+  await selectPageSpan(2);
+  await openNotesPanel(4);
+  await clickInRow("Section 4. Reproducibility", ".note-select-wrap");
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await clearSendCalls();
+  await js(`document.querySelector(".composer-send").click(), true`);
+  await waitSendCalls(1);
+  const prompt43 = await lastSend();
+  await capturePage(win, "43-notes-context-payload.png");
+  const entryBlock43 = prompt43.message.slice(prompt43.message.indexOf("reader_notes:"));
+  record(
+    "notes-context",
+    {
+      phase: "prompt",
+      missing: missingLines(prompt43.message, [
+        "<reading_context>",
+        "page: 2",
+        "selectedText:",
+        "reader_notes:",
+        "1. doc: archive/older-paper.pdf",
+        "   page: 7",
+        "   kind: excerpt",
+        "   text: Section 4. Reproducibility: all runs use three seeds and report the median.",
+        "2. doc: sample-paper.pdf",
+        "   page: 1",
+        "   text: We study retrieval over long documents where the attention budget is the binding constraint.",
+        "   comment: 与第 3 节消融实验对照",
+      ]),
+      orderOk: prompt43.message.indexOf("1. doc: archive/older-paper.pdf") < prompt43.message.indexOf("2. doc: sample-paper.pdf"),
+      entryBlockNoBackslash: entryBlock43.indexOf("\\") < 0,
+      entryBlockNoIds:
+        entryBlock43.indexOf("n-other-1") < 0 &&
+        entryBlock43.indexOf("n-current-1") < 0 &&
+        entryBlock43.indexOf("createdAt") < 0 &&
+        entryBlock43.indexOf("updatedAt") < 0,
+      displayText: prompt43.displayText,
+      endsWithUserText: prompt43.message.endsWith("\n\n" + ASK43),
+    },
+    [
+      ...(missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:"]).length === 0
+        ? []
+        : [`载荷缺少骨架行：${missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:"]).join(" / ")}`]),
+      ...(prompt43.message.indexOf("1. doc: archive/older-paper.pdf") < prompt43.message.indexOf("2. doc: sample-paper.pdf")
+        ? []
+        : "注入顺序应为 docPathKey 升序（archive 在前）"),
+      ...(prompt43.message.includes("   page: 7") && prompt43.message.includes("   kind: excerpt")
+        ? []
+        : "条目字段行缺失或缩进异常"),
+      ...(prompt43.message.includes("   text: Section 4. Reproducibility: all runs use three seeds and report the median.")
+        ? []
+        : "跨文档条目的 text 行异常"),
+      ...(prompt43.message.includes("   comment: 与第 3 节消融实验对照") ? [] : "comment 行缺失"),
+      ...(entryBlock43.indexOf("\\") < 0 ? [] : "条目块不得含反斜杠（绝对路径）"),
+      ...(entryBlock43.indexOf("n-other-1") < 0 && entryBlock43.indexOf("n-current-1") < 0 ? [] : "条目块不得注入 id"),
+      ...(prompt43.displayText === ASK43 ? [] : `气泡文案应逐字等于输入：${prompt43.displayText}`),
+      ...(prompt43.message.endsWith("\n\n" + ASK43) ? [] : "载荷应以空行 + 用户输入收尾"),
+    ],
+  );
+  await clearSendCalls();
+  await emit({ type: "agent_start" });
+  await sendViaEnter(ASK43_STEER);
+  await waitSendCalls(1);
+  const steer43 = await lastSend();
+  await emit({ type: "agent_end", messages: [] });
+  record(
+    "notes-context",
+    { phase: "steer", type: steer43.type, hasReaderNotes: steer43.message.includes("reader_notes:") },
+    [
+      ...(steer43.type === "steer" ? [] : [`流式中发送应走 steer：${steer43.type}`]),
+      ...(steer43.message.includes("reader_notes:") ? [] : ["steer 载荷同样应注入 reader_notes"]),
+    ],
+  );
+
+  // --- 44 删除已选笔记：收敛为 1 条 + 载荷同步 ---------------------------------
+  log("44 删除已选笔记 ⇒ 计数 / chip / 载荷三处同步收敛");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  await clickInRow("attention budget is the binding constraint", ".note-select-wrap");
+  await clickInRow("Table 2 reports", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await clickInRow("Table 2 reports", ".note-delete");
+  await waitFor("删除确认态", `(() => { const row = ${rowFinder("Table 2 reports", false)}; return !!row && row.classList.contains("confirming"); })()`);
+  await clickInRow("Table 2 reports", ".note-delete");
+  await waitFor("删除完成", `document.querySelectorAll(".note-row").length === 3`);
+  const del44 = await selectionSnapshot();
+  const chips44 = await chipSnapshot();
+  await capturePage(win, "44-notes-select-delete.png");
+  record(
+    "notes-select",
+    {
+      phase: "delete-converge",
+      countText: del44.countText,
+      selectedRows: del44.selectedRows,
+      chip: chips44.notesLabel,
+      rows: await countOf(".note-row"),
+    },
+    [
+      ...(del44.countText === "已选 1 条" ? [] : [`删除后计数应收敛：${del44.countText}`]),
+      ...(del44.selectedRows === 1 ? [] : [`删除后选中行应剩 1：${del44.selectedRows}`]),
+      ...(chips44.notesLabel === "摘录 1 条" ? [] : [`删除后 chip 应同步：${chips44.notesLabel}`]),
+      ...((await countOf(".note-row")) === 3 ? [] : ["删除后应剩 3 行"]),
+    ],
+  );
+  await clearSendCalls();
+  await typeAndSend(ASK44);
+  await waitSendCalls(1);
+  const payload44 = await lastSend();
+  const notesCount44 = (payload44.message.match(/^\d+\. doc: /gm) || []).length;
+  record(
+    "notes-context",
+    {
+      phase: "delete-converge",
+      hasReaderNotes: payload44.message.includes("reader_notes:"),
+      notesCount: notesCount44,
+      excludesDeleted: payload44.message.includes("Table 2 reports") === false,
+    },
+    [
+      ...(payload44.message.includes("reader_notes:") ? [] : ["删除后仍应注入剩下的条目"]),
+      ...(notesCount44 === 1 ? [] : [`注入条数应与选择集一致：${notesCount44}`]),
+      ...(payload44.message.includes("Table 2 reports") === false ? [] : ["被删条目不得出现在载荷里"]),
+    ],
+  );
+
+  // --- 44b 删除失败：清单 / 选择集 / chip 都不动 + 文件哈希不变 --------------------
+  log("44b 删除失败：错误通知 + 计数与 chip 原样");
+  const hash44b = notesHash();
+  await setNotesDeleteFailure("write-failed");
+  await clickInRow("attention budget is the binding constraint", ".note-delete");
+  await waitFor("删除确认态", `(() => { const row = ${rowFinder("attention budget is the binding constraint", false)}; return !!row && row.classList.contains("confirming"); })()`);
+  await clickInRow("attention budget is the binding constraint", ".note-delete");
+  await waitFor("删除失败通知", `document.querySelector(".notes-notice.is-error")`);
+  const fail44b = await selectionSnapshot();
+  const chips44b = await chipSnapshot();
+  const notice44b = await textOf(".notes-notice.is-error");
+  await capturePage(win, "44b-notes-select-delete-failure.png");
+  await setNotesDeleteFailure(null);
+  record(
+    "notes-select",
+    {
+      phase: "delete-failure",
+      notice: notice44b,
+      countText: fail44b.countText,
+      chip: chips44b.notesLabel,
+      rows: await countOf(".note-row"),
+      hashSame: notesHash() === hash44b,
+    },
+    [
+      ...(notice44b === "删除失败：笔记写入失败" ? [] : [`失败通知异常：${JSON.stringify(notice44b)}`]),
+      ...(fail44b.countText === "已选 1 条" ? [] : [`失败时计数不得变：${fail44b.countText}`]),
+      ...(chips44b.notesLabel === "摘录 1 条" ? [] : [`失败时 chip 不得变：${chips44b.notesLabel}`]),
+      ...((await countOf(".note-row")) === 3 ? [] : ["失败时行数不得变"]),
+      ...(notesHash() === hash44b ? [] : ["失败时不得写盘"]),
+    ],
+  );
+
+  // --- 45 发送失败：选择集与 chip 保留；恢复后重发仍注入 -------------------------
+  log("45 发送失败（throw / fail）：选择集与 chip 保留，重发仍注入");
+  await clickInRow("结论：稀疏注意力", ".note-select-wrap");
+  await waitFor("计数到 2", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  const base45 = await userBlocks();
+  await setSendFailure("throw");
+  await typeAndSend(ASK45);
+  await waitFor("发送异常错误块", `document.querySelector(".error-block")`);
+  const throw45 = await selectionSnapshot();
+  const chips45 = await chipSnapshot();
+  const throw45State = {
+    errorText: await textOf(".error-block .error-message"),
+    userBlocksRolledBack: (await userBlocks()) === base45,
+    countText: throw45.countText,
+    chip: chips45.notesLabel,
+  };
+  await capturePage(win, "45-notes-select-send-failure.png");
+  record("notes-context", { phase: "send-failure", ...throw45State }, [
+    ...(throw45State.errorText === "stub 发送注入异常" ? [] : [`IPC 异常文案异常：${JSON.stringify(throw45State.errorText)}`]),
+    ...(throw45State.userBlocksRolledBack ? [] : ["失败后乐观用户块应回滚"]),
+    ...(throw45State.countText === "已选 2 条" ? [] : [`失败时选择集不得变：${throw45State.countText}`]),
+    ...(throw45State.chip === "摘录 2 条" ? [] : [`失败时 chip 不得变：${throw45State.chip}`]),
+  ]);
+  await setSendFailure("fail");
+  await typeAndSend(ASK45B);
+  await waitFor("第二次发送失败", `document.querySelectorAll(".error-block").length >= 2`);
+  const reject45 = await lastErrorText();
+  const chips45b = await chipSnapshot();
+  record("notes-context", { phase: "send-reject", errorText: reject45, chip: chips45b.notesLabel }, [
+    ...(reject45 === "stub 发送被拒绝" ? [] : [`success:false 文案异常：${JSON.stringify(reject45)}`]),
+    ...(chips45b.notesLabel === "摘录 2 条" ? [] : [`拒绝时 chip 不得变：${chips45b.notesLabel}`]),
+  ]);
+  await setSendFailure(null);
+  await clearSendCalls();
+  await typeAndSend(ASK45C);
+  await waitSendCalls(1);
+  const resend45 = await lastSend();
+  const notesCount45 = (resend45.message.match(/^\d+\. doc: /gm) || []).length;
+  record(
+    "notes-context",
+    { phase: "resend", hasReaderNotes: resend45.message.includes("reader_notes:"), notesCount: notesCount45, type: resend45.type },
+    [
+      ...(resend45.message.includes("reader_notes:") ? [] : ["恢复后重发仍应注入"]),
+      ...(notesCount45 === 2 ? [] : [`重发注入条数异常：${notesCount45}`]),
+      ...(resend45.type === "prompt" ? [] : [`重发应走 prompt：${resend45.type}`]),
+    ],
+  );
+
+  // --- 46 锚点缓存：两轮不同页 + 失败回滚后重发 --------------------------------
+  log("46 锚点：第 2 页一轮 / 第 3 页一轮 / 回滚后重发");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await clickNext();
+  await waitPage(2, 3);
+  await typeAndSend(T46A);
+  await runTurn(T46A, "第 2 页回答");
+  await waitFor("第 2 页回答块", `document.querySelectorAll(".agent-message").length >= 1`);
+  await clickNext();
+  await waitPage(3, 3);
+  await typeAndSend(T46B);
+  await runTurn(T46B, "第 3 页回答");
+  await waitFor("第 3 页回答块", `document.querySelectorAll(".agent-message").length >= 2`);
+  await sleep(200);
+  const titles46 = [await answerTitleFromEnd(2), await answerTitleFromEnd(1)];
+  await capturePage(win, "46-anchor-cache.png");
+  record("anchor-cache", { phase: "two-turns", titles: titles46 }, [
+    ...(titles46[0] && titles46[0].includes("第 2 页") ? [] : [`第 2 页回答锚点异常：${titles46[0]}`]),
+    ...(titles46[1] && titles46[1].includes("第 3 页") ? [] : [`第 3 页回答锚点异常：${titles46[1]}`]),
+    ...(titles46.every((title) => !!title && !title.includes("（按当前阅读位置）"))
+      ? []
+      : [`两轮锚点都不应回退：${JSON.stringify(titles46)}`]),
+  ]);
+  await setSendFailure("throw");
+  await typeAndSend(T46C);
+  await waitFor("失败错误块", `document.querySelector(".error-block")`);
+  const rollback46 = await textOf(".error-block .error-message");
+  await setSendFailure(null);
+  await typeAndSend(T46D);
+  await runTurn(T46D, "回滚后回答");
+  await waitFor("回滚后回答块", `document.querySelectorAll(".agent-message").length >= 3`);
+  await sleep(200);
+  const lastTitle46 = await answerTitleFromEnd(1);
+  record("anchor-cache", { phase: "rollback", errorText: rollback46, lastTitle: lastTitle46 }, [
+    ...(rollback46 === "stub 发送注入异常" ? [] : [`回滚错误文案异常：${JSON.stringify(rollback46)}`]),
+    ...(lastTitle46 && lastTitle46.includes("第 3 页") ? [] : [`回滚后重发的锚点应为第 3 页：${lastTitle46}`]),
+    ...(lastTitle46 && !lastTitle46.includes("（按当前阅读位置）") ? [] : [`回滚后重发不得回退到当前阅读位置：${lastTitle46}`]),
+  ]);
 }
 
 // ---------------------------------------------------------------------------

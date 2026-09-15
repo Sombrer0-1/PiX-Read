@@ -196,6 +196,8 @@ function openDocumentFromLibrary(path: string): void {
 function selectLeftTab(tab: "library" | "notes"): void {
   if (leftTab.value === tab) return;
   leftTab.value = tab;
+  // 离开笔记标签即清空选择集（R8 设计档 §2 情形 4）：面板被树替换后无法核对「本次注入哪几条」；折叠左栏不清空
+  if (tab === "library") notesStore.clearNoteSelection();
   // 打开面板是允许的读取时机；失败由面板错误态的「重试」处理
   if (tab === "notes") void notesStore.loadNotes();
 }
@@ -269,7 +271,13 @@ async function goHome(): Promise<void> {
             :selected-path="selectedFilePath"
             @select-file="onSelectFile"
           />
-          <NotesPanel v-show="leftTab === 'notes'" class="pane-body" @open-note="onOpenNote" />
+          <NotesPanel
+            v-show="leftTab === 'notes'"
+            class="pane-body"
+            :clarifying="pendingUserInput !== null"
+            :document-open="readerStore.filePath !== null"
+            @open-note="onOpenNote"
+          />
         </div>
       </template>
       <template #center>

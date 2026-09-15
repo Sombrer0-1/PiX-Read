@@ -278,13 +278,33 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   /**
+   * 块 id → 首现下标的索引（N49，O(1) 查表）：唯一失效判据 = 数组引用变「或」长度变 ⇒
+   * 整表重建（`has()` 首现优先，与「取第一个匹配」的线性查找等价）。中段位移一律由替换数组承担
+   * —— 本文件不得对 displayBlocks.value 做 splice/shift/unshift/sort/reverse 就地变更。
+   */
+  let anchorIndexBlocks: DisplayBlock[] | null = null;
+  let byId = new Map<string, number>();
+
+  function blockIndexOf(blockId: string): number {
+    const blocks = displayBlocks.value;
+    if (anchorIndexBlocks !== blocks || byId.size !== blocks.length) {
+      byId = new Map();
+      for (let i = 0; i < blocks.length; i += 1) {
+        if (!byId.has(blocks[i].id)) byId.set(blocks[i].id, i);
+      }
+      anchorIndexBlocks = blocks;
+    }
+    return byId.get(blockId) ?? -1;
+  }
+
+  /**
    * 回答块的轮次锚点（唯一读取处）：向前跳过非 user-message 块，遇第一个 user-message 即终止
    * —— 它有锚点就返回，没有就返回 null。绝不回溯到更早一个带锚点的用户块（那会把上一轮的
    * 锚点当成本轮目标）；块被裁剪或本就不在列表里时同样返回 null，不抛错。
    */
   function readingAnchorFor(blockId: string): ReadingAnchor | null {
     const blocks = displayBlocks.value;
-    const index = blocks.findIndex((block) => block.id === blockId);
+    const index = blockIndexOf(blockId);
     if (index < 0) return null;
     for (let i = index - 1; i >= 0; i -= 1) {
       const block = blocks[i];

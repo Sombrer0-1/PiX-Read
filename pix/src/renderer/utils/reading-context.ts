@@ -6,13 +6,72 @@
  *   Chinese messages so a raw browser/IPC exception never reaches the UI.
  */
 
-import type { LibraryFileResult } from "@shared/types";
+import type { LibraryFileResult, ReaderNote } from "@shared/types";
+import { sortNotesForContext } from "./notes-path";
 
 export interface ReadingSendContext {
   filePath: string | null;
   page: number;
   pageCount: number;
   selectedText: string;
+  /** 必填：选择集快照（发送瞬间的派生结果）；不给默认值，避免第二套向后兼容分支。 */
+  notes: ReaderNote[];
+}
+
+/** 条数上限：选择期拒绝第 11 条（R8 需求 §0.2 / 设计档 §1.2）。 */
+export const MAX_CONTEXT_NOTES = 10;
+/** reader_notes 段的字符上限，判据 = entries.join("\n").length（R8 需求 §0.2 / 设计档 §1.2）。 */
+export const MAX_CONTEXT_NOTES_CHARS = 8000;
+
+export interface NotesContextSelection {
+  /** 已装入的条目块文本，顺序 = 注入顺序，entries.join("\n") 不超过字符上限。 */
+  entries: string[];
+  /** 与 entries 同序同长，供 chip 的 P 取数。 */
+  injected: ReaderNote[];
+  /** 整条丢弃（超字符上限，或防御式超条数上限），供 chip 的 M 取数。 */
+  dropped: ReaderNote[];
+}
+
+/** 行内归一化：读侧不变量不可依赖（stub 与手工编辑的 notes.json 都可能带换行）。 */
+function inlineNoteText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/** 条目块 = 序号行（含 doc 字段）+ page/kind/text（+非空 comment）字段行，字段行 3 空格缩进。 */
+function renderNoteEntry(index: number, note: ReaderNote): string {
+  const lines = [
+    `${index}. doc: ${note.docPath}`,
+    `   page: ${note.page}`,
+    `   kind: ${note.kind}`,
+    `   text: ${inlineNoteText(note.text)}`,
+  ];
+  const comment = inlineNoteText(note.comment);
+  if (comment) lines.push(`   comment: ${comment}`);
+  return lines.join("\n");
+}
+
+/** 组装 reader_notes 条目：排序 → 条数上限 → 逐条尝试字符上限（超限整条丢弃并继续尝试）。 */
+export function selectNotesForContext(notes: ReaderNote[]): NotesContextSelection {
+  const sorted = sortNotesForContext(notes);
+  const entries: string[] = [];
+  const injected: ReaderNote[] = [];
+  const dropped: ReaderNote[] = [];
+  for (const [index, note] of sorted.entries()) {
+    // 防御式条数裁剪：选择期已按派生计数硬拒第 11 条，本分支只在烟测可达
+    if (index >= MAX_CONTEXT_NOTES) {
+      dropped.push(note);
+      continue;
+    }
+    // 序号按已装入条数续编 ⇒ 序号从 1 连续，被丢弃的条目不占号；不做字符级截断
+    const block = renderNoteEntry(entries.length + 1, note);
+    if ([...entries, block].join("\n").length > MAX_CONTEXT_NOTES_CHARS) {
+      dropped.push(note);
+      continue;
+    }
+    entries.push(block);
+    injected.push(note);
+  }
+  return { entries, injected, dropped };
 }
 
 export function buildReadingUserMessage(userText: string, ctx: ReadingSendContext): string {
@@ -28,6 +87,11 @@ export function buildReadingUserMessage(userText: string, ctx: ReadingSendContex
   if (selected) {
     lines.push("selectedText:");
     lines.push(selected);
+  }
+  const picked = selectNotesForContext(ctx.notes);
+  if (picked.entries.length > 0) {
+    lines.push("reader_notes:");
+    lines.push(...picked.entries);
   }
   lines.push("</reading_context>");
   if (userText) {

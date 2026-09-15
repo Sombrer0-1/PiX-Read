@@ -9,6 +9,8 @@
  */
 import { computed, onBeforeUnmount, ref } from "vue";
 import { useNotesStore } from "../../stores/notes-store";
+import { emitNotesAsk } from "../../composables/useQuickAsk";
+import { MAX_CONTEXT_NOTES } from "../../utils/reading-context";
 import type { ReaderNote } from "@shared/types";
 
 /** 原文超过该长度才渲染「展开全文」（启发式阈值，避免逐行测量 DOM 宽度）。 */
@@ -16,6 +18,17 @@ const COLLAPSED_TEXT_LENGTH = 180;
 /** 删除待确认与瞬时提示的复位窗口。 */
 const DELETE_CONFIRM_MS = 3000;
 const NOTICE_MS = 4000;
+
+/** 「追问」的两个禁用原因（R8 设计档 §1.4 三态；自上而下第一条命中者生效）。 */
+const ASK_DISABLED_TITLE = "等待澄清回答时无法发起追问";
+const ASK_NO_DOC_TITLE = "请先打开文档，摘录才会随提问注入";
+/** 条数上限提示：挂在未选中条目的控件包裹元素上（禁用控件在 Chromium 下不派发鼠标事件）。 */
+const SELECT_CAP_TITLE = `最多可注入 ${MAX_CONTEXT_NOTES} 条笔记，请先取消其它选择`;
+
+const props = defineProps<{
+  clarifying: boolean;
+  documentOpen: boolean;
+}>();
 
 const emit = defineEmits<{
   "open-note": [note: ReaderNote];
@@ -35,6 +48,13 @@ const recovering = ref(false);
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 两个「追问」入口的禁用与 title 判据（R8 设计档 §1.4）：可用 ⇔ 本次会注入 reader_notes。 */
+const askDisabledTitle = computed(() => {
+  if (props.clarifying) return ASK_DISABLED_TITLE;
+  if (!props.documentOpen) return ASK_NO_DOC_TITLE;
+  return null;
+});
 
 const currentDocSwitch = computed({
   get: () => notesStore.currentDocOnly,
@@ -94,6 +114,16 @@ function toggleExpanded(id: string): void {
   if (next.has(id)) next.delete(id);
   else next.add(id);
   expandedIds.value = next;
+}
+
+/** 未选且已达上限才禁用；已选条目始终可以取消（上限守卫在 store 内用派生计数判）。 */
+function isNoteSelectDisabled(id: string): boolean {
+  return !notesStore.isNoteSelected(id) && notesStore.selectionFull;
+}
+
+/** 行内「追问」：替换语义只在 store 单一动作内落地；id 已失效即 no-op（零副作用）。 */
+function onAskNote(note: ReaderNote): void {
+  if (notesStore.replaceSelectionWith(note.id)) emitNotesAsk();
 }
 
 function startCommentEdit(note: ReaderNote): void {
@@ -233,6 +263,25 @@ onBeforeUnmount(() => {
         :disabled="!notesStore.currentDocKey"
         label="仅看当前文档"
       />
+      <div
+        v-if="notesStore.status === 'ready' && notesStore.hasNotes && notesStore.selectedCount > 0"
+        class="notes-selection-bar"
+      >
+        <span class="notes-selection-count">已选 {{ notesStore.selectedCount }} 条</span>
+        <span class="notes-ask-btn-wrap" :title="askDisabledTitle ?? undefined">
+          <button type="button" class="notes-ask-btn" :disabled="askDisabledTitle !== null" @click="emitNotesAsk()">
+            问 AI
+          </button>
+        </span>
+        <button
+          type="button"
+          class="notes-selection-clear"
+          title="取消全部选择"
+          @click="notesStore.clearNoteSelection()"
+        >
+          清空
+        </button>
+      </div>
     </div>
 
     <div v-if="notice" class="notes-notice" :class="`is-${notice.kind}`">
@@ -313,67 +362,95 @@ onBeforeUnmount(() => {
           v-for="note in group.notes"
           :key="note.id"
           class="note-row"
-          :class="{ confirming: confirmingDeleteId === note.id }"
+          :class="{ confirming: confirmingDeleteId === note.id, selected: notesStore.isNoteSelected(note.id) }"
           @click="emit('open-note', note)"
         >
-          <div class="note-head">
-            <span class="note-page-badge">第 {{ note.page }} 页</span>
-            <span v-if="note.kind === 'answer'" class="note-ai-badge">AI</span>
-            <span class="note-time">{{ relativeTime(note.createdAt) }}</span>
-            <button
-              type="button"
-              class="note-delete"
-              :disabled="deletingId === note.id"
-              @pointerdown.stop
-              @click.stop="onDeleteClick(note)"
-            >
-              {{ confirmingDeleteId === note.id ? "确认删除" : "删除" }}
-            </button>
-          </div>
-
-          <p class="note-text" :class="{ collapsed: !isExpanded(note.id) }">{{ note.text }}</p>
-          <button
-            v-if="note.text.length > COLLAPSED_TEXT_LENGTH"
-            type="button"
-            class="note-expand"
-            @click.stop="toggleExpanded(note.id)"
+          <!-- 点击落点唯一：切换只挂在包裹元素上，复选框本体只挂受控属性（本体再挂 toggle 会双触发） -->
+          <span
+            class="note-select-wrap"
+            :title="isNoteSelectDisabled(note.id) ? SELECT_CAP_TITLE : undefined"
+            @click.stop="notesStore.toggleNoteSelected(note.id)"
           >
-            {{ isExpanded(note.id) ? "收起" : "展开全文" }}
-          </button>
+            <input
+              type="checkbox"
+              class="note-select"
+              :checked="notesStore.isNoteSelected(note.id)"
+              :disabled="isNoteSelectDisabled(note.id)"
+            />
+          </span>
+          <div class="note-body">
+            <div class="note-head">
+              <span class="note-page-badge">第 {{ note.page }} 页</span>
+              <span v-if="note.kind === 'answer'" class="note-ai-badge">AI</span>
+              <span class="note-time">{{ relativeTime(note.createdAt) }}</span>
+              <button
+                type="button"
+                class="note-delete"
+                :disabled="deletingId === note.id"
+                @pointerdown.stop
+                @click.stop="onDeleteClick(note)"
+              >
+                {{ confirmingDeleteId === note.id ? "确认删除" : "删除" }}
+              </button>
+            </div>
 
-          <div class="note-comment" @click.stop>
-            <template v-if="editingCommentId === note.id">
-              <v-textarea
-                v-model="commentDraft"
-                auto-grow
-                rows="2"
-                density="compact"
-                hide-details
-                placeholder="写点备注…"
-              />
-              <div class="comment-actions">
-                <v-btn
-                  size="x-small"
-                  variant="tonal"
-                  color="primary"
-                  :loading="savingComment"
-                  @click="saveComment(note)"
-                >
-                  保存
-                </v-btn>
-                <v-btn size="x-small" variant="text" :disabled="savingComment" @click="cancelCommentEdit">取消</v-btn>
-              </div>
-            </template>
+            <p class="note-text" :class="{ collapsed: !isExpanded(note.id) }">{{ note.text }}</p>
             <button
-              v-else
+              v-if="note.text.length > COLLAPSED_TEXT_LENGTH"
               type="button"
-              class="comment-trigger"
-              :class="{ empty: !note.comment }"
-              @click="startCommentEdit(note)"
+              class="note-expand"
+              @click.stop="toggleExpanded(note.id)"
             >
-              <v-icon size="12">mdi-pencil-outline</v-icon>
-              <span class="comment-text">{{ note.comment || "添加备注" }}</span>
+              {{ isExpanded(note.id) ? "收起" : "展开全文" }}
             </button>
+
+            <div class="note-comment" @click.stop>
+              <template v-if="editingCommentId === note.id">
+                <v-textarea
+                  v-model="commentDraft"
+                  auto-grow
+                  rows="2"
+                  density="compact"
+                  hide-details
+                  placeholder="写点备注…"
+                />
+                <div class="comment-actions">
+                  <v-btn
+                    size="x-small"
+                    variant="tonal"
+                    color="primary"
+                    :loading="savingComment"
+                    @click="saveComment(note)"
+                  >
+                    保存
+                  </v-btn>
+                  <v-btn size="x-small" variant="text" :disabled="savingComment" @click="cancelCommentEdit">取消</v-btn>
+                </div>
+              </template>
+              <button
+                v-else
+                type="button"
+                class="comment-trigger"
+                :class="{ empty: !note.comment }"
+                @click="startCommentEdit(note)"
+              >
+                <v-icon size="12">mdi-pencil-outline</v-icon>
+                <span class="comment-text">{{ note.comment || "添加备注" }}</span>
+              </button>
+            </div>
+
+            <div class="note-actions">
+              <span class="note-ask-wrap" :title="askDisabledTitle ?? undefined">
+                <button
+                  type="button"
+                  class="note-ask"
+                  :disabled="askDisabledTitle !== null"
+                  @click.stop="onAskNote(note)"
+                >
+                  追问
+                </button>
+              </span>
+            </div>
           </div>
         </div>
       </div>
@@ -428,6 +505,67 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--pix-text-secondary);
   opacity: 1;
+}
+
+/* 选择条：随头部 sticky，位于筛选开关之后（R8 设计档 §1.5） */
+.notes-selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-elevated, #ffffff);
+}
+
+.notes-selection-count {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--pix-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notes-ask-btn-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.notes-ask-btn {
+  padding: 2px 8px;
+  border: none;
+  border-radius: 999px;
+  background: var(--pix-accent, #31424f);
+  color: #ffffff;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.notes-ask-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.notes-selection-clear {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.notes-selection-clear:hover {
+  background: var(--pix-bg-hover, #e8eff5);
+  color: var(--pix-text-primary);
 }
 
 .notes-notice {
@@ -632,8 +770,9 @@ onBeforeUnmount(() => {
 
 .note-row {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  gap: 6px;
+  align-items: flex-start;
   margin: 0 0 6px;
   padding: 7px 8px;
   border: 1px solid var(--pix-border-light, #e3eaf0);
@@ -644,6 +783,36 @@ onBeforeUnmount(() => {
 
 .note-row:hover {
   border-color: var(--pix-border, #d5dfe8);
+}
+
+/* 选择控件列：宽度固定 13px + gap 6px，.note-head 内部三元素与删除按钮位置不变（32 段 headOverflow 回归门） */
+.note-select-wrap {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+}
+
+.note-select {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--pix-accent);
+  cursor: pointer;
+}
+
+.note-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 已选行态；与 .confirming 叠加时由后者在样式表中的既有配色胜出，不新增第三种配色 */
+.note-row.selected {
+  border-color: var(--pix-accent, #31424f);
+  background: var(--pix-accent-light, #edf2f6);
 }
 
 .note-row.confirming {
@@ -792,5 +961,38 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: 4px;
+}
+
+/* 行内追问：.note-body 的最后一个子节点，右对齐单行 */
+.note-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.note-ask-wrap {
+  display: inline-flex;
+  align-items: center;
+}
+
+.note-ask {
+  padding: 1px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-link, #314b5f);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.note-ask:hover {
+  background: var(--pix-bg-hover, #e8eff5);
+}
+
+.note-ask:disabled {
+  opacity: 0.5;
+  cursor: default;
+  color: var(--pix-text-muted);
 }
 </style>

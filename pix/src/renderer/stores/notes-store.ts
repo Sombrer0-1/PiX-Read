@@ -14,6 +14,7 @@ import type { PixApi } from "../../main/preload";
 import { useReaderStore } from "./reader-store";
 import { useProjectStore } from "./project-store";
 import { currentDocKey as toDocKey, groupNotesByDocument, type NoteGroup } from "../utils/notes-path";
+import { MAX_CONTEXT_NOTES } from "../utils/reading-context";
 
 export type AddNoteResult = { ok: true; duplicate: boolean; page: number } | { ok: false; message: string };
 export type ExportNotesResult = { ok: true; filePath: string; count: number } | { ok: false; message: string };
@@ -59,6 +60,12 @@ export const useNotesStore = defineStore("notes", () => {
   const lastExport = ref<{ filePath: string; count: number; at: number } | null>(null);
   const currentDocOnly = ref(false);
 
+  /**
+   * 选择集只存 id，整组替换式更新（不做就地 add/delete）；允许含失效 id，
+   * 计数、上限与注入一律取派生结果，故删除/重载后不产生幽灵条目。
+   */
+  const selectedNoteIds = ref<ReadonlySet<string>>(new Set());
+
   /** 竞态序号：loadSeq 丢弃过期 load；writeSeq 让已完成的变更不被先发起的 load 覆盖。 */
   let loadSeq = 0;
   let writeSeq = 0;
@@ -70,6 +77,9 @@ export const useNotesStore = defineStore("notes", () => {
     groupNotesByDocument(notes.value, currentDocKey.value, currentDocOnly.value)
   );
   const errorMessage = computed(() => (errorCode.value ? ERROR_TITLES[errorCode.value] : "") || errorDetail.value);
+  const selectedNotes = computed<ReaderNote[]>(() => notes.value.filter((n) => selectedNoteIds.value.has(n.id)));
+  const selectedCount = computed(() => selectedNotes.value.length);
+  const selectionFull = computed(() => selectedNotes.value.length >= MAX_CONTEXT_NOTES);
 
   /** 只有 success === true 的变更才覆盖本地列表（失败时主进程回传的 notes 恒为空）。 */
   function applyNotes(next: ReaderNote[]): void {
@@ -185,10 +195,36 @@ export const useNotesStore = defineStore("notes", () => {
     notesFilePath.value = "";
     lastExport.value = null;
     currentDocOnly.value = false;
+    clearNoteSelection();
   }
 
   function setCurrentDocOnly(value: boolean): void {
     currentDocOnly.value = value;
+  }
+
+  function isNoteSelected(id: string): boolean {
+    return selectedNoteIds.value.has(id);
+  }
+
+  /** 上限守卫用派生计数判（失效 id 不占名额）：未选且已满 ⇒ no-op。 */
+  function toggleNoteSelected(id: string): void {
+    if (isNoteSelected(id)) {
+      selectedNoteIds.value = new Set([...selectedNoteIds.value].filter((noteId) => noteId !== id));
+      return;
+    }
+    if (selectionFull.value) return;
+    selectedNoteIds.value = new Set([...selectedNoteIds.value, id]);
+  }
+
+  /** 「追问」的替换语义：id 不在最新清单 ⇒ 返回 false 且零副作用（不改集合、不发信号、不聚焦）。 */
+  function replaceSelectionWith(id: string): boolean {
+    if (!notes.value.some((note) => note.id === id)) return false;
+    selectedNoteIds.value = new Set([id]);
+    return true;
+  }
+
+  function clearNoteSelection(): void {
+    selectedNoteIds.value = new Set();
   }
 
   return {
@@ -199,6 +235,9 @@ export const useNotesStore = defineStore("notes", () => {
     notesFilePath,
     lastExport,
     currentDocOnly,
+    selectedNotes,
+    selectedCount,
+    selectionFull,
     totalCount,
     hasNotes,
     currentDocKey,
@@ -212,5 +251,9 @@ export const useNotesStore = defineStore("notes", () => {
     recoverCorruptNotes,
     resetNotes,
     setCurrentDocOnly,
+    isNoteSelected,
+    toggleNoteSelected,
+    replaceSelectionWith,
+    clearNoteSelection,
   };
 });
