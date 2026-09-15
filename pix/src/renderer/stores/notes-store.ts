@@ -7,13 +7,13 @@
  * 本文件不拼任何存储路径（存储位置由主进程从资料库根派生）。
  */
 
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { defineStore } from "pinia";
 import type { ReaderNote, ReaderNoteDraft, ReaderNotesErrorCode, ReaderNotesMutationResult } from "@shared/types";
 import type { PixApi } from "../../main/preload";
 import { useReaderStore } from "./reader-store";
 import { useProjectStore } from "./project-store";
-import { currentDocKey as toDocKey, groupNotesByDocument, type NoteGroup } from "../utils/notes-path";
+import { currentDocKey as toDocKey, groupNotesByDocument, type NoteGroup, type PageRange } from "../utils/notes-path";
 import { MAX_CONTEXT_NOTES } from "../utils/reading-context";
 
 export type AddNoteResult = { ok: true; duplicate: boolean; page: number } | { ok: false; message: string };
@@ -61,6 +61,14 @@ export const useNotesStore = defineStore("notes", () => {
   const currentDocOnly = ref(false);
 
   /**
+   * 章节过滤：视图状态，非消费式（持续生效直到显式清除或文档作用域失效）；
+   * label 只接受 buildChapterRanges 的产出，不在本文件拼第二份页码文本。
+   */
+  const chapterFilter = ref<{ title: string; label: string; start: number; end: number } | null>(null);
+  /** 一次性聚焦请求信号：单调递增（focusChapter 每次 +1），resetNotes 归 0；复位不构成聚焦请求。 */
+  const chapterFocusToken = ref(0);
+
+  /**
    * 选择集只存 id，整组替换式更新（不做就地 add/delete）；允许含失效 id，
    * 计数、上限与注入一律取派生结果，故删除/重载后不产生幽灵条目。
    */
@@ -73,9 +81,17 @@ export const useNotesStore = defineStore("notes", () => {
   const totalCount = computed(() => notes.value.length);
   const hasNotes = computed(() => notes.value.length > 0);
   const currentDocKey = computed(() => toDocKey(readerStore.filePath, projectStore.currentProject?.path ?? ""));
-  const groups = computed<NoteGroup[]>(() =>
-    groupNotesByDocument(notes.value, currentDocKey.value, currentDocOnly.value)
+  const chapterRange = computed<PageRange | null>(() =>
+    chapterFilter.value ? { start: chapterFilter.value.start, end: chapterFilter.value.end } : null
   );
+  const groups = computed<NoteGroup[]>(() =>
+    groupNotesByDocument(notes.value, currentDocKey.value, currentDocOnly.value, chapterRange.value)
+  );
+
+  // 文档作用域：切文档/关文档即清除章节过滤（token 不变 ⇒ 不触发标签切换，也不发 notesLoad）
+  watch(currentDocKey, () => {
+    chapterFilter.value = null;
+  });
   const errorMessage = computed(() => (errorCode.value ? ERROR_TITLES[errorCode.value] : "") || errorDetail.value);
   const selectedNotes = computed<ReaderNote[]>(() => notes.value.filter((n) => selectedNoteIds.value.has(n.id)));
   const selectedCount = computed(() => selectedNotes.value.length);
@@ -195,11 +211,28 @@ export const useNotesStore = defineStore("notes", () => {
     notesFilePath.value = "";
     lastExport.value = null;
     currentDocOnly.value = false;
+    chapterFilter.value = null;
+    chapterFocusToken.value = 0;
     clearNoteSelection();
   }
 
   function setCurrentDocOnly(value: boolean): void {
     currentDocOnly.value = value;
+  }
+
+  /**
+   * 徽标点击入口：只写过滤状态 + 发一次性聚焦信号；不跳页、不改标签、不清选择集、不发 IPC。
+   * currentDocKey === null（资料库外文件）时 no-op：此时地图上也没有可点击入口。
+   */
+  function focusChapter(input: { title: string; start: number; end: number; label: string }): void {
+    if (currentDocKey.value === null) return;
+    chapterFilter.value = { title: input.title, label: input.label, start: input.start, end: input.end };
+    chapterFocusToken.value += 1;
+  }
+
+  /** 清除只把过滤置 null：不改标签、不改阅读位置、不改选择集、不写盘、不发 IPC。 */
+  function clearChapterFilter(): void {
+    chapterFilter.value = null;
   }
 
   function isNoteSelected(id: string): boolean {
@@ -235,12 +268,15 @@ export const useNotesStore = defineStore("notes", () => {
     notesFilePath,
     lastExport,
     currentDocOnly,
+    chapterFilter,
+    chapterFocusToken,
     selectedNotes,
     selectedCount,
     selectionFull,
     totalCount,
     hasNotes,
     currentDocKey,
+    chapterRange,
     groups,
     errorMessage,
     loadNotes,
@@ -251,6 +287,8 @@ export const useNotesStore = defineStore("notes", () => {
     recoverCorruptNotes,
     resetNotes,
     setCurrentDocOnly,
+    focusChapter,
+    clearChapterFilter,
     isNoteSelected,
     toggleNoteSelected,
     replaceSelectionWith,

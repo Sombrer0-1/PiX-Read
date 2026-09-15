@@ -7,7 +7,7 @@
  * │ 资料库    │ 阅读区                │ Agent 对话  │
  * └──────────┴──────────────────────┴────────────┘
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useSessionStore } from "../stores/session-store";
 import { useReaderStore } from "../stores/reader-store";
@@ -201,6 +201,17 @@ function selectLeftTab(tab: "library" | "notes"): void {
   // 打开面板是允许的读取时机；失败由面板错误态的「重试」处理
   if (tab === "notes") void notesStore.loadNotes();
 }
+
+// 地图徽标 → 笔记面板：切标签的唯一触发条件是 token 变化这一次事件（复位 0 不是聚焦请求，
+// 否则 goHome/卸载的 resetNotes 会伪触发）；不得存在读过滤状态来切标签的路径。
+watch(
+  () => notesStore.chapterFocusToken,
+  (token, previous) => {
+    if (token <= 0 || token <= previous) return;
+    leftCollapsed.value = false;
+    selectLeftTab("notes");
+  },
+);
 
 function onOpenNote(note: ReaderNote): void {
   const target = absoluteDocPath(rootDir.value, note.docPath);

@@ -43,14 +43,42 @@ export function absoluteDocPath(root: string, docPath: string): string {
   return `${root.replace(/[\\/]+$/, "")}${sep}${docPath.replace(/[\\/]+/g, sep)}`;
 }
 
+export interface PageRange {
+  start: number;
+  end: number;
+}
+
+/** 闭区间命中：页码非有限或小于 1 时不命中（不抛错）。 */
+export function rangeContains(range: PageRange, page: number): boolean {
+  return Number.isFinite(page) && page >= range.start && page <= range.end;
+}
+
+/**
+ * 章节过滤的唯一判定式：docKey 为空恒 false；range === null 时只做文档归属判定
+ * ——不是恒真，否则「仅看当前文档」的回退语义会被吞掉。
+ */
+export function matchesChapterFilter(note: ReaderNote, docKey: string | null, range: PageRange | null): boolean {
+  if (docKey === null) return false;
+  if (docPathKey(note.docPath) !== docKey) return false;
+  return range === null || rangeContains(range, note.page);
+}
+
 /** 分组顺序：当前文档组置顶 → 其余按 key 升序；组内 page 升序 → 同页 createdAt 升序。 */
 export function groupNotesByDocument(
   notes: ReaderNote[],
   currentKey: string | null,
-  onlyCurrent: boolean
+  onlyCurrent: boolean,
+  chapterRange: PageRange | null = null
 ): NoteGroup[] {
   const groups = new Map<string, NoteGroup>();
   for (const note of notes) {
+    // 章节过滤生效时逐条等于唯一判定式（含文档归属）；未生效时退回 onlyCurrent 判定：
+    // 章节分支直调该判定式，同文件内不写第二份区间谓词，也不引入中间组合变量
+    const visible =
+      chapterRange !== null
+        ? matchesChapterFilter(note, currentKey, chapterRange)
+        : !onlyCurrent || docPathKey(note.docPath) === currentKey;
+    if (!visible) continue;
     const key = docPathKey(note.docPath);
     const group = groups.get(key);
     if (group) {
@@ -71,8 +99,8 @@ export function groupNotesByDocument(
     group.notes.sort((a, b) => a.page - b.page || a.createdAt - b.createdAt);
   }
   list.sort((a, b) => (a.isCurrentDoc === b.isCurrentDoc ? a.key.localeCompare(b.key) : a.isCurrentDoc ? -1 : 1));
-  // currentKey 为 null 时所有 isCurrentDoc 均为 false，过滤结果为空数组
-  return onlyCurrent ? list.filter((group) => group.isCurrentDoc) : list;
+  // 可见性已在入组前逐条判定；currentKey 为 null 时无组通过（chapterRange 非空时同理，判定式恒 false）
+  return list;
 }
 
 /**

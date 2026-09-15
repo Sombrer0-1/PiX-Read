@@ -10,6 +10,7 @@
 import { computed, onBeforeUnmount, ref } from "vue";
 import { useNotesStore } from "../../stores/notes-store";
 import { emitNotesAsk } from "../../composables/useQuickAsk";
+import { docDisplayName } from "../../utils/notes-path";
 import { MAX_CONTEXT_NOTES } from "../../utils/reading-context";
 import type { ReaderNote } from "@shared/types";
 
@@ -66,15 +67,21 @@ const showEscapeHatch = computed(
 );
 const exportLabel = computed(() => (notesStore.hasNotes ? "导出 Markdown" : "暂无笔记"));
 const filteredEmpty = computed(() => notesStore.hasNotes && notesStore.groups.length === 0);
+/** 章节过滤条容器 title：文档显示名取当前文档比较键的末段（与地图行同一个字符串）。 */
+const chapterFilterTitle = computed(
+  () =>
+    `仅显示当前文档「${docDisplayName(notesStore.currentDocKey ?? "")}」该章节范围内的笔记；点「清除」恢复全部笔记`,
+);
 /**
  * 头部计数：错误态下本地列表是本次读取失败前的旧值，不展示；
- * 筛选开启时同时给出当前文档条数，避免头部与只含当前文档的列表不一致。
+ * 筛选开启时同时给出当前文档条数，章节过滤生效时改给章节内条数（均以避免头部与列表不一致为准则）。
  */
 const countLabel = computed(() => {
   if (notesStore.status === "error") return "";
-  if (!notesStore.currentDocOnly) return `共 ${notesStore.totalCount} 条`;
   const visibleCount = notesStore.groups.reduce((sum, group) => sum + group.notes.length, 0);
   // 左栏头部与导出按钮同排，文案必须放得下，否则头部高度会跳一档
+  if (notesStore.chapterFilter) return `本章 ${visibleCount} 条 / 共 ${notesStore.totalCount} 条`;
+  if (!notesStore.currentDocOnly) return `共 ${notesStore.totalCount} 条`;
   return `当前 ${visibleCount} 条 / 共 ${notesStore.totalCount} 条`;
 });
 
@@ -264,6 +271,23 @@ onBeforeUnmount(() => {
         label="仅看当前文档"
       />
       <div
+        v-if="notesStore.status === 'ready' && notesStore.chapterFilter"
+        class="notes-chapter-filter"
+        :title="chapterFilterTitle"
+      >
+        <span class="notes-chapter-filter-text">
+          章节：{{ notesStore.chapterFilter.title }} · 第 {{ notesStore.chapterFilter.label }} 页
+        </span>
+        <button
+          type="button"
+          class="notes-chapter-filter-clear"
+          title="清除章节过滤，恢复全部笔记"
+          @click="notesStore.clearChapterFilter()"
+        >
+          清除
+        </button>
+      </div>
+      <div
         v-if="notesStore.status === 'ready' && notesStore.hasNotes && notesStore.selectedCount > 0"
         class="notes-selection-bar"
       >
@@ -343,6 +367,10 @@ onBeforeUnmount(() => {
       <v-icon size="40" class="empty-icon">mdi-notebook-outline</v-icon>
       <p class="empty-title">还没有摘录</p>
       <p class="empty-subtitle">在 PDF 中选中文字，点「摘录」保存到这里</p>
+    </div>
+
+    <div v-else-if="notesStore.hasNotes && notesStore.groups.length === 0 && notesStore.chapterFilter" class="notes-chapter-empty">
+      本章暂无笔记
     </div>
 
     <div v-else-if="filteredEmpty" class="notes-filtered-empty">当前文档暂无笔记</div>
@@ -517,6 +545,45 @@ onBeforeUnmount(() => {
   border: 1px solid var(--pix-border-light, #e3eaf0);
   border-radius: var(--pix-radius-md);
   background: var(--pix-bg-elevated, #ffffff);
+}
+
+/* 章节过滤条：位于筛选开关之后、选择条之前（R9 设计档 §1.8），盒模型逐字对齐选择条 */
+.notes-chapter-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-elevated, #ffffff);
+}
+
+.notes-chapter-filter-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--pix-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notes-chapter-filter-clear {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.notes-chapter-filter-clear:hover {
+  background: var(--pix-bg-hover, #e8eff5);
+  color: var(--pix-text-primary);
 }
 
 .notes-selection-count {
@@ -712,6 +779,14 @@ onBeforeUnmount(() => {
 }
 
 .notes-filtered-empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--pix-text-muted);
+}
+
+/* 章节过滤生效且可见行 0（分支优先于「当前文档暂无笔记」） */
+.notes-chapter-empty {
   padding: 24px 16px;
   text-align: center;
   font-size: 12px;

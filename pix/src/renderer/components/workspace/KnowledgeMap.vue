@@ -4,9 +4,14 @@
  *
  * Nodes come from readerStore.outline (pdf.js bookmarks). Clicking a node
  * with a page writes readerStore.gotoPage. No LLM-generated structure.
+ * 页码范围与笔记计数来自 utils/outline-notes（唯一派生）：徽标只显示「该页码范围内的笔记数」，
+ * 不是「子树内的笔记数」（父节点范围不保证覆盖后代）；徽标点击只交给 notesStore.focusChapter。
  */
 import { computed, ref, watch } from "vue";
 import { useReaderStore } from "../../stores/reader-store";
+import { useNotesStore } from "../../stores/notes-store";
+import { buildChapterRanges, countNotesByChapter } from "../../utils/outline-notes";
+import type { ChapterNoteCount, ChapterRange } from "../../utils/outline-notes";
 import type { ReaderOutlineNode } from "@shared/types";
 
 const BRANCH_COLORS = ["#5b8def", "#2a9d8f", "#c4891a", "#7c6bc4", "#c45c6a", "#3d8ea0"];
@@ -19,6 +24,10 @@ interface MapRow {
   color: string;
   depth: number;
   hasChildren: boolean;
+  /** 页码范围（无页码节点为 null）：页脚徽标、已读判定与徽标点击共用同一份派生 */
+  range: ChapterRange | null;
+  /** 当前文档在该范围内的笔记数（只读字段：模板不做按行调用） */
+  count: ChapterNoteCount | null;
 }
 
 interface ChapterGroup {
@@ -27,6 +36,7 @@ interface ChapterGroup {
 }
 
 const readerStore = useReaderStore();
+const notesStore = useNotesStore();
 const expanded = ref<Set<string>>(new Set());
 const treeEl = ref<HTMLElement | null>(null);
 // 点击地图节点后的抑制窗口：期间发生的 page 变化属于程序性跳转，不触发自动滚动
@@ -34,14 +44,23 @@ const suppressScrollUntil = ref(0);
 
 const bookTitle = computed(() => titleFromPath(readerStore.filePath));
 const nodeCount = computed(() => countOutlineNodes(readerStore.outline));
-const pageLabels = computed(() => buildPageLabels(readerStore.outline, readerStore.pageCount));
+/** 唯一范围派生：页码徽标、已读判定、笔记计数与章节过滤共用（utils/outline-notes）。 */
+const chapterRanges = computed(() => buildChapterRanges(readerStore.outline, readerStore.pageCount));
+/** 依赖只有 notes / currentDocKey / outline / pageCount：翻页与展开态变化不触发重算。 */
+const noteCounts = computed(() =>
+  countNotesByChapter(chapterRanges.value, notesStore.notes, notesStore.currentDocKey),
+);
 const rows = computed(() =>
-  flattenVisible(readerStore.outline, 0, "root", null, expanded.value, pageLabels.value),
+  flattenVisible(readerStore.outline, 0, "root", null, expanded.value, chapterRanges.value, noteCounts.value),
 );
 const groups = computed(() => groupByChapter(rows.value));
 const hasOutline = computed(() => readerStore.outline.length > 0);
-// 各节点页码范围上界（预序中下一个更大页码节点的前一页，口径对齐 buildPageLabels）
-const rangeEnds = computed(() => buildRangeEnds(readerStore.outline, readerStore.pageCount));
+/** 阅读位置与全书进度：pageCount 未就绪（加载窗口 / 文本预览）时不渲染这一行。 */
+const progressText = computed(() => {
+  const { page, pageCount } = readerStore;
+  if (pageCount <= 0) return null;
+  return `第 ${page} / ${pageCount} 页 · ${Math.round((page / pageCount) * 100)}%`;
+});
 
 watch(
   () => readerStore.outline,
@@ -83,68 +102,6 @@ function countOutlineNodes(nodes: ReaderOutlineNode[]): number {
   return count;
 }
 
-function collectPreorder(
-  nodes: ReaderOutlineNode[],
-  parentKey: string,
-  into: { key: string; page: number | null }[],
-): void {
-  nodes.forEach((node, index) => {
-    const key = `${parentKey}/${index}`;
-    into.push({ key, page: node.page });
-    collectPreorder(node.items, key, into);
-  });
-}
-
-function buildPageLabels(nodes: ReaderOutlineNode[], pageCount: number): Map<string, string> {
-  const flat: { key: string; page: number | null }[] = [];
-  collectPreorder(nodes, "root", flat);
-  const labels = new Map<string, string>();
-  for (let i = 0; i < flat.length; i++) {
-    const start = flat[i].page;
-    if (start == null) continue;
-    let end: number | null = null;
-    for (let j = i + 1; j < flat.length; j++) {
-      const next = flat[j].page;
-      if (next != null && next > start) {
-        end = next - 1;
-        if (pageCount > 0) end = Math.min(end, pageCount);
-        break;
-      }
-    }
-    if (end == null || end === start || end < start) {
-      labels.set(flat[i].key, String(start));
-    } else {
-      labels.set(flat[i].key, `${start}-${end}`);
-    }
-  }
-  return labels;
-}
-
-/**
- * 计算每个节点的页码范围上界：预序遍历中下一个更大页码节点的前一页，无后继时取总页数。
- * 与 buildPageLabels 使用同一份全量预序（含未展开节点），保证高亮范围与页码徽标一致。
- */
-function buildRangeEnds(nodes: ReaderOutlineNode[], pageCount: number): Map<string, number> {
-  const flat: { key: string; page: number | null }[] = [];
-  collectPreorder(nodes, "root", flat);
-  const ends = new Map<string, number>();
-  for (let i = 0; i < flat.length; i++) {
-    const start = flat[i].page;
-    if (start == null) continue;
-    let end = pageCount > 0 ? pageCount : Number.POSITIVE_INFINITY;
-    for (let j = i + 1; j < flat.length; j++) {
-      const next = flat[j].page;
-      if (next != null && next > start) {
-        end = next - 1;
-        if (pageCount > 0) end = Math.min(end, pageCount);
-        break;
-      }
-    }
-    ends.set(flat[i].key, end);
-  }
-  return ends;
-}
-
 function collectExpandable(
   nodes: ReaderOutlineNode[],
   parentKey: string,
@@ -164,24 +121,28 @@ function flattenVisible(
   parentKey: string,
   parentColor: string | null,
   open: Set<string>,
-  labels: Map<string, string>,
+  ranges: Map<string, ChapterRange>,
+  counts: Map<string, ChapterNoteCount>,
 ): MapRow[] {
   const result: MapRow[] = [];
   nodes.forEach((node, index) => {
     const key = `${parentKey}/${index}`;
     const color = parentColor ?? BRANCH_COLORS[index % BRANCH_COLORS.length];
     const title = node.title.trim() || "未命名";
+    const range = ranges.get(key) ?? null;
     result.push({
       key,
       title,
       page: node.page,
-      pageLabel: labels.get(key) ?? null,
+      pageLabel: range?.label ?? null,
       color,
       depth,
       hasChildren: node.items.length > 0,
+      range,
+      count: counts.get(key) ?? null,
     });
     if (node.items.length > 0 && open.has(key)) {
-      result.push(...flattenVisible(node.items, depth + 1, key, color, open, labels));
+      result.push(...flattenVisible(node.items, depth + 1, key, color, open, ranges, counts));
     }
   });
   return result;
@@ -203,12 +164,24 @@ function isExpanded(key: string): boolean {
   return expanded.value.has(key);
 }
 
-// 范围命中：start <= 当前页 <= 范围上界；无页码节点不命中
+// 范围命中：start <= 当前页 <= range.end；无页码（不在 Map）的行不命中
 function isCurrent(row: MapRow): boolean {
-  if (row.page == null) return false;
-  const end = rangeEnds.value.get(row.key);
-  if (end == null) return false;
-  return row.page <= readerStore.page && readerStore.page <= end;
+  return row.range != null && row.range.start <= readerStore.page && readerStore.page <= row.range.end;
+}
+
+// 已读：范围上界严格小于当前页；与 .current 互斥（end < page 与 page <= end 不可同真）
+function isRead(row: MapRow): boolean {
+  return row.range != null && row.range.end < readerStore.page;
+}
+
+function noteCountTitle(count: ChapterNoteCount): string {
+  return `${count.total} 条笔记 · 摘录 ${count.excerpt} · AI 结论 ${count.answer}；点击只看该章节笔记`;
+}
+
+/** 徽标点击把该行的整个 ChapterRange 交给 store：label 只此一份来源，切标签由页面编排。 */
+function onNoteCountClick(range: ChapterRange | null): void {
+  if (!range) return;
+  notesStore.focusChapter(range);
 }
 
 function toggleExpand(key: string): void {
@@ -241,6 +214,8 @@ function onNodeClick(row: MapRow): void {
       <span class="map-count">{{ nodeCount }}</span>
     </div>
 
+    <div v-if="progressText" class="map-progress">{{ progressText }}</div>
+
     <div v-if="!hasOutline" class="map-empty">
       <v-icon size="32" class="empty-icon">mdi-bookmark-off-outline</v-icon>
       <p class="empty-title">当前文档没有书签</p>
@@ -254,7 +229,7 @@ function onNodeClick(row: MapRow): void {
         class="chapter-block"
         :style="{ '--branch': group.chapter.color }"
       >
-        <div class="map-row chapter" :class="{ current: isCurrent(group.chapter) }">
+        <div class="map-row chapter" :class="{ current: isCurrent(group.chapter), read: isRead(group.chapter) }">
           <button
             v-if="group.chapter.hasChildren"
             type="button"
@@ -278,6 +253,17 @@ function onNodeClick(row: MapRow): void {
             <span class="label">{{ group.chapter.title }}</span>
             <span v-if="group.chapter.pageLabel" class="page-badge">{{ group.chapter.pageLabel }}</span>
           </button>
+
+          <button
+            v-if="group.chapter.count"
+            type="button"
+            class="note-count-badge"
+            :title="noteCountTitle(group.chapter.count)"
+            @click="onNoteCountClick(group.chapter.range)"
+          >
+            <v-icon size="11">mdi-notebook-outline</v-icon>
+            <span class="note-count-num">{{ group.chapter.count.total }}</span>
+          </button>
         </div>
 
         <div v-if="group.descendants.length" class="map-children">
@@ -285,7 +271,7 @@ function onNodeClick(row: MapRow): void {
             v-for="row in group.descendants"
             :key="row.key"
             class="map-row child-row"
-            :class="{ current: isCurrent(row) }"
+            :class="{ current: isCurrent(row), read: isRead(row) }"
             :style="{ '--indent': `${(row.depth - 1) * 14}px` }"
           >
             <button
@@ -305,6 +291,17 @@ function onNodeClick(row: MapRow): void {
               <span class="dot" aria-hidden="true"></span>
               <span class="label">{{ row.title }}</span>
               <span v-if="row.pageLabel" class="page-badge">{{ row.pageLabel }}</span>
+            </button>
+
+            <button
+              v-if="row.count"
+              type="button"
+              class="note-count-badge"
+              :title="noteCountTitle(row.count)"
+              @click="onNoteCountClick(row.range)"
+            >
+              <v-icon size="11">mdi-notebook-outline</v-icon>
+              <span class="note-count-num">{{ row.count.total }}</span>
             </button>
           </div>
         </div>
@@ -355,6 +352,20 @@ function onNodeClick(row: MapRow): void {
   line-height: 16px;
   text-align: center;
   font-variant-numeric: tabular-nums;
+}
+
+/* 阅读位置与全书进度：既有头部行之后的独立一行，无交互 */
+.map-progress {
+  flex-shrink: 0;
+  padding: 0 8px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--pix-text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .map-empty {
@@ -417,6 +428,11 @@ function onNodeClick(row: MapRow): void {
 .map-row.chapter.current,
 .map-row.child-row.current {
   background: color-mix(in srgb, var(--branch) 18%, transparent);
+}
+
+/* 已读行整行等比弱化（含 dot / label / 徽标 / 分支色），不新增颜色变量 */
+.map-row.read {
+  opacity: 0.55;
 }
 
 .map-children {
@@ -546,5 +562,27 @@ function onNodeClick(row: MapRow): void {
   text-align: center;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* 笔记数徽标：渲染在 .map-node 之后（按钮不能嵌在按钮内），0 条时不进 DOM */
+.note-count-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--branch) 32%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--branch) 16%, #fff);
+  color: var(--branch);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.note-count-badge:hover {
+  background: color-mix(in srgb, var(--branch) 26%, #fff);
 }
 </style>

@@ -58,6 +58,16 @@ const SEL = {
   pdfPageOne: '.pdf-page[data-page="1"] .textLayer span',
   quickAsk: ".quick-ask",
   quickAskFeedbackOk: ".quick-ask-feedback.is-ok",
+  mapToggle: ".map-toggle",
+  mapSlot: ".knowledge-map-slot",
+  mapEmpty: ".map-empty",
+  mapRow: ".map-row",
+  mapNode: ".map-node",
+  mapBadge: ".note-count-badge",
+  mapProgress: ".map-progress",
+  chapterFilter: ".notes-chapter-filter",
+  chapterFilterClear: ".notes-chapter-filter-clear",
+  chapterEmpty: ".notes-chapter-empty",
 };
 
 // ---------------------------------------------------------------------------
@@ -68,11 +78,24 @@ function escapePdfText(text) {
   return text.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
 
-function buildPdf(pages) {
+/**
+ * 最小 PDF 生成（pdf.js 需要真实 xref，文本用 Helvetica/WinAnsi，仅 ASCII）。
+ * outline（声明表 { title, page, items }）非空时追加 /Outlines:
+ *   书签根 = 4+2*pages.length，节点按声明表预序连续编号（先子树后兄弟——按层次分配
+ *   会把 /First /Next 串成 BFS 序、pdf.js 解析出的目录结构与声明表不一致）。
+ *   /First 必须是间接引用，否则 pdf.js 直接判「无书签」；page === null 时不输出 /Dest。
+ * outline 缺省为空数组：既有调用点的对象编号与字节布局逐字不变。
+ */
+function buildPdf(pages, outline = []) {
   const objBodies = [];
   const pageIds = pages.map((_, index) => 4 + index * 2);
   const contentIds = pages.map((_, index) => 5 + index * 2);
-  objBodies.push("<< /Type /Catalog /Pages 2 0 R >>");
+  const outlineRootId = 4 + 2 * pages.length;
+  objBodies.push(
+    outline.length
+      ? `<< /Type /Catalog /Pages 2 0 R /Outlines ${outlineRootId} 0 R >>`
+      : "<< /Type /Catalog /Pages 2 0 R >>",
+  );
   objBodies.push(`<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pages.length} >>`);
   objBodies.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
   pages.forEach((lines, index) => {
@@ -89,6 +112,45 @@ function buildPdf(pages) {
     stream += "ET";
     objBodies.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
   });
+
+  if (outline.length) {
+    const itemsOf = (node) => (Array.isArray(node.items) ? node.items : []);
+    const countSubtree = (nodes) => nodes.reduce((sum, node) => sum + 1 + countSubtree(itemsOf(node)), 0);
+    const ids = new Map();
+    let nextId = outlineRootId + 1;
+    const allocate = (nodes) => {
+      nodes.forEach((node) => {
+        ids.set(node, nextId);
+        nextId += 1;
+        allocate(itemsOf(node));
+      });
+    };
+    allocate(outline);
+    const nodeBodies = [];
+    const emit = (nodes, parentId) => {
+      nodes.forEach((node, index) => {
+        const items = itemsOf(node);
+        const fields = [`/Title (${escapePdfText(node.title)})`, `/Parent ${parentId} 0 R`];
+        if (node.page != null) fields.push(`/Dest [${pageIds[node.page - 1]} 0 R /XYZ null null null]`);
+        if (index > 0) fields.push(`/Prev ${ids.get(nodes[index - 1])} 0 R`);
+        if (index < nodes.length - 1) fields.push(`/Next ${ids.get(nodes[index + 1])} 0 R`);
+        if (items.length) {
+          fields.push(
+            `/First ${ids.get(items[0])} 0 R`,
+            `/Last ${ids.get(items[items.length - 1])} 0 R`,
+            `/Count ${countSubtree(items)}`,
+          );
+        }
+        nodeBodies.push(`<< ${fields.join(" ")} >>`);
+        emit(items, ids.get(node));
+      });
+    };
+    emit(outline, outlineRootId);
+    objBodies.push(
+      `<< /Type /Outlines /First ${ids.get(outline[0])} 0 R /Last ${ids.get(outline[outline.length - 1])} 0 R /Count ${countSubtree(outline)} >>`,
+    );
+    objBodies.push(...nodeBodies);
+  }
 
   let out = "%PDF-1.4\n";
   const offsets = [];
@@ -139,6 +201,90 @@ const OLDER_PAGES = [
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
+
+/**
+ * sample-paper.pdf 的声明期望值（pageCount 3 + 标准种子 seedNotes()）：场景断言直接引用本表字面量。
+ * rows 按 DOM 顺序：label / pageText / noteNum / noteTitle（null = 该行无对应元素）。
+ */
+const SAMPLE_MAP_EXPECT = {
+  nodeCount: 8,
+  visibleRows: 7,
+  badges: 4,
+  badgeTexts: ["1", "2", "2", "3", "3", "2-3"],
+  rows: [
+    { label: "1. Abstract", pageText: "1", noteNum: "1", noteTitle: "1 条笔记 · 摘录 1 · AI 结论 0；点击只看该章节笔记" },
+    { label: "2. Method Overview", pageText: "2", noteNum: "2", noteTitle: "2 条笔记 · 摘录 1 · AI 结论 1；点击只看该章节笔记" },
+    { label: "2.1 Sparse mask budget", pageText: "2", noteNum: "2", noteTitle: "2 条笔记 · 摘录 1 · AI 结论 1；点击只看该章节笔记" },
+    { label: "2.2 Positional prior", pageText: "3", noteNum: null, noteTitle: null },
+    { label: "3. Ablation Study", pageText: "3", noteNum: null, noteTitle: null },
+    { label: "Appendix A", pageText: null, noteNum: null, noteTitle: null },
+    { label: "Appendix B", pageText: "2-3", noteNum: "2", noteTitle: "2 条笔记 · 摘录 1 · AI 结论 1；点击只看该章节笔记" },
+  ],
+  read: {
+    page1: { read: 0, current: 1 },
+    page2: { read: 1, current: 3 },
+    page3: { read: 3, current: 3 },
+  },
+  progress: {
+    page1: "第 1 / 3 页 · 33%",
+    page2: "第 2 / 3 页 · 67%",
+    page3: "第 3 / 3 页 · 100%",
+  },
+};
+
+/**
+ * sample-paper.pdf（3 页）的书签声明表：{ title, page, items } 喂给 buildPdf 生成 /Outlines；
+ * label 只是断言期望值（手写，不参与 PDF 生成）——「无更大后继且 page < pageCount」的唯一文案变化落在 Appendix B。
+ */
+const SAMPLE_OUTLINE = [
+  { title: "1. Abstract", page: 1, label: "1", items: [] },
+  {
+    title: "2. Method Overview",
+    page: 2,
+    label: "2",
+    items: [
+      { title: "2.1 Sparse mask budget", page: 2, label: "2", items: [] },
+      { title: "2.2 Positional prior", page: 3, label: "3", items: [] },
+    ],
+  },
+  {
+    title: "3. Ablation Study",
+    page: 3,
+    label: "3",
+    items: [
+      // 无页码节点：不进 ranges（无页码徽标、无笔记徽标、不参与已读/当前判定）
+      {
+        title: "Appendix A",
+        page: null,
+        label: null,
+        items: [{ title: "Appendix A.1", page: 3, label: "3", items: [] }],
+      },
+      { title: "Appendix B", page: 2, label: "2-3", items: [] },
+    ],
+  },
+];
+
+/** long-book.pdf（60 页）：20 章 × 10 节 × 1 子节 = 420 节点；page(Chapter k) = page(Section k.*) = page(Note k.*) = 1+3k。 */
+const LONG_BOOK_PAGES = Array.from({ length: 60 }, (_, index) => [
+  { text: `Long Book Page ${index + 1}`, size: 16 },
+  { text: `Chapter ${Math.floor(index / 3) + 1} body text for the outline scale fixture.`, size: 12 },
+]);
+const LONG_BOOK_OUTLINE = Array.from({ length: 20 }, (_, chapter) => {
+  const chapterLabel = String(chapter + 1).padStart(2, "0");
+  const page = 1 + chapter * 3;
+  return {
+    title: `Chapter ${chapterLabel}`,
+    page,
+    items: Array.from({ length: 10 }, (_, section) => {
+      const sectionLabel = String(section + 1).padStart(2, "0");
+      return {
+        title: `Section ${chapterLabel}.${sectionLabel}`,
+        page,
+        items: [{ title: `Note ${chapterLabel}.${sectionLabel}`, page, items: [] }],
+      };
+    }),
+  };
+});
 
 /** 种子笔记：覆盖「多文档分组 / 当前文档标记 / 长文折叠 / 备注空与非空」。 */
 function seedNotes() {
@@ -197,13 +343,15 @@ function writeFixtures() {
   mkdirSync(join(LIBRARY_B_DIR, ".pix-read"), { recursive: true });
   mkdirSync(SHOTS_DIR, { recursive: true });
   // A/B 两个工作区的 sample-paper.pdf 同字节；B 不预置 reader-state.json（首启 missing）
-  const samplePdf = buildPdf(SAMPLE_PAGES);
+  const samplePdf = buildPdf(SAMPLE_PAGES, SAMPLE_OUTLINE);
   writeFileSync(join(LIBRARY_DIR, "sample-paper.pdf"), samplePdf);
   writeFileSync(join(LIBRARY_B_DIR, "sample-paper.pdf"), samplePdf);
   // 上一轮遗留的状态文件会让「首启 missing」不可复现：fixture 冻结为两个工作区都没有它
   rmSync(join(LIBRARY_DIR, ".pix-read", "reader-state.json"), { force: true });
   rmSync(join(LIBRARY_B_DIR, ".pix-read", "reader-state.json"), { force: true });
   writeFileSync(join(LIBRARY_DIR, "archive", "older-paper.pdf"), buildPdf(OLDER_PAGES));
+  // long-book.pdf:420 节点规模场景的夹具（与 sample-paper 同格式，无页码声明表以外的内容依赖）
+  writeFileSync(join(LIBRARY_DIR, "long-book.pdf"), buildPdf(LONG_BOOK_PAGES, LONG_BOOK_OUTLINE));
   writeFileSync(
     join(LIBRARY_DIR, "reading-notes.md"),
     "# 阅读清单\n\n- [x] sample-paper.pdf\n- [ ] archive/older-paper.pdf\n",
@@ -251,6 +399,8 @@ let notesAddDelayMs = 0;
 let notesAddFailure = null;
 let notesDeleteFailure = null;
 const notesAddCalls = [];
+// notesLoad 计数器：52h 的「goHome 不得触发加载」判据（只计数，不影响返回）
+let notesLoadCalls = 0;
 // 发送类命令（prompt/steer）的记录：notes-context / notes-chip 断言的事实源（N50 验收 1）
 const sendCalls = [];
 let sendFailure = null;
@@ -481,6 +631,8 @@ const LIBRARY_TREE = [
   ] },
   { name: "reading-notes.md", path: path.join(CONFIG.root, "reading-notes.md"), type: "file" },
   { name: "sample-paper.pdf", path: CONFIG.samplePath, type: "file" },
+  // 追加在末行：既有行位置不变（waitTreeRows 用 >=，既有场景不受影响）
+  { name: "long-book.pdf", path: path.join(CONFIG.root, "long-book.pdf"), type: "file" },
 ];
 
 // B 树只返回同名的那一行：场景 24 的 B 侧断言必须有真实的树可断言
@@ -575,6 +727,7 @@ const api = {
   },
 
   notesLoad: async function () {
+    notesLoadCalls += 1;
     if (loadDelayMs) await sleep(loadDelayMs);
     if (loadFailure) {
       return { success: false, notes: [], filePath: NOTES_FILE, code: loadFailure.code, error: loadFailure.error };
@@ -722,6 +875,7 @@ contextBridge.exposeInMainWorld("__pixStub", {
   notesAddCalls: function () {
     return { count: notesAddCalls.length, payloads: notesAddCalls.slice(-8) };
   },
+  notesLoadCalls: function () { return notesLoadCalls; },
   setNotesAddFailure: function (code) { notesAddFailure = code || null; },
   setNotesDeleteFailure: function (code) { notesDeleteFailure = code || null; },
   sendCalls: function () {
@@ -3642,6 +3796,867 @@ async function runReaderStateScenarios(win, log) {
     ...(lastTitle46 && lastTitle46.includes("第 3 页") ? [] : [`回滚后重发的锚点应为第 3 页：${lastTitle46}`]),
     ...(lastTitle46 && !lastTitle46.includes("（按当前阅读位置）") ? [] : [`回滚后重发不得回退到当前阅读位置：${lastTitle46}`]),
   ]);
+
+  // -------------------------------------------------------------------------
+  // 场景 50-55：结构可见（R9 / N52-N62）
+  //
+  // 挂载位置：本函数末尾（R8 场景 46 之后）。36 末段 rmSync 了 archive/older-paper.pdf,
+  // 50c/52g 需要该文件 ⇒ 本节开头按原字节重建（00-46 的断言已全部执行完毕）。
+  // 入口序列与 R8 一致：goHome → clearStateA → enterWorkspace → 写种子（停在资料库标签）。
+  // 页脚徽标 / 进度 / 已读全部来自 utils/outline-notes 的唯一派生；断言只引用声明表字面量。
+  // -------------------------------------------------------------------------
+
+  writeFileSync(join(LIBRARY_DIR, "archive", "older-paper.pdf"), buildPdf(OLDER_PAGES));
+
+  const setLoadFailure = (code) => js(`window.__pixStub.setLoadFailure(${JSON.stringify(code)}), true`);
+  const setLoadDelay = (ms) => js(`window.__pixStub.setLoadDelay(${ms}), true`);
+  const setLibraryReadDelay = (ms) => js(`window.__pixStub.setLibraryReadDelay(${ms}), true`);
+  const loadCalls = () => js("window.__pixStub.notesLoadCalls()");
+  const fileHash = (file) => {
+    try {
+      return createHash("sha256").update(readFileSync(file)).digest("hex");
+    } catch (err) {
+      return null;
+    }
+  };
+  const activeTab = () => js(`(() => {
+    const el = document.querySelector(".pill-tab.active");
+    return el ? el.getAttribute("data-tab") : null;
+  })()`);
+  const filterChecked = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.notesFilterInput)});
+    return el ? el.checked : null;
+  })()`);
+  const groupPaths = () => js(`Array.from(document.querySelectorAll(".notes-group-head")).map((el) => el.getAttribute("title"))`);
+  /** 过滤器开关：与既有场景同一落点（input 本体），再等状态生效。 */
+  const toggleCurrentDocOnly = async (value) => {
+    await js(`document.querySelector(${JSON.stringify(SEL.notesFilterInput)}).click(), true`);
+    await waitFor(
+      `仅看当前文档 ${value ? "ON" : "OFF"}`,
+      `document.querySelector(${JSON.stringify(SEL.notesFilterInput)}).checked === ${value}`,
+    );
+  };
+  /** 打开知识地图：只等槽位--无书签与加载窗口下只有 .map-empty,.map-row 结构性不存在。 */
+  const openMap = async () => {
+    await js(`document.querySelector(${JSON.stringify(SEL.mapToggle)}).click(), true`);
+    await waitFor("知识地图槽位", `document.querySelector(${JSON.stringify(SEL.mapSlot)})`);
+  };
+  /** 地图行定位表达式：按 .label 逐字匹配（与声明表同源）。 */
+  const mapRowExpr = (name) => `Array.from(document.querySelectorAll(".map-row")).find((row) => {
+    const label = row.querySelector(".label");
+    return !!label && label.textContent.trim() === ${JSON.stringify(name)};
+  })`;
+  /** 地图快照：行、页码徽标、笔记徽标与每行几何/状态（断言直接引用本结构字段）。 */
+  const mapSnapshot = () => js(`(() => {
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const rows = Array.from(document.querySelectorAll(".map-row"));
+    return {
+      count: text(document.querySelector(".map-count")),
+      rowCount: rows.length,
+      pageBadges: Array.from(document.querySelectorAll(".map-row .page-badge")).map((el) => text(el)),
+      progress: text(document.querySelector(".map-progress")),
+      badgeCount: document.querySelectorAll(".note-count-badge").length,
+      rows: rows.map((row) => {
+        const page = row.querySelector(".page-badge");
+        const node = row.querySelector(".map-node");
+        const badge = row.querySelector(".note-count-badge");
+        const pageStyle = page ? getComputedStyle(page) : null;
+        const badgeStyle = badge ? getComputedStyle(badge) : null;
+        return {
+          label: text(row.querySelector(".label")),
+          pageText: text(page),
+          pageHeight: pageStyle ? pageStyle.height : null,
+          pageFontSize: pageStyle ? pageStyle.fontSize : null,
+          pageRadius: pageStyle ? pageStyle.borderTopLeftRadius : null,
+          pageFits: page ? page.scrollWidth <= page.clientWidth : null,
+          noteNum: text(row.querySelector(".note-count-num")),
+          noteTitle: badge ? badge.getAttribute("title") : null,
+          noteHeight: badgeStyle ? badgeStyle.height : null,
+          noteFontSize: badgeStyle ? badgeStyle.fontSize : null,
+          noteRadius: badgeStyle ? badgeStyle.borderTopLeftRadius : null,
+          noteBorderWidth: badgeStyle ? badgeStyle.borderTopWidth : null,
+          read: row.classList.contains("read"),
+          current: row.classList.contains("current"),
+          opacity: getComputedStyle(row).opacity,
+          rowFits: row.scrollWidth <= row.clientWidth,
+          nodeFits: node ? node.scrollWidth <= node.clientWidth : null,
+          childCount: row.children.length,
+        };
+      }),
+    };
+  })()`);
+  const mapRowSummary = (name) => js(`(() => {
+    const row = ${mapRowExpr(name)};
+    if (!row) return null;
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const badge = row.querySelector(".note-count-badge");
+    return {
+      label: text(row.querySelector(".label")),
+      pageText: text(row.querySelector(".page-badge")),
+      noteNum: text(row.querySelector(".note-count-num")),
+      noteTitle: badge ? badge.getAttribute("title") : null,
+      read: row.classList.contains("read"),
+      current: row.classList.contains("current"),
+      opacity: getComputedStyle(row).opacity,
+      childCount: row.children.length,
+    };
+  })()`);
+  const mapRowCount = (name) => js(`Array.from(document.querySelectorAll(".map-row")).filter((row) => {
+    const label = row.querySelector(".label");
+    return !!label && label.textContent.trim() === ${JSON.stringify(name)};
+  }).length`);
+  const badgePairs = () => js(`(() => {
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    return Array.from(document.querySelectorAll(".map-row")).map((row) => {
+      const badge = row.querySelector(".note-count-badge");
+      return {
+        label: text(row.querySelector(".label")),
+        num: text(row.querySelector(".note-count-num")),
+        title: badge ? badge.getAttribute("title") : null,
+      };
+    }).filter((row) => row.num !== null);
+  })()`);
+  const clickMapBadge = (name) => js(`(() => {
+    const row = ${mapRowExpr(name)};
+    if (!row) throw new Error("map row not found: " + ${JSON.stringify(name)});
+    const badge = row.querySelector(".note-count-badge");
+    if (!badge) throw new Error("note badge not found: " + ${JSON.stringify(name)});
+    badge.click();
+    return true;
+  })()`);
+  const clickMapNode = (name) => js(`(() => {
+    const row = ${mapRowExpr(name)};
+    if (!row) throw new Error("map row not found: " + ${JSON.stringify(name)});
+    row.querySelector(".map-node").click();
+    return true;
+  })()`);
+  const chapterFilterText = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.chapterFilter)});
+    if (!el) return null;
+    const label = el.querySelector(".notes-chapter-filter-text");
+    return label ? label.textContent.replace(/\\s+/g, " ").trim() : null;
+  })()`);
+  const chapterFilterTitle = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.chapterFilter)});
+    return el ? el.getAttribute("title") : null;
+  })()`);
+  /** 过滤条就绪：文本逐字相等 + 面板行数达标（切标签会触发 loadNotes，两者都要等）。 */
+  const waitChapterFilter = (text, rows) =>
+    waitFor(
+      `章节过滤条「${text}」+ ${rows} 行`,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(SEL.chapterFilter)});
+        if (!el) return false;
+        const label = el.querySelector(".notes-chapter-filter-text");
+        return !!label && label.textContent.replace(/\\s+/g, " ").trim() === ${JSON.stringify(text)}
+          && document.querySelectorAll(".note-row").length === ${rows};
+      })()`,
+    );
+  /** R9 场景入口：回首页 → 清 A 现场 → 进工作区（long-book 已入树 ⇒ 5 行）→ 写种子。 */
+  const enterMapWorkspace = async (seed) => {
+    await enterCleanWorkspace(seed);
+    await waitTreeRows(5);
+  };
+  /** 打开 sample-paper.pdf（第 1 页）→ 切笔记标签（触发 loadNotes）→ 开地图并等 7 行。 */
+  const enterSampleMap = async (rows = 4) => {
+    await openRow("sample-paper.pdf");
+    await waitPdfLoaded();
+    await waitPage(1, 3);
+    await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+    await waitFor("笔记列表就绪", `document.querySelectorAll(".note-row").length === ${rows}`);
+    await openMap();
+    await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  };
+  const backToLibraryTab = async () => {
+    await js(`document.querySelector(${JSON.stringify(SEL.tabLibrary)}).click(), true`);
+    await waitFor("活动标签切到资料库", `document.querySelector(".pill-tab.active").getAttribute("data-tab") === "library"`);
+  };
+  const waitNotesTab = () =>
+    waitFor("活动标签切到笔记", `document.querySelector(".pill-tab.active").getAttribute("data-tab") === "notes"`);
+  const readCounts = (snap) => ({
+    read: snap.rows.filter((row) => row.read).length,
+    current: snap.rows.filter((row) => row.current).length,
+    both: snap.rows.filter((row) => row.read && row.current).length,
+  });
+  /** 进度行与页码指示器联读：两处的 N / M 必须同源同值。 */
+  const progressSnapshot = async () => {
+    const progress = await textOf(SEL.mapProgress);
+    const label = await pageLabel();
+    const match = /第 (\d+) \/ (\d+) 页/.exec(label || "");
+    return {
+      progress,
+      pageLabel: label,
+      pagePair: match ? `第 ${match[1]} / ${match[2]} 页` : null,
+      current: await countOf(".map-row.current"),
+    };
+  };
+  /** 55 段场景局部种子：写穿同一 notes.json（标准种子由 restoreStandardSeed 复位）。 */
+  const longBookSeed = () => {
+    const now = Date.now();
+    return [
+      { id: "lb-1", kind: "excerpt", docPath: "long-book.pdf", page: 1, text: "长书夹具的摘录", comment: "", createdAt: now - 2 * MINUTE, updatedAt: now - 2 * MINUTE },
+      { id: "lb-2", kind: "answer", docPath: "long-book.pdf", page: 58, text: "长书夹具的 AI 结论", comment: "", createdAt: now - MINUTE, updatedAt: now - MINUTE },
+    ];
+  };
+  /** long-book 的朴素参照：按声明表（章节起页 = 1+3k，范围 = 起页..min（起页 + 2, 60））逐页扫描种子。 */
+  const longBookExpected = (title) => {
+    const seed = longBookSeed();
+    const inRange = (start) => seed.filter((note) => note.page >= start && note.page <= Math.min(start + 2, 60)).length;
+    const chapter = /^Chapter (\d+)$/.exec(title);
+    if (chapter) return inRange(1 + 3 * (Number(chapter[1]) - 1));
+    const section = /^Section (\d+)\.(\d+)$/.exec(title);
+    if (section) return inRange(1 + 3 * (Number(section[1]) - 1));
+    return null;
+  };
+
+  // --- 50a 有书签文档：节点数 / 可见行 / 页码徽标序列 / 跳页零回归 ---------------
+  log("50a 地图结构：sample-paper.pdf 8 节点 / 7 可见行");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await capturePage(win, "50-map-outline.png");
+  const mapRect50 = await rectOfSelector(SEL.mapSlot, 2);
+  if (mapRect50) await capturePage(win, "50b-map-outline-zoom.png", mapRect50);
+  const snap50 = await mapSnapshot();
+  const appendixA50 = await mapRowSummary("Appendix A");
+  const appendixA1Rows50 = await mapRowCount("Appendix A.1");
+  record(
+    "map-outline",
+    { phase: "sample", count: snap50.count, rows: snap50.rowCount, pageBadges: snap50.pageBadges, appendixA: appendixA50, appendixA1Rows: appendixA1Rows50 },
+    [
+      ...(snap50.count === String(SAMPLE_MAP_EXPECT.nodeCount) ? [] : [`节点数异常：${snap50.count}`]),
+      ...(snap50.rowCount === SAMPLE_MAP_EXPECT.visibleRows ? [] : [`可见行异常：${snap50.rowCount}`]),
+      ...(JSON.stringify(snap50.pageBadges) === JSON.stringify(SAMPLE_MAP_EXPECT.badgeTexts)
+        ? []
+        : [`页码徽标序列异常：${JSON.stringify(snap50.pageBadges)}`]),
+      ...(appendixA50 && appendixA50.pageText === null ? [] : [`无页码节点不该有页码徽标：${JSON.stringify(appendixA50)}`]),
+      ...(appendixA1Rows50 === 0 ? [] : ["未展开的孙节点不应渲染"]),
+    ],
+  );
+  await clickMapNode("2.2 Positional prior");
+  await waitPage(3, 3);
+  const jump50 = await pageLabel();
+  await clickMapNode("1. Abstract");
+  await waitPage(1, 3);
+  const back50 = await pageLabel();
+  record("map-outline", { phase: "jump", toThird: jump50, backToFirst: back50 }, [
+    ...(jump50 && jump50.includes("第 3 / 3 页") ? [] : [`点节点应跳页：${jump50}`]),
+    ...(back50 && back50.includes("第 1 / 3 页") ? [] : [`回点首章应落到第 1 页：${back50}`]),
+  ]);
+
+  // --- 50c 无书签文档：空态 + 进度仍在 -----------------------------------------
+  log("50c 无书签文档：地图空态 + 进度行");
+  await enterMapWorkspace(seedNotes());
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await openMap();
+  await waitFor(
+    "地图空态与进度就绪",
+    `document.querySelector(${JSON.stringify(SEL.mapEmpty)}) && document.querySelector(${JSON.stringify(SEL.mapProgress)})`,
+  );
+  await capturePage(win, "50c-map-outline-empty.png");
+  const empty50c = {
+    empty: await has(SEL.mapEmpty),
+    emptyTitle: await textOf(".map-empty .empty-title"),
+    count: await textOf(".map-count"),
+    rows: await countOf(SEL.mapRow),
+    progress: await textOf(SEL.mapProgress),
+  };
+  record("map-outline", { phase: "no-outline", ...empty50c }, [
+    ...(empty50c.empty && empty50c.emptyTitle === "当前文档没有书签" ? [] : [`空态异常：${JSON.stringify(empty50c)}`]),
+    ...(empty50c.count === "0" ? [] : [`空态节点数异常：${empty50c.count}`]),
+    ...(empty50c.rows === 0 ? [] : ["空态不得渲染任何行"]),
+    ...(empty50c.progress === "第 1 / 2 页 · 50%" ? [] : [`空态进度异常：${empty50c.progress}`]),
+  ]);
+
+  // --- 51 笔记数徽标：计数 / 文案 / 几何 / 与开关无关 ---------------------------
+  log("51 笔记数徽标：标准种子下的四行");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await capturePage(win, "51-map-note-badges.png");
+  const badgeRect51 = await rectOfSelector(SEL.mapBadge, 5);
+  if (badgeRect51) await capturePage(win, "51b-map-badge-zoom.png", badgeRect51);
+  const snap51 = await mapSnapshot();
+  const expect51 = SAMPLE_MAP_EXPECT.rows;
+  const mismatch51 = expect51.filter((expect, index) => {
+    const row = snap51.rows[index];
+    return (
+      !row ||
+      row.label !== expect.label ||
+      row.pageText !== expect.pageText ||
+      row.noteNum !== expect.noteNum ||
+      row.noteTitle !== expect.noteTitle
+    );
+  });
+  const badgeRow51 = snap51.rows.find((row) => row.label === "1. Abstract") ?? null;
+  const plainRow51 = snap51.rows.find((row) => row.label === "2.2 Positional prior") ?? null;
+  record(
+    "map-note-badges",
+    { phase: "standard-seed", rows: snap51.rows, badgeCount: snap51.badgeCount, pageBadges: snap51.pageBadges },
+    [
+      ...(snap51.badgeCount === SAMPLE_MAP_EXPECT.badges ? [] : [`徽标数异常：${snap51.badgeCount}`]),
+      ...(snap51.rowCount === SAMPLE_MAP_EXPECT.visibleRows ? [] : [`行数异常：${snap51.rowCount}`]),
+      ...(mismatch51.length === 0 ? [] : [`行徽标不符：${JSON.stringify(mismatch51)}`]),
+      ...(badgeRow51 &&
+      badgeRow51.noteHeight === "16px" &&
+      badgeRow51.noteRadius === "999px" &&
+      badgeRow51.noteFontSize === "10px" &&
+      badgeRow51.noteBorderWidth === "1px"
+        ? []
+        : [`徽标几何异常：${JSON.stringify(badgeRow51)}`]),
+      ...(snap51.rows.filter((row) => row.noteNum === null).every((row) => row.childCount === 2)
+        ? []
+        : ["无徽标行只应有 chevron/spacer + .map-node"]),
+      ...(plainRow51 &&
+      plainRow51.pageText === "3" &&
+      plainRow51.pageHeight === "16px" &&
+      plainRow51.pageFontSize === "10px" &&
+      plainRow51.pageRadius === "999px"
+        ? []
+        : [`无徽标行页码徽标几何异常：${JSON.stringify(plainRow51)}`]),
+      ...(snap51.rows.every((row) => row.rowFits && row.nodeFits !== false && (row.pageText === null || row.pageFits === true))
+        ? []
+        : ["地图行存在溢出"]),
+    ],
+  );
+  const badgesBefore51 = await badgePairs();
+  await toggleCurrentDocOnly(true);
+  await sleep(200);
+  const badgesOn51 = await badgePairs();
+  await toggleCurrentDocOnly(false);
+  await sleep(200);
+  const badgesOff51 = await badgePairs();
+  record("map-note-badges", { phase: "current-doc-toggle", on: badgesOn51, off: badgesOff51 }, [
+    ...(JSON.stringify(badgesOn51) === JSON.stringify(badgesBefore51) ? [] : ["开关 ON 不得改变徽标"]),
+    ...(JSON.stringify(badgesOff51) === JSON.stringify(badgesBefore51) ? [] : ["开关 OFF 不得改变徽标"]),
+    ...((await filterChecked()) === false ? [] : ["开关应回到 OFF"]),
+  ]);
+
+  // --- 52 徽标点击 → 章节过滤（切标签 / 过滤条 / 不落盘） ----------------------
+  log("52 徽标点击：切标签 + 章节过滤条 + 字节不变");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await backToLibraryTab();
+  await sleep(900); // reader-state 去抖窗口：基线必须在静置后取（must-fix 5）
+  const hash52 = { notes: notesHash(), state: fileHash(STATE_FILE_A) };
+  const before52 = { page: await pageLabel(), current: await countOf(".map-row.current") };
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await waitNotesTab();
+  await capturePage(win, "52-map-chapter-filter.png");
+  const leftRect52 = await rectOfSelector(".layout-left", 2);
+  if (leftRect52) await capturePage(win, "52b-map-chapter-filter-left-pane.png", leftRect52);
+  const barRect52 = await rectOfSelector(SEL.chapterFilter, 4);
+  if (barRect52) await capturePage(win, "52c-map-chapter-filter-zoom.png", barRect52);
+  const click52 = {
+    tab: await activeTab(),
+    text: await chapterFilterText(),
+    title: await chapterFilterTitle(),
+    rows: await countOf(SEL.noteRow),
+    groups: await countOf(".notes-group"),
+    count: await textOf(".notes-count"),
+    page: await pageLabel(),
+    current: await countOf(".map-row.current"),
+    notesBytesSame: notesHash() === hash52.notes,
+    stateBytesSame: fileHash(STATE_FILE_A) === hash52.state,
+  };
+  record("map-chapter-filter", { phase: "badge-click", ...click52 }, [
+    ...(click52.tab === "notes" ? [] : [`点徽标应切到笔记标签：${click52.tab}`]),
+    ...(click52.text === "章节：1. Abstract · 第 1 页" ? [] : [`过滤条文本异常：${click52.text}`]),
+    ...(click52.title === "仅显示当前文档「sample-paper.pdf」该章节范围内的笔记；点「清除」恢复全部笔记"
+      ? []
+      : [`过滤条 title 异常：${click52.title}`]),
+    ...(click52.rows === 1 && click52.groups === 1 ? [] : [`过滤后行/组异常：${click52.rows}/${click52.groups}`]),
+    ...(click52.count === "本章 1 条 / 共 4 条" ? [] : [`计数第三态异常：${click52.count}`]),
+    ...(click52.page === before52.page && click52.current === before52.current
+      ? []
+      : [`点徽标不得改阅读位置：${click52.page}/${click52.current}`]),
+    ...(click52.notesBytesSame ? [] : ["点徽标不得改写 notes.json"]),
+    ...(click52.stateBytesSame ? [] : ["点徽标不得改写 reader-state.json"]),
+  ]);
+
+  // 52-子行：子行徽标与父行同范围 ⇒ 行数同为 2（重叠口径的可见证据）
+  await clickMapBadge("2.1 Sparse mask budget");
+  await waitChapterFilter("章节：2.1 Sparse mask budget · 第 2 页", 2);
+  const child52 = { text: await chapterFilterText(), rows: await countOf(SEL.noteRow), groups: await countOf(".notes-group") };
+  record("map-chapter-filter", { phase: "child-badge", ...child52 }, [
+    ...(child52.text === "章节：2.1 Sparse mask budget · 第 2 页" ? [] : [`子行过滤条异常：${child52.text}`]),
+    ...(child52.rows === 2 && child52.groups === 1 ? [] : [`子行过滤行数异常：${child52.rows}/${child52.groups}`]),
+  ]);
+
+  // 52-重复：先切回资料库再点同一徽标（不存在同内容 no-op）
+  await backToLibraryTab();
+  await clickMapBadge("2.1 Sparse mask budget");
+  await waitNotesTab();
+  await waitChapterFilter("章节：2.1 Sparse mask budget · 第 2 页", 2);
+  const repeat52 = { text: await chapterFilterText(), rows: await countOf(SEL.noteRow), tab: await activeTab() };
+  record("map-chapter-filter", { phase: "repeat-click", ...repeat52 }, [
+    ...(repeat52.tab === "notes" ? [] : [`重复点击应切标签：${repeat52.tab}`]),
+    ...(repeat52.text === "章节：2.1 Sparse mask budget · 第 2 页" ? [] : [`重复点击文本异常：${repeat52.text}`]),
+    ...(repeat52.rows === 2 ? [] : [`重复点击行数异常：${repeat52.rows}`]),
+  ]);
+
+  // 52-替换：换一章不累积（chapterFilter 单值）
+  await clickMapBadge("Appendix B");
+  await waitChapterFilter("章节：Appendix B · 第 2-3 页", 2);
+  const replace52 = { text: await chapterFilterText(), rows: await countOf(SEL.noteRow) };
+  record("map-chapter-filter", { phase: "replace", ...replace52 }, [
+    ...(replace52.text === "章节：Appendix B · 第 2-3 页" ? [] : [`替换过滤条异常：${replace52.text}`]),
+    ...(replace52.rows === 2 ? [] : [`替换过滤行数异常：${replace52.rows}`]),
+  ]);
+
+  // 52d 折叠态点徽标：折叠必须被展开（否则过滤生效但看不到结果）
+  await js(`(() => {
+    const btn = Array.from(document.querySelectorAll(".pill-icon-btn")).find((el) => el.getAttribute("title") === "折叠资料库");
+    if (!btn) throw new Error("折叠按钮未找到");
+    btn.click();
+    return true;
+  })()`);
+  await waitFor("左栏折叠", `(() => { const el = document.querySelector(".layout-left"); return !el || el.offsetWidth === 0; })()`);
+  await clickMapBadge("1. Abstract");
+  await waitFor("左栏展开", `(() => { const el = document.querySelector(".layout-left"); return !!el && el.offsetWidth > 0; })()`);
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await capturePage(win, "52d-map-chapter-filter-collapsed.png");
+  const collapsed52 = {
+    tab: await activeTab(),
+    bar: await has(SEL.chapterFilter),
+    leftWidth: await js(`document.querySelector(".layout-left").offsetWidth`),
+  };
+  record("map-chapter-filter", { phase: "collapsed", ...collapsed52 }, [
+    ...(collapsed52.tab === "notes" ? [] : [`折叠态点徽标应切到笔记标签：${collapsed52.tab}`]),
+    ...(collapsed52.bar ? [] : ["折叠态点徽标后过滤条应可见"]),
+    ...(collapsed52.leftWidth > 0 ? [] : ["折叠态点徽标必须展开左栏"]),
+  ]);
+
+  // 52e/52e2：「仅看当前文档」两态逐条相同 + 过滤条 DOM 顺序
+  await toggleCurrentDocOnly(true);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  await capturePage(win, "52e-map-chapter-filter-current-doc-on.png");
+  const on52e = { checked: await filterChecked(), rows: await countOf(SEL.noteRow), groups: await countOf(".notes-group"), count: await textOf(".notes-count") };
+  record("map-chapter-filter", { phase: "and-combination-on", ...on52e }, [
+    ...(on52e.checked === true ? [] : ["起始态开关应为 ON"]),
+    ...(on52e.rows === 2 && on52e.groups === 1 ? [] : [`ON 态行/组异常：${on52e.rows}/${on52e.groups}`]),
+    ...(on52e.count === "本章 2 条 / 共 4 条" ? [] : [`ON 态计数异常：${on52e.count}`]),
+  ]);
+  await toggleCurrentDocOnly(false);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  await js(`(() => {
+    Array.from(document.querySelectorAll(".note-row .note-select")).forEach((el) => el.click());
+    return true;
+  })()`);
+  await waitFor("已选 2 条", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.includes("已选 2 条"); })()`);
+  const order52e2 = await js(`(() => {
+    const filter = document.querySelector(".notes-filter");
+    const bar = document.querySelector(".notes-chapter-filter");
+    const selection = document.querySelector(".notes-selection-bar");
+    const follows = (a, b) => !!a && !!b && (a.compareDocumentPosition(b) & 4) === 4;
+    return { hasAll: !!filter && !!bar && !!selection, filterBar: follows(filter, bar), barSelection: follows(bar, selection) };
+  })()`);
+  await capturePage(win, "52e2-map-chapter-filter-current-doc-off.png");
+  const off52e = { checked: await filterChecked(), rows: await countOf(SEL.noteRow), groups: await countOf(".notes-group"), count: await textOf(".notes-count") };
+  record("map-chapter-filter", { phase: "and-combination-off", ...off52e, order: order52e2, selection: await textOf(".notes-selection-count") }, [
+    ...(off52e.checked === false ? [] : ["OFF 态开关不得被程序改写"]),
+    ...(off52e.rows === 2 && off52e.groups === 1 ? [] : [`OFF 态行/组异常：${off52e.rows}/${off52e.groups}`]),
+    ...(off52e.count === "本章 2 条 / 共 4 条" ? [] : [`OFF 态计数异常：${off52e.count}`]),
+    ...(order52e2.hasAll && order52e2.filterBar && order52e2.barSelection ? [] : [`DOM 顺序异常：${JSON.stringify(order52e2)}`]),
+  ]);
+
+  // 52f 清除：条消失 / 列表回全量 / 开关与阅读位置不变
+  const pageBefore52f = await pageLabel();
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("过滤条消失", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)})`);
+  await waitFor("列表回全量", `document.querySelectorAll(".note-row").length === 4`);
+  await capturePage(win, "52f-map-chapter-filter-cleared.png");
+  const clear52f = { rows: await countOf(SEL.noteRow), count: await textOf(".notes-count"), checked: await filterChecked(), tab: await activeTab(), page: await pageLabel() };
+  record("map-chapter-filter", { phase: "clear", ...clear52f }, [
+    ...(clear52f.rows === 4 ? [] : [`清除后行数异常：${clear52f.rows}`]),
+    ...(clear52f.count === "共 4 条" ? [] : [`清除后计数异常：${clear52f.count}`]),
+    ...(clear52f.checked === false ? [] : ["清除不得改开关"]),
+    ...(clear52f.tab === "notes" ? [] : ["清除不得切标签"]),
+    ...(clear52f.page === pageBefore52f ? [] : ["清除不得改阅读位置"]),
+  ]);
+
+  // 52f2 过滤生效后删空该范围：章节空态（分支优先于「当前文档暂无笔记」）
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await js(`document.querySelector(".note-row .note-delete").click(), true`);
+  await waitFor("删除确认态", `document.querySelector(".note-row").classList.contains("confirming")`);
+  await js(`document.querySelector(".note-row .note-delete").click(), true`);
+  await waitFor("章节空态", `document.querySelector(${JSON.stringify(SEL.chapterEmpty)})`);
+  await capturePage(win, "52f2-notes-chapter-empty.png");
+  const empty52f2 = {
+    text: await textOf(SEL.chapterEmpty),
+    bar: await has(SEL.chapterFilter),
+    count: await textOf(".notes-count"),
+    rows: await countOf(SEL.noteRow),
+    abstract: await mapRowSummary("1. Abstract"),
+  };
+  record("map-chapter-filter", { phase: "chapter-empty", ...empty52f2 }, [
+    ...(empty52f2.text === "本章暂无笔记" ? [] : [`章节空态文案异常：${empty52f2.text}`]),
+    ...(empty52f2.bar ? [] : ["过滤不得被计数归零连带清除"]),
+    // 共 {total} = notesStore.totalCount：删掉范围内唯一条目后 totalCount 为 3
+    ...(empty52f2.count === "本章 0 条 / 共 3 条" ? [] : [`删空后计数异常：${empty52f2.count}`]),
+    ...(empty52f2.rows === 0 ? [] : ["章节空态不得渲染行"]),
+    ...(empty52f2.abstract && empty52f2.abstract.noteNum === null ? [] : [`范围清空后徽标应消失：${JSON.stringify(empty52f2.abstract)}`]),
+  ]);
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("清除后列表回 3 条", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)}) && document.querySelectorAll(".note-row").length === 3`);
+  record("map-chapter-filter", { phase: "chapter-empty-cleared", rows: await countOf(SEL.noteRow) }, [
+    ...((await countOf(SEL.noteRow)) === 3 ? [] : ["清除后应显示剩余 3 条"]),
+  ]);
+  await restoreStandardSeed();
+
+  // 52g 文档作用域：切文档清除过滤（notes.json 不写；reader-state 属 R6 既有语义，不纳入）
+  log("52g 切文档：过滤清除、标签不变、字节不变");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await backToLibraryTab();
+  await sleep(900);
+  const hash52g = notesHash();
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await backToLibraryTab();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记列表就绪", `document.querySelectorAll(".note-row").length === 4`);
+  const switched52g = { bar: await has(SEL.chapterFilter), groups: await countOf(".notes-group"), paths: await groupPaths() };
+  await capturePage(win, "52g-map-chapter-filter-doc-switch.png");
+  record("map-chapter-filter", { phase: "doc-switch", ...switched52g }, [
+    ...(switched52g.bar === false ? [] : ["切文档必须清除章节过滤"]),
+    ...(switched52g.groups === 2 ? [] : [`切文档后组数异常：${switched52g.groups}`]),
+    ...(switched52g.paths[0] === "archive/older-paper.pdf" ? [] : [`当前文档组应置顶：${JSON.stringify(switched52g.paths)}`]),
+  ]);
+  await backToLibraryTab();
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记列表就绪", `document.querySelectorAll(".note-row").length === 4`);
+  const back52g = { bar: await has(SEL.chapterFilter), groups: await countOf(".notes-group"), paths: await groupPaths(), notesBytesSame: notesHash() === hash52g };
+  record("map-chapter-filter", { phase: "doc-switch-back", ...back52g }, [
+    ...(back52g.bar === false ? [] : ["切回原文档不得恢复过滤（已清除）"]),
+    ...(back52g.groups === 2 ? [] : [`切回后组数异常：${back52g.groups}`]),
+    ...(back52g.paths[0] === "sample-paper.pdf" ? [] : [`切回后当前文档组应置顶：${JSON.stringify(back52g.paths)}`]),
+    ...(back52g.notesBytesSame ? [] : ["切文档不得改写 notes.json"]),
+  ]);
+
+  // 52h 一次性聚焦：goHome 不触发加载、重进工作区不复现过滤
+  log("52h 一次性聚焦：goHome 前后 notesLoad 计数不变");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await backToLibraryTab();
+  await clickMapBadge("1. Abstract");
+  await waitNotesTab();
+  await backToLibraryTab();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const middle52h = { tab: await activeTab(), bar: await has(SEL.chapterFilter) };
+  await capturePage(win, "52h-map-chapter-filter-focus-once.png");
+  record("map-chapter-filter", { phase: "focus-once-middle", ...middle52h }, [
+    ...(middle52h.tab === "library" ? [] : [`切文档不得改标签：${middle52h.tab}`]),
+    ...(middle52h.bar === false ? [] : ["切文档应清除过滤"]),
+  ]);
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await waitNotesTab();
+  record("map-chapter-filter", { phase: "focus-once-repeat", tab: await activeTab() }, [
+    ...((await activeTab()) === "notes" ? [] : ["再点徽标应切到笔记标签"]),
+  ]);
+  const loadBefore52h = await loadCalls();
+  await goHome();
+  const loadAfter52h = await loadCalls();
+  record("map-chapter-filter", { phase: "focus-once-home", before: loadBefore52h, after: loadAfter52h }, [
+    ...(loadAfter52h === loadBefore52h ? [] : [`goHome 不得触发 notesLoad:${loadBefore52h} → ${loadAfter52h}`]),
+  ]);
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(5);
+  const remount52h = {
+    tab: await activeTab(),
+    panelVisible: await js(`(() => { const el = document.querySelector(".notes-panel"); return !!el && el.offsetParent !== null; })()`),
+  };
+  record("map-chapter-filter", { phase: "focus-once-remount", ...remount52h }, [
+    ...(remount52h.tab === "library" ? [] : [`重进工作区活动标签应为资料库：${remount52h.tab}`]),
+    ...(remount52h.panelVisible === false ? [] : ["重进工作区笔记面板不应可见"]),
+  ]);
+
+  // 52-err 错误态：过滤条不渲染、状态保留（恢复后清除仍可用）
+  log("52-err 错误态：过滤条不渲染，恢复后清除可用");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await backToLibraryTab();
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await backToLibraryTab();
+  await setLoadFailure("corrupt");
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记错误态", `document.querySelector(".notes-error")`);
+  const error52 = { bar: await has(SEL.chapterFilter), title: await textOf(".notes-error .error-title") };
+  record("map-chapter-filter", { phase: "error", ...error52 }, [
+    ...(error52.bar === false ? [] : ["错误态不得渲染过滤条"]),
+    ...(error52.title === "笔记文件无法读取" ? [] : [`错误态标题异常：${error52.title}`]),
+  ]);
+  await setLoadFailure(null);
+  await js(`(() => {
+    const btn = Array.from(document.querySelectorAll(".notes-error button")).find((el) => el.textContent.trim() === "重试");
+    if (!btn) throw new Error("重试按钮未找到");
+    btn.click();
+    return true;
+  })()`);
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("恢复后清除可用", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)}) && document.querySelectorAll(".note-row").length === 4`);
+  record("map-chapter-filter", { phase: "error-recovered", rows: await countOf(SEL.noteRow), bar: await has(SEL.chapterFilter) }, [
+    ...((await countOf(SEL.noteRow)) === 4 ? [] : ["恢复后清除应回到全量列表"]),
+    ...((await has(SEL.chapterFilter)) === false ? [] : ["恢复后过滤条应已被清除"]),
+  ]);
+
+  // 52-load 加载窗口：过滤条暂不渲染、加载完成后原样出现
+  log("52-load 加载窗口：过滤状态保留");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await backToLibraryTab();
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  await backToLibraryTab();
+  await setLoadDelay(4000);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记加载态", `document.querySelector(".notes-loading")`);
+  const loading52 = { bar: await has(SEL.chapterFilter), loading: await has(".notes-loading") };
+  record("map-chapter-filter", { phase: "loading", ...loading52 }, [
+    ...(loading52.loading ? [] : ["应处于加载态"]),
+    ...(loading52.bar === false ? [] : ["加载态不得渲染过滤条"]),
+  ]);
+  await setLoadDelay(0);
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  const restored52 = await chapterFilterText();
+  record("map-chapter-filter", { phase: "loading-restored", text: restored52 }, [
+    ...(restored52 === "章节：2. Method Overview · 第 2 页" ? [] : [`加载完成后过滤不得丢失：${restored52}`]),
+  ]);
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+
+  // 52-inject 注入口径：被隐藏条目仍在选择集（发送不受过滤影响）
+  log("52-inject 过滤与选择集独立：发送仍注入 2 条");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  await js(`(() => {
+    const inputs = Array.from(document.querySelectorAll(".note-select"));
+    if (inputs.length < 2) throw new Error("选择控件不足");
+    inputs[0].click();
+    inputs[1].click();
+    return true;
+  })()`);
+  await waitFor("已选 2 条", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.includes("已选 2 条"); })()`);
+  const stateHash52i = fileHash(STATE_FILE_A);
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  await typeAndSend("52-inject：过滤后仍按选择集注入。");
+  await runTurn("52-inject：过滤后仍按选择集注入。", "过滤注入回答");
+  await waitFor("回答块", `document.querySelectorAll(".agent-message").length >= 1`);
+  const send52i = await lastSend();
+  const selection52i = await selectionSnapshot();
+  const chips52i = await chipSnapshot();
+  const notesCount52i = send52i ? (send52i.message.match(/^\d+\. doc: /gm) || []).length : 0;
+  record(
+    "map-chapter-filter",
+    {
+      phase: "injection",
+      countText: selection52i.countText,
+      chip: chips52i.notesLabel,
+      notesCount: notesCount52i,
+      hasReaderNotes: !!send52i && send52i.message.includes("reader_notes:"),
+      stateBytesSame: fileHash(STATE_FILE_A) === stateHash52i,
+    },
+    [
+      ...(selection52i.countText === "已选 2 条" ? [] : [`选择集异常：${selection52i.countText}`]),
+      ...(chips52i.notesLabel === "摘录 2 条" ? [] : [`chip 异常：${chips52i.notesLabel}`]),
+      ...(notesCount52i === 2 ? [] : [`注入条数异常：${notesCount52i}`]),
+      ...(send52i && send52i.message.includes("reader_notes:") ? [] : ["发送载荷缺少 reader_notes"]),
+      ...(fileHash(STATE_FILE_A) === stateHash52i ? [] : ["发送不得改写 reader-state.json"]),
+    ],
+  );
+
+  // --- 53 进度行：三页文案与页码指示器同源 -------------------------------------
+  log("53 进度行：第 1 / 2 / 3 页三态");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  const p1 = await progressSnapshot();
+  await capturePage(win, "53-map-progress.png");
+  await clickNext();
+  await waitPage(2, 3);
+  await sleep(150);
+  const p2 = await progressSnapshot();
+  await capturePage(win, "53b-map-progress-p2.png");
+  await clickNext();
+  await waitPage(3, 3);
+  await sleep(150);
+  const p3 = await progressSnapshot();
+  record("map-progress", { phase: "three-pages", p1, p2, p3 }, [
+    ...(p1.progress === SAMPLE_MAP_EXPECT.progress.page1 && p1.current === SAMPLE_MAP_EXPECT.read.page1.current
+      ? []
+      : [`第 1 页进度异常：${JSON.stringify(p1)}`]),
+    ...(p2.progress === SAMPLE_MAP_EXPECT.progress.page2 ? [] : [`第 2 页进度异常：${JSON.stringify(p2)}`]),
+    ...(p3.progress === SAMPLE_MAP_EXPECT.progress.page3 ? [] : [`第 3 页进度异常：${JSON.stringify(p3)}`]),
+    ...([p1, p2, p3].every((item) => !!item.progress && !!item.pagePair && item.progress.startsWith(item.pagePair))
+      ? []
+      : ["进度页码与 .page-label 不同源"]),
+  ]);
+
+  // --- 53c 加载窗口内点开地图：pageCount 未就绪 ⇒ 无进度行 ---------------------
+  log("53c 加载窗口：地图无进度行，加载完成后出现");
+  await enterMapWorkspace(seedNotes());
+  await setLibraryReadDelay(900);
+  await openRow("sample-paper.pdf");
+  await openMap();
+  const during53c = { slot: await has(SEL.mapSlot), progress: await has(SEL.mapProgress), rows: await countOf(SEL.mapRow) };
+  await setLibraryReadDelay(0);
+  await waitPage(1, 3);
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`, 30000);
+  const after53c = { progress: await textOf(SEL.mapProgress) };
+  record("map-progress", { phase: "loading-guard", during: during53c, after: after53c }, [
+    ...(during53c.slot ? [] : ["加载窗口内应有点开的地图槽位"]),
+    ...(during53c.progress === false ? [] : ["pageCount 未就绪时不得渲染进度行"]),
+    ...(after53c.progress === "第 1 / 3 页 · 33%" ? [] : [`加载完成后进度异常：${after53c.progress}`]),
+  ]);
+
+  // --- 54 已读/未读：三页计数、透明度、无页码节点豁免 -------------------------
+  log("54 已读弱化：三页 read/current 计数");
+  await enterMapWorkspace(seedNotes());
+  await enterSampleMap();
+  const read1 = readCounts(await mapSnapshot());
+  await clickNext();
+  await waitPage(2, 3);
+  await sleep(150);
+  const snap2 = await mapSnapshot();
+  const read2 = readCounts(snap2);
+  const abstract2 = snap2.rows.find((row) => row.label === "1. Abstract") ?? null;
+  const currentRow2 = snap2.rows.find((row) => row.current) ?? null;
+  await capturePage(win, "54-map-read-dim.png");
+  const readRect54 = await rectOfSelector(".map-row.read", 4);
+  if (readRect54) await capturePage(win, "54b-map-read-zoom.png", readRect54);
+  const appendixA54 = await mapRowSummary("Appendix A");
+  await clickNext();
+  await waitPage(3, 3);
+  await sleep(150);
+  const read3 = readCounts(await mapSnapshot());
+  record(
+    "map-read",
+    {
+      phase: "three-pages",
+      read1,
+      read2,
+      read3,
+      abstractOpacity: abstract2 ? abstract2.opacity : null,
+      currentOpacity: currentRow2 ? currentRow2.opacity : null,
+      appendixA: appendixA54,
+    },
+    [
+      ...(read1.read === SAMPLE_MAP_EXPECT.read.page1.read && read1.current === SAMPLE_MAP_EXPECT.read.page1.current
+        ? []
+        : [`第 1 页计数异常：${JSON.stringify(read1)}`]),
+      ...(read2.read === SAMPLE_MAP_EXPECT.read.page2.read && read2.current === SAMPLE_MAP_EXPECT.read.page2.current
+        ? []
+        : [`第 2 页计数异常：${JSON.stringify(read2)}`]),
+      ...(read3.read === SAMPLE_MAP_EXPECT.read.page3.read && read3.current === SAMPLE_MAP_EXPECT.read.page3.current
+        ? []
+        : [`第 3 页计数异常：${JSON.stringify(read3)}`]),
+      ...([read1, read2, read3].every((item) => item.both === 0) ? [] : ["read 与 current 必须互斥"]),
+      ...(abstract2 && abstract2.opacity === "0.55" ? [] : [`已读行透明度异常：${abstract2 ? abstract2.opacity : null}`]),
+      ...(currentRow2 && currentRow2.opacity === "1" ? [] : [`当前行不应弱化：${currentRow2 ? currentRow2.opacity : null}`]),
+      ...(appendixA54 &&
+      appendixA54.read === false &&
+      appendixA54.current === false &&
+      appendixA54.noteNum === null &&
+      appendixA54.pageText === null
+        ? []
+        : [`无页码行不应参与已读/当前判定：${JSON.stringify(appendixA54)}`]),
+    ],
+  );
+  // 展开无页码节点：其有页码的孙行随后进入可见行集（计数域只随可见行变化）
+  await clickMapNode("Appendix A");
+  await waitFor("孙节点出现", `document.querySelectorAll(".map-row").length === 8`);
+  const appendixA1Rows54 = await mapRowCount("Appendix A.1");
+  const appendixA1_54 = await mapRowSummary("Appendix A.1");
+  record("map-read", { phase: "expand-null-page", rows: await countOf(SEL.mapRow), childRows: appendixA1Rows54, child: appendixA1_54 }, [
+    ...(appendixA1Rows54 === 1 && appendixA1_54 && appendixA1_54.pageText === "3"
+      ? []
+      : [`展开后孙节点异常：${JSON.stringify(appendixA1_54)}`]),
+  ]);
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  record("map-chapter-filter", { phase: "read-row-badge", rows: await countOf(SEL.noteRow) }, [
+    ...((await countOf(SEL.noteRow)) === 1 ? [] : ["已读行徽标仍应触发过滤"]),
+  ]);
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("清除后回 4 行", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)}) && document.querySelectorAll(".note-row").length === 4`);
+
+  // --- 55 规模：420 节点 / 220 可见行 / 22 徽标 + 展开耗时 ---------------------
+  log("55 规模：long-book 420 节点 / 220 可见行");
+  await enterMapWorkspace(longBookSeed());
+  await openRow("long-book.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 60);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记列表就绪", `document.querySelectorAll(".note-row").length === 2`);
+  // 耗时起点冻结为「点 .map-toggle 到 .map-row 数达标」；3000ms 兜底返回现场值（断言仍按 800ms 判）
+  const timing55 = await js(`(() => new Promise((resolve) => {
+    const start = performance.now();
+    const toggle = document.querySelector(${JSON.stringify(SEL.mapToggle)});
+    if (!toggle) throw new Error("map toggle not found");
+    toggle.click();
+    const poll = () => {
+      const rows = document.querySelectorAll(".map-row").length;
+      if (rows >= 220 || performance.now() - start > 3000) {
+        resolve({ ms: Math.round(performance.now() - start), rows, mode: rows >= 220 ? "ready" : "timeout" });
+        return;
+      }
+      setTimeout(poll, 10);
+    };
+    poll();
+  }))()`);
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 220`, 30000);
+  await capturePage(win, "55-map-scale-200.png");
+  const snap55 = await mapSnapshot();
+  const samples55 = ["Chapter 01", "Chapter 20", "Section 11.05"].map((name) => {
+    const row = snap55.rows.find((item) => item.label === name) ?? null;
+    const count = longBookExpected(name);
+    // 0 条不进 DOM ⇒ 声明的期望文本为 null（与 51 段的声明表同口径）
+    return { name, count, expected: count > 0 ? String(count) : null, actual: row ? row.noteNum : null };
+  });
+  const overflow55 = snap55.rows.every(
+    (row) => row.rowFits && row.nodeFits !== false && (row.noteNum !== null || row.pageText === null || row.pageFits === true),
+  );
+  record(
+    "map-scale",
+    {
+      phase: "long-book",
+      timing: timing55,
+      count: snap55.count,
+      rows: snap55.rowCount,
+      badges: snap55.badgeCount,
+      progress: snap55.progress,
+      samples: samples55,
+      overflowFree: overflow55,
+    },
+    [
+      ...(timing55.rows === 220 ? [] : [`可见行数异常：${timing55.rows}`]),
+      ...(timing55.ms <= 800 ? [] : [`展开耗时超限：${timing55.ms}ms(mode=${timing55.mode})`]),
+      ...(snap55.count === "420" ? [] : [`节点数异常：${snap55.count}`]),
+      ...(snap55.rowCount === 220 ? [] : [`可见行数异常：${snap55.rowCount}`]),
+      ...(snap55.badgeCount === 22 ? [] : [`徽标数异常：${snap55.badgeCount}`]),
+      ...(snap55.progress === "第 1 / 60 页 · 2%" ? [] : [`进度异常：${snap55.progress}`]),
+      ...(samples55.every((item) => item.expected === item.actual) ? [] : [`抽样不符：${JSON.stringify(samples55)}`]),
+      ...(overflow55 ? [] : ["存在行溢出"]),
+    ],
+  );
+  await restoreStandardSeed();
 }
 
 // ---------------------------------------------------------------------------
