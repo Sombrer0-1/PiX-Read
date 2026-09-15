@@ -70,6 +70,7 @@ export interface PixApi {
   notesAdd: (draft: ReaderNoteDraft) => Promise<ReaderNotesMutationResult>;
   notesUpdate: (id: string, comment: string) => Promise<ReaderNotesMutationResult>;
   notesDelete: (id: string) => Promise<ReaderNotesMutationResult>;
+  notesRestore: (id: string) => Promise<ReaderNotesMutationResult>;
   notesExport: () => Promise<ReaderNotesExportResult>;
   notesReset: () => Promise<ReaderNotesResetResult>;
 
@@ -158,6 +159,7 @@ const api: PixApi = {
   notesUpdate: (id: string, comment: string) =>
     ipcRenderer.invoke("notes-update", id, comment) as Promise<ReaderNotesMutationResult>,
   notesDelete: (id: string) => ipcRenderer.invoke("notes-delete", id) as Promise<ReaderNotesMutationResult>,
+  notesRestore: (id: string) => ipcRenderer.invoke("notes-restore", id) as Promise<ReaderNotesMutationResult>,
   notesExport: () => ipcRenderer.invoke("notes-export") as Promise<ReaderNotesExportResult>,
   notesReset: () => ipcRenderer.invoke("notes-reset") as Promise<ReaderNotesResetResult>,
 

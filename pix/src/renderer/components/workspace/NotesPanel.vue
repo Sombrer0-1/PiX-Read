@@ -7,10 +7,17 @@
  * This component never builds storage paths: notes.json lives wherever the
  * main process put it (notesStore.notesFilePath is display-only).
  */
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useNotesStore } from "../../stores/notes-store";
 import { emitNotesAsk } from "../../composables/useQuickAsk";
 import { docDisplayName } from "../../utils/notes-path";
+import {
+  buildNoteCopyFragment,
+  resolveListEmptyReason,
+  UNDO_EXPIRED_MESSAGE,
+  UNDO_ROW_MS,
+  type ListEmptyReason,
+} from "../../utils/notes-view";
 import { MAX_CONTEXT_NOTES } from "../../utils/reading-context";
 import type { ReaderNote } from "@shared/types";
 
@@ -19,6 +26,17 @@ const COLLAPSED_TEXT_LENGTH = 180;
 /** 删除待确认与瞬时提示的复位窗口。 */
 const DELETE_CONFIRM_MS = 3000;
 const NOTICE_MS = 4000;
+/** 复制按钮的「已复制」反馈窗口（与 ChatPanel 同值，不抽公共模块）。 */
+const COPY_FEEDBACK_MS = 1200;
+
+/** 空态判别值 → 类名；条件判定只在 resolveListEmptyReason，本表不做第二次判断。 */
+const LIST_EMPTY_CLASS: Record<ListEmptyReason, string> = {
+  "search-chapter": "notes-search-empty",
+  "search-current-doc": "notes-search-empty",
+  search: "notes-search-empty",
+  chapter: "notes-chapter-empty",
+  "current-doc": "notes-filtered-empty",
+};
 
 /** 「追问」的两个禁用原因（R8 设计档 §1.4 三态；自上而下第一条命中者生效）。 */
 const ASK_DISABLED_TITLE = "等待澄清回答时无法发起追问";
@@ -46,9 +64,15 @@ const commentDraft = ref("");
 const savingComment = ref(false);
 const exporting = ref(false);
 const recovering = ref(false);
+/** 撤销在途守卫：只在 finally 复位，stale 分支不得让按钮永久禁用。 */
+const restoring = ref(false);
+const copiedNoteId = ref<string | null>(null);
+const searchInputRef = ref<HTMLInputElement | null>(null);
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+let undoRowTimer: ReturnType<typeof setTimeout> | null = null;
+let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 两个「追问」入口的禁用与 title 判据（R8 设计档 §1.4）：可用 ⇔ 本次会注入 reader_notes。 */
 const askDisabledTitle = computed(() => {
@@ -66,20 +90,55 @@ const showEscapeHatch = computed(
   () => notesStore.errorCode === "corrupt" || notesStore.errorCode === "version-unsupported",
 );
 const exportLabel = computed(() => (notesStore.hasNotes ? "导出 Markdown" : "暂无笔记"));
-const filteredEmpty = computed(() => notesStore.hasNotes && notesStore.groups.length === 0);
+/** 搜索框只经 store 的 setSearchQuery 写值（原串），是否生效一律看派生 searchActive。 */
+const searchModel = computed({
+  get: () => notesStore.searchQuery,
+  set: (value: string) => notesStore.setSearchQuery(value),
+});
+const sortLabel = computed(() => (notesStore.sortMode === "page" ? "排序：页码" : "排序：最新"));
+const sortTitle = computed(() =>
+  notesStore.sortMode === "page" ? "当前按页码排序，点击改为「最新优先」" : "当前按最新优先排序，点击改为「页码」",
+);
+/** 撤销行的展示文案：正文截断只影响展示，还原内容完全来自主进程槽。 */
+const undoSnippet = computed(() => {
+  const pending = notesStore.pendingUndo;
+  if (!pending) return "";
+  return pending.text.length > 12 ? `${pending.text.slice(0, 12)}…` : pending.text;
+});
+const emptyReason = computed(() =>
+  resolveListEmptyReason({
+    query: notesStore.activeQuery,
+    visibleCount: notesStore.visibleCount,
+    chapterFilterActive: notesStore.chapterFilter !== null,
+    currentDocOnly: notesStore.currentDocOnly,
+  }),
+);
+const emptyClass = computed(() => (emptyReason.value ? LIST_EMPTY_CLASS[emptyReason.value] : ""));
+/** 搜索类三条含 {q}（activeQuery 已 trim），其余两条是 R9 既有逐字文案。 */
+const emptyText = computed(() => {
+  const reason = emptyReason.value;
+  if (reason === "search-chapter") return `本章内没有匹配「${notesStore.activeQuery}」的笔记`;
+  if (reason === "search-current-doc") return `当前文档内没有匹配「${notesStore.activeQuery}」的笔记`;
+  if (reason === "search") return `没有匹配「${notesStore.activeQuery}」的笔记`;
+  if (reason === "chapter") return "本章暂无笔记";
+  if (reason === "current-doc") return "当前文档暂无笔记";
+  return "";
+});
 /** 章节过滤条容器 title：文档显示名取当前文档比较键的末段（与地图行同一个字符串）。 */
 const chapterFilterTitle = computed(
   () =>
     `仅显示当前文档「${docDisplayName(notesStore.currentDocKey ?? "")}」该章节范围内的笔记；点「清除」恢复全部笔记`,
 );
 /**
- * 头部计数：错误态下本地列表是本次读取失败前的旧值，不展示；
- * 筛选开启时同时给出当前文档条数，章节过滤生效时改给章节内条数（均以避免头部与列表不一致为准则）。
+ * 头部计数（四分叉）：错误态下本地列表是本次读取失败前的旧值，不展示；
+ * 搜索维度优先于章节/文档维度（计数只表达搜索，另两维由控件自身状态表达）。
+ * 可见条数取 store 的 visibleCount（V 的唯一定点），面板不自行求和。
  */
 const countLabel = computed(() => {
   if (notesStore.status === "error") return "";
-  const visibleCount = notesStore.groups.reduce((sum, group) => sum + group.notes.length, 0);
+  const visibleCount = notesStore.visibleCount;
   // 左栏头部与导出按钮同排，文案必须放得下，否则头部高度会跳一档
+  if (notesStore.searchActive) return `命中 ${visibleCount} 条 / 共 ${notesStore.totalCount} 条`;
   if (notesStore.chapterFilter) return `本章 ${visibleCount} 条 / 共 ${notesStore.totalCount} 条`;
   if (!notesStore.currentDocOnly) return `共 ${notesStore.totalCount} 条`;
   return `当前 ${visibleCount} 条 / 共 ${notesStore.totalCount} 条`;
@@ -131,6 +190,103 @@ function isNoteSelectDisabled(id: string): boolean {
 /** 行内「追问」：替换语义只在 store 单一动作内落地；id 已失效即 no-op（零副作用）。 */
 function onAskNote(note: ReaderNote): void {
   if (notesStore.replaceSelectionWith(note.id)) emitNotesAsk();
+}
+
+/** 排序切换不新增第二个 setter：只写 store 的 sortMode（不落盘、不发 IPC）。 */
+function onToggleSort(): void {
+  notesStore.setSortMode(notesStore.sortMode === "page" ? "created" : "page");
+}
+
+/** Esc 只清空查询并交出焦点；不 stopPropagation（既有 window 级 Esc 语义保留）。 */
+function onSearchEsc(): void {
+  notesStore.clearSearchQuery();
+  searchInputRef.value?.blur();
+}
+
+/** 清空按钮：置空后把焦点交还输入框，便于继续输入。 */
+function onSearchClear(): void {
+  notesStore.clearSearchQuery();
+  searchInputRef.value?.focus();
+}
+
+/**
+ * 撤销行计时基准是 deletedAt：重挂载不续命不复活。定时器建在 watch 上（每次新删除都重建），
+ * 剩余 ≤ 0 时钳到 0（到期处理只有定时器回调一处）。
+ */
+function scheduleUndoRow(): void {
+  if (undoRowTimer) {
+    clearTimeout(undoRowTimer);
+    undoRowTimer = null;
+  }
+  const pending = notesStore.pendingUndo;
+  if (!pending) return;
+  undoRowTimer = setTimeout(() => {
+    undoRowTimer = null;
+    notesStore.clearPendingUndo();
+  }, Math.max(0, UNDO_ROW_MS - (Date.now() - pending.deletedAt)));
+}
+
+watch(() => notesStore.pendingUndo, scheduleUndoRow, { immediate: true });
+
+/** stale（目标已被替换 / 已复位）零副作用：不弹提示、不动行、不覆盖列表。 */
+async function onUndoClick(): Promise<void> {
+  if (restoring.value) return;
+  restoring.value = true;
+  try {
+    const result = await notesStore.undoDelete();
+    if ("stale" in result) return;
+    if (result.ok) {
+      setNotice("success", "已还原该条笔记");
+      return;
+    }
+    setNotice("error", `撤销失败：${result.message}`);
+    if (result.message === UNDO_EXPIRED_MESSAGE) notesStore.clearPendingUndo();
+  } finally {
+    restoring.value = false;
+  }
+}
+
+// --- 剪贴板：异步 API 优先，execCommand 兜底（写法与 ChatPanel 一致） ---
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return copyViaExecCommand(text);
+  }
+}
+
+function copyViaExecCommand(text: string): boolean {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
+  textarea.remove();
+  return copied;
+}
+
+/** 复制是只读动作：不写盘、不改过滤/选择/排序，两链路都失败时不置反馈态。 */
+async function onCopyNote(note: ReaderNote): Promise<void> {
+  if (!(await copyToClipboard(buildNoteCopyFragment(note)))) {
+    setNotice("error", "复制失败：无法访问剪贴板");
+    return;
+  }
+  copiedNoteId.value = note.id;
+  if (copyTimer) clearTimeout(copyTimer);
+  copyTimer = setTimeout(() => {
+    copiedNoteId.value = null;
+    copyTimer = null;
+  }, COPY_FEEDBACK_MS);
 }
 
 function startCommentEdit(note: ReaderNote): void {
@@ -239,7 +395,15 @@ onBeforeUnmount(() => {
     clearTimeout(noticeTimer);
     noticeTimer = null;
   }
-  // 卸载兜底：待确认监听与定时器必须成对清理
+  // 卸载兜底：待确认监听、撤销行定时器与复制反馈定时器必须成对清理
+  if (undoRowTimer) {
+    clearTimeout(undoRowTimer);
+    undoRowTimer = null;
+  }
+  if (copyTimer) {
+    clearTimeout(copyTimer);
+    copyTimer = null;
+  }
   clearDeleteConfirm();
 });
 </script>
@@ -260,6 +424,30 @@ onBeforeUnmount(() => {
         >
           {{ exportLabel }}
         </v-btn>
+      </div>
+      <div v-if="notesStore.status === 'ready' && notesStore.hasNotes" class="notes-search">
+        <input
+          ref="searchInputRef"
+          v-model="searchModel"
+          type="text"
+          class="notes-search-input"
+          placeholder="搜索原文或备注"
+          @keydown.esc="onSearchEsc"
+        />
+        <v-btn
+          v-if="notesStore.searchActive"
+          class="notes-search-clear"
+          icon="mdi-close"
+          size="x-small"
+          variant="text"
+          title="清空搜索"
+          @click="onSearchClear"
+        />
+      </div>
+      <div v-if="notesStore.status === 'ready' && notesStore.hasNotes" class="notes-sort">
+        <button type="button" class="notes-sort-btn" :title="sortTitle" @click="onToggleSort">
+          {{ sortLabel }}
+        </button>
       </div>
       <v-switch
         v-model="currentDocSwitch"
@@ -312,6 +500,13 @@ onBeforeUnmount(() => {
       <span class="notice-text">{{ notice.text }}</span>
       <button type="button" class="notice-close" title="关闭" @click="dismissNotice">
         <v-icon size="12">mdi-close</v-icon>
+      </button>
+    </div>
+
+    <div v-if="notesStore.pendingUndo" class="notes-undo">
+      <span class="undo-text">已删除「{{ undoSnippet }}」· 第 {{ notesStore.pendingUndo.page }} 页</span>
+      <button type="button" class="notes-undo-btn" title="还原这条笔记" :disabled="restoring" @click="onUndoClick">
+        撤销
       </button>
     </div>
 
@@ -369,11 +564,7 @@ onBeforeUnmount(() => {
       <p class="empty-subtitle">在 PDF 中选中文字，点「摘录」保存到这里</p>
     </div>
 
-    <div v-else-if="notesStore.hasNotes && notesStore.groups.length === 0 && notesStore.chapterFilter" class="notes-chapter-empty">
-      本章暂无笔记
-    </div>
-
-    <div v-else-if="filteredEmpty" class="notes-filtered-empty">当前文档暂无笔记</div>
+    <div v-else-if="emptyReason" :class="emptyClass">{{ emptyText }}</div>
 
     <div v-else class="notes-list">
       <div v-for="group in notesStore.groups" :key="group.key" class="notes-group">
@@ -468,6 +659,15 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="note-actions">
+              <button
+                type="button"
+                class="note-copy"
+                :class="{ 'is-copied': copiedNoteId === note.id }"
+                :title="copiedNoteId === note.id ? '已复制' : '复制为 Markdown'"
+                @click.stop="onCopyNote(note)"
+              >
+                {{ copiedNoteId === note.id ? "已复制" : "复制" }}
+              </button>
               <span class="note-ask-wrap" :title="askDisabledTitle ?? undefined">
                 <button
                   type="button"
@@ -511,6 +711,51 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+/* 搜索行：位于头部首行之后、排序行之前；未就绪/无笔记时整行不进 DOM */
+.notes-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 盒模型照抄 PdfSearchPanel.vue 的 .search-input（需求 §0.8：高 26px、圆角 6、12px 字号、focus 边框） */
+.notes-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--pix-border, #d5dfe8);
+  border-radius: 6px;
+  background: var(--pix-bg-input, #ffffff);
+  font-size: 12px;
+  color: var(--pix-text-primary, #1f2933);
+  outline: none;
+}
+
+.notes-search-input:focus {
+  border-color: var(--pix-border-focus, #31424f);
+}
+
+.notes-sort {
+  display: flex;
+  align-items: center;
+}
+
+.notes-sort-btn {
+  padding: 1px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-link, #314b5f);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.notes-sort-btn:hover {
+  background: var(--pix-bg-hover, #e8eff5);
 }
 
 .notes-count {
@@ -681,6 +926,47 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, currentColor 12%, transparent);
 }
 
+.notes-undo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 10px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-elevated, #ffffff);
+}
+
+.undo-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
+  word-break: break-word;
+}
+
+.notes-undo-btn {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-link, #314b5f);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.notes-undo-btn:hover {
+  background: var(--pix-bg-hover, #e8eff5);
+}
+
+.notes-undo-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .notes-export-row {
   display: flex;
   align-items: center;
@@ -779,6 +1065,14 @@ onBeforeUnmount(() => {
 }
 
 .notes-filtered-empty {
+  padding: 24px 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--pix-text-muted);
+}
+
+/* 搜索类空态（4a/4b/4c 共用；原因由文本区分），盒模型逐字对齐 .notes-filtered-empty */
+.notes-search-empty {
   padding: 24px 16px;
   text-align: center;
   font-size: 12px;
@@ -1048,6 +1342,25 @@ onBeforeUnmount(() => {
 .note-ask-wrap {
   display: inline-flex;
   align-items: center;
+}
+
+.note-copy {
+  padding: 1px 6px;
+  border: none;
+  border-radius: var(--pix-radius-sm);
+  background: transparent;
+  color: var(--pix-text-link, #314b5f);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.note-copy:hover {
+  background: var(--pix-bg-hover, #e8eff5);
+}
+
+.note-copy.is-copied {
+  color: var(--pix-accent, #31424f);
 }
 
 .note-ask {

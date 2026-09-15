@@ -18,7 +18,7 @@ import { resolvePixSessionDir, type SessionBridge } from "./session-bridge.js";
 import { getPixStoragePaths, pixAgentDir, pixSessionsRootDir } from "./pix-paths.js";
 import type { SettingsStore } from "./settings-store.js";
 import { clearLibraryRoot, getLibraryRoot, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
-import { addNote, deleteNote, exportNotesMarkdown, loadNotes, resetCorruptNotes, updateNoteComment } from "./notes-store.js";
+import { addNote, deleteNote, exportNotesMarkdown, loadNotes, resetCorruptNotes, restoreNote, updateNoteComment } from "./notes-store.js";
 import { loadReaderState, saveReaderState } from "./reader-state-store.js";
 import type {
   GuiSettings,
@@ -474,6 +474,8 @@ export function registerIpcHandlers(
   );
 
   ipcMain.handle("notes-delete", (_event, id: unknown) => (isNoteId(id) ? deleteNote(id) : invalidNotesInput()));
+
+  ipcMain.handle("notes-restore", (_event, id: unknown) => (isNoteId(id) ? restoreNote(id) : invalidNotesInput()));
 
   ipcMain.handle("notes-export", () => exportNotesMarkdown());
 

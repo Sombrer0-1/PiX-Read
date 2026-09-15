@@ -47,6 +47,17 @@ const ERROR_MESSAGES: Record<ReaderNotesErrorCode, string> = {
 /** answer 超长文案；不能按 kind 给 ERROR_MESSAGES 加键（码表与 ReaderNotesErrorCode 一一对应，N35 验收 7）。 */
 const ANSWER_TOO_LONG_MESSAGE = "回答过长（超过 4000 字），无法存为笔记";
 
+/** restoreNote 专有文案（R10）：错误码复用既有码表，文案按调用点写死（同 ANSWER_TOO_LONG_MESSAGE 先例）。 */
+const RESTORE_EMPTY_MESSAGE = "没有可撤销的删除";
+const RESTORE_EXISTS_MESSAGE = "该笔记已重新存在，无法撤销";
+const RESTORE_DUPLICATE_MESSAGE = "该笔记内容已重新存在，无法撤销";
+
+/**
+ * 撤销槽：只存最近一次成功删除的条目。内存态、不落盘、不跨重启、不参与序列化。
+ * 只有成功的 deleteNote 设槽，只有成功的 restoreNote 与 resetCorruptNotes 清槽；失败一律保留（可重试）。
+ */
+let undoSlot: { root: string; note: ReaderNote; index: number } | null = null;
+
 interface NotesPaths {
   file: string;
   markdown: string;
@@ -69,6 +80,11 @@ function emptyNotesFile(): ReaderNotesFile {
 
 function failure(code: ReaderNotesErrorCode): ReaderNotesMutationResult {
   return { success: false, notes: [], code, error: ERROR_MESSAGES[code] };
+}
+
+/** 失败回传空列表，与既有六通道同形；文案不走码表（撤销有三类专有文案）。 */
+function restoreFailure(code: ReaderNotesErrorCode, error: string): ReaderNotesMutationResult {
+  return { success: false, notes: [], code, error };
 }
 
 function corruptRead(): NotesRead {
@@ -344,12 +360,45 @@ export function deleteNote(id: string): ReaderNotesMutationResult {
   if (!paths) return failure("no-root");
   const read = readNotesFile(paths.file);
   if (!read.ok) return failure(read.code);
+  const index = read.file.notes.findIndex((note) => note.id === id);
+  if (index < 0) return failure("not-found");
   const notes = read.file.notes.filter((note) => note.id !== id);
-  if (notes.length === read.file.notes.length) return failure("not-found");
 
   const write = writeFileAtomic(paths.file, serializeNotes({ version: SCHEMA_VERSION, notes }));
   if (!write.ok) return failure("write-failed");
-  return { success: true, notes };
+  // 写盘成功才设槽（覆盖式，只存最近一条）：删除失败不能把上一次撤销权冲掉
+  undoSlot = { root: getLibraryRoot(), note: read.file.notes[index], index };
+  return { success: true, notes, note: read.file.notes[index] };
+}
+
+/**
+ * 撤销最近一次成功删除（R10）：槽内原对象按删除前下标插回，不刷新 updatedAt ⇒ 文件字节回复。
+ * 校验顺序自上而下第一条命中即返回；归属校验只读，绝不写别的库的目录。
+ */
+export function restoreNote(id: string): ReaderNotesMutationResult {
+  const paths = notesPaths();
+  if (!paths) return failure("no-root");
+  const slot = undoSlot;
+  if (!slot) return restoreFailure("not-found", RESTORE_EMPTY_MESSAGE);
+  if (id !== slot.note.id) return restoreFailure("not-found", RESTORE_EMPTY_MESSAGE);
+  if (docPathKey(slot.root) !== docPathKey(getLibraryRoot())) return restoreFailure("not-found", RESTORE_EMPTY_MESSAGE);
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return restoreFailure(read.code, read.error);
+  if (read.file.notes.some((note) => note.id === slot.note.id)) {
+    return restoreFailure("invalid-input", RESTORE_EXISTS_MESSAGE);
+  }
+  // 去重键占用（同内容不同 id）：不覆盖不合并，否则会写出两条同键条目
+  const key = duplicateKey(slot.note.docPath, slot.note.page, slot.note.kind, slot.note.text);
+  if (read.file.notes.some((note) => duplicateKey(note.docPath, note.page, note.kind, note.text) === key)) {
+    return restoreFailure("invalid-input", RESTORE_DUPLICATE_MESSAGE);
+  }
+
+  const notes = [...read.file.notes];
+  notes.splice(Math.min(slot.index, notes.length), 0, slot.note);
+  const write = writeFileAtomic(paths.file, serializeNotes({ version: SCHEMA_VERSION, notes }));
+  if (!write.ok) return failure("write-failed");
+  undoSlot = null;
+  return { success: true, notes, note: slot.note };
 }
 
 export function exportNotesMarkdown(): ReaderNotesExportResult {
@@ -387,5 +436,7 @@ export function resetCorruptNotes(): ReaderNotesResetResult {
     // 备份已存在，必须把路径报给渲染层，否则用户无从找回原文件
     return { success: false, notes: [], backupPath, code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
   }
+  // 重建语义 = 从空库开始：把重建前删除的条目悄悄写回会让用户以为重建失败
+  undoSlot = null;
   return { success: true, notes: [], backupPath };
 }

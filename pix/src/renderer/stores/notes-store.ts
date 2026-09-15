@@ -14,10 +14,27 @@ import type { PixApi } from "../../main/preload";
 import { useReaderStore } from "./reader-store";
 import { useProjectStore } from "./project-store";
 import { currentDocKey as toDocKey, groupNotesByDocument, type NoteGroup, type PageRange } from "../utils/notes-path";
+import {
+  applyViewToGroups,
+  isUndoExpired,
+  normalizeQuery,
+  UNDO_EXPIRED_MESSAGE,
+  type NotesSortMode,
+} from "../utils/notes-view";
 import { MAX_CONTEXT_NOTES } from "../utils/reading-context";
 
 export type AddNoteResult = { ok: true; duplicate: boolean; page: number } | { ok: false; message: string };
 export type ExportNotesResult = { ok: true; filePath: string; count: number } | { ok: false; message: string };
+
+/** 撤销三态：stale = 响应所属的撤销目标已被替换或已复位，调用方必须零副作用。 */
+export type UndoDeleteResult = { ok: true } | { ok: false; message: string } | { ok: false; stale: true };
+
+export interface PendingUndo {
+  id: string;
+  page: number;
+  text: string;
+  deletedAt: number;
+}
 
 type NotesActionResult = { ok: true } | { ok: false; message: string };
 
@@ -60,6 +77,12 @@ export const useNotesStore = defineStore("notes", () => {
   const lastExport = ref<{ filePath: string; count: number; at: number } | null>(null);
   const currentDocOnly = ref(false);
 
+  /** 搜索输入原串（不 trim/不归一化存值）；是否生效只看派生 searchActive。 */
+  const searchQuery = ref("");
+  const sortMode = ref<NotesSortMode>("page");
+  /** 撤销行只存展示与时限四项；还原载荷完全由主进程槽提供（渲染层无法伪造正文）。 */
+  const pendingUndo = ref<PendingUndo | null>(null);
+
   /**
    * 章节过滤：视图状态，非消费式（持续生效直到显式清除或文档作用域失效）；
    * label 只接受 buildChapterRanges 的产出，不在本文件拼第二份页码文本。
@@ -77,16 +100,27 @@ export const useNotesStore = defineStore("notes", () => {
   /** 竞态序号：loadSeq 丢弃过期 load；writeSeq 让已完成的变更不被先发起的 load 覆盖。 */
   let loadSeq = 0;
   let writeSeq = 0;
+  /** 撤销作用域令牌：resetNotes() 递增，跨工作区的在途响应一律丢弃（守卫②）。 */
+  let undoScope = 0;
 
   const totalCount = computed(() => notes.value.length);
   const hasNotes = computed(() => notes.value.length > 0);
+  const activeQuery = computed(() => normalizeQuery(searchQuery.value));
+  const searchActive = computed(() => activeQuery.value !== "");
   const currentDocKey = computed(() => toDocKey(readerStore.filePath, projectStore.currentProject?.path ?? ""));
   const chapterRange = computed<PageRange | null>(() =>
     chapterFilter.value ? { start: chapterFilter.value.start, end: chapterFilter.value.end } : null
   );
+  // 搜索与排序的唯一管道：分组、章节/文档过滤保持 R9 语义，视图维度只在其之后追加
   const groups = computed<NoteGroup[]>(() =>
-    groupNotesByDocument(notes.value, currentDocKey.value, currentDocOnly.value, chapterRange.value)
+    applyViewToGroups(
+      groupNotesByDocument(notes.value, currentDocKey.value, currentDocOnly.value, chapterRange.value),
+      activeQuery.value,
+      sortMode.value
+    )
   );
+  /** V：列表实际渲染行数之和（计数与空态判别的唯一定点，面板不再自行求和）。 */
+  const visibleCount = computed(() => groups.value.reduce((sum, group) => sum + group.notes.length, 0));
 
   // 文档作用域：切文档/关文档即清除章节过滤（token 不变 ⇒ 不触发标签切换，也不发 notesLoad）
   watch(currentDocKey, () => {
@@ -171,7 +205,40 @@ export const useNotesStore = defineStore("notes", () => {
   }
 
   async function removeNote(id: string): Promise<NotesActionResult> {
-    return runMutation((api) => api.notesDelete(id));
+    try {
+      const result = await bridge().notesDelete(id);
+      if (!result.success) return { ok: false, message: result.error ?? "删除失败" };
+      applyNotes(result.notes);
+      // 缺载荷 = 内部不一致（删除已真实落盘）：必须非静默，且不产生撤回不了的撤销行
+      if (!result.note) return { ok: false, message: "删除已生效，但未收到撤销数据（内部不一致）" };
+      pendingUndo.value = { id, page: result.note.page, text: result.note.text, deletedAt: Date.now() };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: rejectMessage(err) };
+    }
+  }
+
+  /**
+   * 撤销最近一次删除：无槽/已过期在发 IPC 之前返回；两条 stale 守卫必须在 applyNotes 之前
+   * —— 迟到响应不得复活新删除的条目，也不得把上一个工作区的列表写进已复位的 store。
+   */
+  async function undoDelete(): Promise<UndoDeleteResult> {
+    const pending = pendingUndo.value;
+    if (pending === null) return { ok: false, message: UNDO_EXPIRED_MESSAGE };
+    if (isUndoExpired(pending.deletedAt, Date.now())) return { ok: false, message: UNDO_EXPIRED_MESSAGE };
+    const scope = undoScope;
+    try {
+      const result = await bridge().notesRestore(pending.id);
+      if (scope !== undoScope) return { ok: false, stale: true };
+      if (pendingUndo.value !== null && pendingUndo.value.id !== pending.id) return { ok: false, stale: true };
+      if (!result.success) return { ok: false, message: result.error ?? "撤销失败" };
+      applyNotes(result.notes);
+      pendingUndo.value = null;
+      return { ok: true };
+    } catch (err) {
+      if (scope !== undoScope) return { ok: false, stale: true };
+      return { ok: false, message: rejectMessage(err) };
+    }
   }
 
   async function exportMarkdown(): Promise<ExportNotesResult> {
@@ -201,9 +268,10 @@ export const useNotesStore = defineStore("notes", () => {
     }
   }
 
-  /** 跨工作区残留防护：goHome 与工作区卸载时各调一次；同时作废在途 load。 */
+  /** 跨工作区残留防护：goHome 与工作区卸载时各调一次；同时作废在途 load 与在途撤销。 */
   function resetNotes(): void {
     loadSeq += 1;
+    undoScope += 1;
     notes.value = [];
     status.value = "idle";
     errorCode.value = null;
@@ -213,11 +281,30 @@ export const useNotesStore = defineStore("notes", () => {
     currentDocOnly.value = false;
     chapterFilter.value = null;
     chapterFocusToken.value = 0;
+    searchQuery.value = "";
+    sortMode.value = "page";
+    pendingUndo.value = null;
     clearNoteSelection();
   }
 
   function setCurrentDocOnly(value: boolean): void {
     currentDocOnly.value = value;
+  }
+
+  function setSearchQuery(value: string): void {
+    searchQuery.value = value;
+  }
+
+  function clearSearchQuery(): void {
+    searchQuery.value = "";
+  }
+
+  function setSortMode(mode: NotesSortMode): void {
+    sortMode.value = mode;
+  }
+
+  function clearPendingUndo(): void {
+    pendingUndo.value = null;
   }
 
   /**
@@ -268,6 +355,12 @@ export const useNotesStore = defineStore("notes", () => {
     notesFilePath,
     lastExport,
     currentDocOnly,
+    searchQuery,
+    activeQuery,
+    searchActive,
+    sortMode,
+    pendingUndo,
+    visibleCount,
     chapterFilter,
     chapterFocusToken,
     selectedNotes,
@@ -287,6 +380,11 @@ export const useNotesStore = defineStore("notes", () => {
     recoverCorruptNotes,
     resetNotes,
     setCurrentDocOnly,
+    setSearchQuery,
+    clearSearchQuery,
+    setSortMode,
+    undoDelete,
+    clearPendingUndo,
     focusChapter,
     clearChapterFilter,
     isNoteSelected,

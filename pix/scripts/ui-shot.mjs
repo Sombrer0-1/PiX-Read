@@ -22,7 +22,7 @@
  * 离屏窗口只在 DOM 变更时出帧，capturePage() 会拿到上一帧，因此每张图前必须 invalidate() 并等一拍。
  * 注意：脚本内不得使用 inline dynamic import；stub 是字符串模板，内部不能出现反引号。
  */
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, clipboard } from "electron";
 import { createServer } from "vite";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -68,6 +68,14 @@ const SEL = {
   chapterFilter: ".notes-chapter-filter",
   chapterFilterClear: ".notes-chapter-filter-clear",
   chapterEmpty: ".notes-chapter-empty",
+  // R10 新增七项（设计档 §1.5）
+  searchInput: ".notes-search-input",
+  searchClear: ".notes-search-clear",
+  sortBtn: ".notes-sort-btn",
+  searchEmpty: ".notes-search-empty",
+  undoRow: ".notes-undo",
+  undoBtn: ".notes-undo-btn",
+  noteCopy: ".note-copy",
 };
 
 // ---------------------------------------------------------------------------
@@ -399,6 +407,16 @@ let notesAddDelayMs = 0;
 let notesAddFailure = null;
 let notesDeleteFailure = null;
 const notesAddCalls = [];
+// R10 撤销槽：只存最近一次成功删除（内存态、不落盘、不跨重启），与 src/main/notes-store.ts 同语义
+let deleteSlot = null;
+let notesRestoreFailure = null;
+// 还原响应延迟：作用于「读-改-写之后、返回之前」（落盘顺序 = 请求到达顺序）
+let notesRestoreDelayMs = 0;
+const notesRestoreCalls = [];
+// 还原专有文案（与 src/main/notes-store.ts 逐字一致）
+const RESTORE_EMPTY_MESSAGE = "没有可撤销的删除";
+const RESTORE_EXISTS_MESSAGE = "该笔记已重新存在，无法撤销";
+const RESTORE_DUPLICATE_MESSAGE = "该笔记内容已重新存在，无法撤销";
 // notesLoad 计数器：52h 的「goHome 不得触发加载」判据（只计数，不影响返回）
 let notesLoadCalls = 0;
 // 发送类命令（prompt/steer）的记录：notes-context / notes-chip 断言的事实源（N50 验收 1）
@@ -437,6 +455,11 @@ function writeNotesFile(list) {
 
 function normalizeNoteText(value) {
   return String(value == null ? "" : value).replace(/\\s+/g, " ").trim();
+}
+
+/** 去重键（与 src/main/notes-store.ts 的 duplicateKey 同口径）：两份同键条目会破坏 addNote 的唯一性不变量。 */
+function noteKey(note) {
+  return [note.docPath, note.page, note.kind, note.text].join("\\u0000");
 }
 
 /** 越界判据与 library-root 的前缀归属口径一致（不校验文件是否存在，场景 36 依赖这一点）。 */
@@ -807,9 +830,63 @@ const api = {
         error: NOTES_ERRORS[notesDeleteFailure] || notesDeleteFailure,
       };
     }
-    const next = readNotesFile().filter(function (note) { return note.id !== id; });
+    const current = readNotesFile();
+    const index = current.findIndex(function (note) { return note.id === id; });
+    if (index < 0) {
+      return { success: false, notes: [], code: "not-found", error: NOTES_ERRORS["not-found"] || "笔记不存在" };
+    }
+    const removed = current[index];
+    const next = current.filter(function (note) { return note.id !== id; });
     writeNotesFile(next);
-    return { success: true, notes: clone(next) };
+    // 与主进程同序：写盘成功后覆盖式设槽（下标 = 删除前的数组下标）并回传 note
+    deleteSlot = { root: activeRoot, note: clone([removed])[0], index: index };
+    return { success: true, notes: clone(next), note: clone([removed])[0] };
+  },
+  /** 还原槽内那一条：校验顺序与错误文案逐字对齐 src/main/notes-store.ts 的 restoreNote。 */
+  notesRestore: async function (id) {
+    notesRestoreCalls.push({ id: id });
+    if (!id || typeof id !== "string") {
+      return { success: false, notes: [], code: "invalid-input", error: NOTES_ERRORS["invalid-input"] };
+    }
+    if (!deleteSlot) {
+      return { success: false, notes: [], code: "not-found", error: RESTORE_EMPTY_MESSAGE };
+    }
+    if (id !== deleteSlot.note.id) {
+      return { success: false, notes: [], code: "not-found", error: RESTORE_EMPTY_MESSAGE };
+    }
+    // 跨工作区防护：槽属于另一个资料库根时绝不写盘
+    if (normalizePath(deleteSlot.root) !== normalizePath(activeRoot)) {
+      return { success: false, notes: [], code: "not-found", error: RESTORE_EMPTY_MESSAGE };
+    }
+    if (notesRestoreFailure) {
+      return {
+        success: false,
+        notes: [],
+        code: notesRestoreFailure,
+        error: NOTES_ERRORS[notesRestoreFailure] || notesRestoreFailure,
+      };
+    }
+    const current = readNotesFile();
+    const slotNote = deleteSlot.note;
+    if (current.some(function (note) { return note.id === slotNote.id; })) {
+      return { success: false, notes: [], code: "invalid-input", error: RESTORE_EXISTS_MESSAGE };
+    }
+    if (
+      current.some(function (note) {
+        return note.id !== slotNote.id && noteKey(note) === noteKey(slotNote);
+      })
+    ) {
+      return { success: false, notes: [], code: "invalid-input", error: RESTORE_DUPLICATE_MESSAGE };
+    }
+    const index = Math.min(deleteSlot.index, current.length);
+    const next = current.slice();
+    next.splice(index, 0, clone([slotNote])[0]);
+    writeNotesFile(next);
+    const snapshot = clone(next);
+    deleteSlot = null;
+    // 延迟只推迟响应（真实 FIFO 下后续请求的快照会包含本次写回）
+    if (notesRestoreDelayMs) await sleep(notesRestoreDelayMs);
+    return { success: true, notes: snapshot, note: clone([slotNote])[0] };
   },
   notesExport: async function () {
     // 与 notesLoad 同源（文件），避免「内存数组 vs 文件」两套事实源；stub 不生成 notes.md 内容
@@ -817,6 +894,8 @@ const api = {
   },
   notesReset: async function () {
     writeNotesFile([]);
+    // 重建 = 从空库开始：重建前删除的条目不得被悄悄写回
+    deleteSlot = null;
     return { success: true, notes: [], backupPath: NOTES_FILE + ".bak" };
   },
 
@@ -878,6 +957,12 @@ contextBridge.exposeInMainWorld("__pixStub", {
   notesLoadCalls: function () { return notesLoadCalls; },
   setNotesAddFailure: function (code) { notesAddFailure = code || null; },
   setNotesDeleteFailure: function (code) { notesDeleteFailure = code || null; },
+  notesRestoreCalls: function () {
+    return { count: notesRestoreCalls.length, payloads: notesRestoreCalls.slice(-8) };
+  },
+  clearDeleteSlot: function () { deleteSlot = null; return true; },
+  setNotesRestoreFailure: function (code) { notesRestoreFailure = code || null; },
+  setNotesRestoreDelay: function (ms) { notesRestoreDelayMs = ms || 0; },
   sendCalls: function () {
     return { count: sendCalls.length, payloads: sendCalls.slice(-8) };
   },
@@ -4657,6 +4742,1101 @@ async function runReaderStateScenarios(win, log) {
     ],
   );
   await restoreStandardSeed();
+
+  // -------------------------------------------------------------------------
+  // 场景 60–65：笔记面板的搜索 / 排序 / 撤销 / 复制（R10 / N63–N72）
+  //
+  // 挂载位置：本函数末尾（R9 场景 55 之后）。60 段起每个场景自带复位（enterNotesProbe），
+  // 不引用其它场景的局部变量；60-7 / 60-9 / 64b 会真实删空笔记，其后的字节与行数判据
+  // 一律先复位再采集（设计档 §8.6 第 5 条）。
+  // -------------------------------------------------------------------------
+
+  const restoreCalls = () => js("window.__pixStub.notesRestoreCalls()");
+  const clearSlot = () => js("window.__pixStub.clearDeleteSlot(), true");
+  const setRestoreFailure = (code) => js(`window.__pixStub.setNotesRestoreFailure(${JSON.stringify(code)}), true`);
+  const setRestoreDelay = (ms) => js(`window.__pixStub.setNotesRestoreDelay(${ms}), true`);
+
+  /** 复位 + 打开 sample-paper.pdf 第 1 页 + 笔记面板就绪（60–65 的共用入口）。 */
+  const enterNotesProbe = async (seed = seedNotes(), rows = 4) => {
+    await enterMapWorkspace(seed);
+    await openRow("sample-paper.pdf");
+    await waitPdfLoaded();
+    await waitPage(1, 3);
+    await openNotesPanel(rows);
+  };
+
+  /** 搜索写值：先聚焦（供 60-3 的 Esc 断言），再用原生 setter 派发 input（一次 js 往返，不等待）。 */
+  const setSearch = (text) => js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.searchInput)});
+    if (!input) throw new Error("search input not found");
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(input, ${JSON.stringify(text)});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+
+  /** 搜索现场：值 / 焦点 / 清空按钮 / 行数 / 计数 / 搜索类空态文本（一次 js 读完）。 */
+  const searchProbe = () => js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.searchInput)});
+    const count = document.querySelector(".notes-count");
+    const empty = document.querySelector(${JSON.stringify(SEL.searchEmpty)});
+    return {
+      value: input ? input.value : null,
+      focused: document.activeElement === input,
+      clearInDom: !!document.querySelector(${JSON.stringify(SEL.searchClear)}),
+      rows: document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length,
+      countText: count ? count.textContent.replace(/\\s+/g, " ").trim() : null,
+      emptyText: empty ? empty.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+
+  const readRowsAndCount = () => js(`(() => {
+    const count = document.querySelector(".notes-count");
+    return {
+      rows: document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length,
+      countText: count ? count.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+
+  /** 地图开关是二态切换：已开时不得再点（否则把地图关掉）。 */
+  const ensureMapOpen = async () => {
+    if (await has(SEL.mapSlot)) return;
+    await openMap();
+  };
+
+  const pressSearchEsc = () => js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.searchInput)});
+    if (!input) throw new Error("search input not found");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return true;
+  })()`);
+
+  const clickSearchClear = () => js(`(() => {
+    const btn = document.querySelector(${JSON.stringify(SEL.searchClear)});
+    if (!btn) throw new Error("search clear button not found");
+    btn.click();
+    return true;
+  })()`);
+
+  const sortButtonProbe = () => js(`(() => {
+    const btn = document.querySelector(${JSON.stringify(SEL.sortBtn)});
+    return btn ? { text: btn.textContent.replace(/\\s+/g, " ").trim(), title: btn.getAttribute("title") } : null;
+  })()`);
+
+  /** 当前文档组（DOM 首个 .notes-group）的行序：文本全串 + 页码徽标 + AI 徽标。 */
+  const currentGroupProbe = () => js(`(() => {
+    const group = document.querySelector(".notes-group");
+    if (!group) return null;
+    return Array.from(group.querySelectorAll(".note-row")).map((row) => {
+      const text = row.querySelector(".note-text");
+      const page = row.querySelector(".note-page-badge");
+      return {
+        text: text ? text.textContent : null,
+        pageBadge: page ? page.textContent.replace(/\\s+/g, " ").trim() : null,
+        ai: !!row.querySelector(".note-ai-badge"),
+      };
+    });
+  })()`);
+
+  /** 组头序列：title / 显示名 / 计数（跨文档组的顺序与计数判据）。 */
+  const groupHeads = () => js(`(() => {
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    return Array.from(document.querySelectorAll(".notes-group")).map((group) => {
+      const head = group.querySelector(".notes-group-head");
+      return {
+        title: head ? head.getAttribute("title") : null,
+        name: text(head ? head.querySelector(".group-name") : null),
+        count: text(head ? head.querySelector(".group-count") : null),
+      };
+    });
+  })()`);
+
+  const rowTextSet = () => js(`Array.from(document.querySelectorAll(".note-row .note-text")).map((el) => el.textContent)`);
+
+  /** 删除行：两次点击（中间等 .confirming），与既有场景同手法。 */
+  const deleteRowByText = async (needle) => {
+    await js(`(() => {
+      const row = ${rowFinder(needle, false)};
+      if (!row) throw new Error("delete target not found: " + ${JSON.stringify(needle)});
+      row.querySelector(".note-delete").click();
+      return true;
+    })()`);
+    await waitFor("删除确认态", `(() => { const row = ${rowFinder(needle, false)}; return !!row && row.classList.contains("confirming"); })()`);
+    await js(`(() => {
+      const row = ${rowFinder(needle, false)};
+      if (!row) throw new Error("confirming row gone: " + ${JSON.stringify(needle)});
+      row.querySelector(".note-delete").click();
+      return true;
+    })()`);
+    await waitFor("删除完成", `!(${rowFinder(needle, false)})`);
+  };
+
+  const undoSnapshot = () => js(`(() => {
+    const rows = Array.from(document.querySelectorAll(${JSON.stringify(SEL.undoRow)}));
+    const row = rows[0];
+    const span = row ? row.querySelector(".undo-text") : null;
+    const btn = row ? row.querySelector(${JSON.stringify(SEL.undoBtn)}) : null;
+    return {
+      rowCount: rows.length,
+      text: span ? span.textContent.replace(/\\s+/g, " ").trim() : null,
+      btnText: btn ? btn.textContent.replace(/\\s+/g, " ").trim() : null,
+      btnTitle: btn ? btn.getAttribute("title") : null,
+      btnDisabled: btn ? btn.disabled : null,
+    };
+  })()`);
+
+  /** 撤销行的 DOM 位置：在 .notes-notice 之后、.notes-export-row 之前（元素缺失时不判）。 */
+  const undoOrder = () => js(`(() => {
+    const row = document.querySelector(${JSON.stringify(SEL.undoRow)});
+    const notice = document.querySelector(".notes-notice");
+    const exportRow = document.querySelector(".notes-export-row");
+    const follows = (a, b) => !!a && !!b && (a.compareDocumentPosition(b) & 4) === 4;
+    return { hasNotice: !!notice, noticeBefore: follows(notice, row), hasExport: !!exportRow, beforeExport: follows(row, exportRow) };
+  })()`);
+
+  const clickUndo = () => js(`(() => {
+    const btn = document.querySelector(${JSON.stringify(SEL.undoBtn)});
+    if (!btn) throw new Error("undo button not found");
+    btn.click();
+    return true;
+  })()`);
+
+  const notesNotice = () => js(`(() => {
+    const el = document.querySelector(".notes-notice");
+    return el
+      ? { isError: el.classList.contains("is-error"), isSuccess: el.classList.contains("is-success"), text: el.textContent.replace(/\\s+/g, " ").trim() }
+      : null;
+  })()`);
+
+  const closeNotice = () => js(`(() => {
+    const btn = document.querySelector(".notes-notice .notice-close");
+    if (btn) btn.click();
+    return true;
+  })()`);
+
+  /** 剪贴板写入是异步的：等它相对点击前的值发生变化（仍断言逐字内容，不用期望值做轮询条件）。 */
+  const readClipboardChange = async (before, label) => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const text = clipboard.readText();
+      if (text !== before) return text;
+      if (Date.now() > deadline) throw new Error(`等待超时：${label}（剪贴板未变化）`);
+      await sleep(80);
+    }
+  };
+  /** Windows 系统剪贴板会把 LF 规整成 CRLF（OS 行为，非产品行为）：逐字比较前归一化，原始值同时入库。 */
+  const normalizeClipboard = (text) => String(text).replace(/\r\n/g, "\n");
+
+  const clickCopyByText = (needle) => js(`(() => {
+    const row = ${rowFinder(needle, false)};
+    if (!row) throw new Error("copy target not found: " + ${JSON.stringify(needle)});
+    const btn = row.querySelector(${JSON.stringify(SEL.noteCopy)});
+    if (!btn) throw new Error("copy button not found in row");
+    btn.click();
+    return true;
+  })()`);
+
+  const rowCopyProbe = (needle) => js(`(() => {
+    const row = ${rowFinder(needle, false)};
+    if (!row) return null;
+    const btn = row.querySelector(${JSON.stringify(SEL.noteCopy)});
+    return btn
+      ? { text: btn.textContent.replace(/\\s+/g, " ").trim(), title: btn.getAttribute("title"), copied: btn.classList.contains("is-copied") }
+      : null;
+  })()`);
+
+  /**
+   * 在 PDF 第 1 页造选区并点「摘录」。
+   * 判据是「文件 + 面板」而不是浮层反馈：面板从空态切到列表会触发一次滚动，
+   * quick-ask 的 document 级 scroll 监听随即隐藏浮层（既有语义）⇒ 反馈态在此不可依赖（仅 60-9 命中）。
+   */
+  const excerptFirstSpan = async () => {
+    await selectPageSpan(1);
+    const beforeExcerpt = readNotes().length;
+    await js(`(() => {
+      const buttons = Array.from(document.querySelectorAll(".quick-ask-btn"));
+      const target = buttons.find((el) => (el.textContent || "").includes("摘录"));
+      if (!target) throw new Error("excerpt button not found");
+      target.click();
+      return true;
+    })()`);
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      if (readNotes().length === beforeExcerpt + 1) break;
+      if (Date.now() > deadline) throw new Error(`等待超时：摘录入库（notes.json 条数未从 ${beforeExcerpt} 增加）`);
+      await sleep(120);
+    }
+    await waitFor("摘录后面板回位", `document.querySelector(${JSON.stringify(SEL.searchInput)})`);
+  };
+
+  // 三段逐字样例（设计档 §4.1）：断言直接引用这些字面量，不由产品函数生成
+  const COPY_SAMPLE_1 =
+    "> Table 2 reports the ablation over the sparse mask budget. Removing the positional prior costs 2.4 points of recall, " +
+    "which confirms the mask is doing more than sparsification alone; the effect persists when the retrieval corpus is " +
+    "truncated to the first 8k tokens, so the gain cannot be attributed to longer effective context windows.\n\n" +
+    "—— sample-paper.pdf · 第 2 页";
+  const COPY_SAMPLE_2 = "> 结论：稀疏注意力在三分之一的预算下保持召回，位置先验是关键。\n\n—— sample-paper.pdf · 第 2 页 · AI 结论";
+  const COPY_SAMPLE_3 = "> Section 4. Reproducibility: all runs use three seeds and report the median.\n\n—— older-paper.pdf · 第 7 页";
+
+  // --- 60-1 搜索命中态与计数（含 60-2 的即时性判据） ---------------------------
+  log("60-1 搜索命中态与计数（含中文与大小写不敏感）");
+  await enterNotesProbe();
+  const hash60 = notesHash();
+  const loadBase60 = await loadCalls();
+  await setSearch("TABLE 2");
+  const instant60 = await readRowsAndCount();
+  await capturePage(win, "60-notes-search.png");
+  const left60 = await rectOfSelector(".layout-left", 2);
+  if (left60) await capturePage(win, "60b-notes-search-left-pane.png", left60);
+  const header60 = await rectOfSelector(".notes-header", 2);
+  if (header60) await capturePage(win, "60c-notes-search-zoom.png", header60);
+  await setSearch("消融");
+  const commentHit60 = await searchProbe();
+  // 搜索行形态（需求 §0.8 冻结）：placeholder / 输入框盒模型（26px + 圆角 6 + 12px，照抄 PdfSearchPanel）/ 清空控件是 v-btn 图标按钮。
+  const rowForm60 = await js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.searchInput)});
+    if (!input) return null;
+    const clear = document.querySelector(${JSON.stringify(SEL.searchClear)});
+    const ist = getComputedStyle(input);
+    const irect = input.getBoundingClientRect();
+    const crect = clear ? clear.getBoundingClientRect() : null;
+    return {
+      placeholder: input.getAttribute("placeholder"),
+      height: Math.round(irect.height),
+      radius: ist.borderTopLeftRadius,
+      fontSize: ist.fontSize,
+      clearTag: clear ? clear.tagName : null,
+      clearVBtn: clear ? clear.classList.contains("v-btn") : false,
+      clearIconBtn: clear ? clear.classList.contains("v-btn--icon") : false,
+      clearTitle: clear ? clear.getAttribute("title") : null,
+      clearIcon: clear ? !!clear.querySelector(".v-icon.mdi-close") : false,
+      clearBox: crect ? { w: Math.round(crect.width), h: Math.round(crect.height) } : null,
+    };
+  })()`);
+  record("notes-search", { phase: "search-row-form", ...rowForm60 }, [
+    ...(rowForm60.placeholder === "搜索原文或备注" ? [] : [`placeholder 非冻结字面：${rowForm60.placeholder}`]),
+    ...(rowForm60.height === 26 ? [] : [`输入框高度应为 26px：${rowForm60.height}`]),
+    ...(rowForm60.radius === "6px" ? [] : [`输入框圆角应为 6px：${rowForm60.radius}`]),
+    ...(rowForm60.fontSize === "12px" ? [] : [`输入框字号应为 12px：${rowForm60.fontSize}`]),
+    ...(rowForm60.clearTag === "BUTTON" && rowForm60.clearVBtn && rowForm60.clearIconBtn
+      ? []
+      : [`清空控件应为 v-btn 图标按钮：${JSON.stringify(rowForm60)}`]),
+    ...(rowForm60.clearTitle === "清空搜索" ? [] : [`清空控件 title 异常：${rowForm60.clearTitle}`]),
+    ...(rowForm60.clearIcon ? [] : ["清空控件应含 mdi-close 图标"]),
+  ]);
+  await setSearch("消融 实验");
+  const innerSpace60 = await searchProbe();
+  await setSearch("sample-paper.pdf");
+  const meta60 = await searchProbe();
+  await setSearch("");
+  const cleared60 = await searchProbe();
+  record(
+    "notes-search",
+    {
+      phase: "hits",
+      immediate: instant60,
+      comment: commentHit60,
+      innerSpace: innerSpace60,
+      meta: meta60,
+      cleared: cleared60,
+      hashSame: notesHash() === hash60,
+      loadCallsSame: (await loadCalls()) === loadBase60,
+    },
+    [
+      ...(instant60.rows === 1 ? [] : [`输入与读取之间只允许一次 IPC 往返：应见 1 行（无防抖），实为 ${instant60.rows}`]),
+      ...(instant60.countText === "命中 1 条 / 共 4 条" ? [] : [`即时计数异常：${instant60.countText}`]),
+      ...(commentHit60.rows === 1 ? [] : [`备注命中异常：${commentHit60.rows}`]),
+      ...(commentHit60.countText === "命中 1 条 / 共 4 条" ? [] : [`备注命中计数异常：${commentHit60.countText}`]),
+      ...(innerSpace60.rows === 0 ? [] : [`内部空白不折叠：应 0 行，实为 ${innerSpace60.rows}`]),
+      ...(innerSpace60.emptyText === "没有匹配「消融 实验」的笔记" ? [] : [`空态文案异常：${innerSpace60.emptyText}`]),
+      ...(innerSpace60.clearInDom ? [] : ["搜索生效时清空按钮应在 DOM"]),
+      ...(meta60.rows === 0 ? [] : [`docPath 不参与匹配：应 0 行，实为 ${meta60.rows}`]),
+      ...(cleared60.rows === 4 && cleared60.countText === "共 4 条"
+        ? []
+        : [`清空后应回全量：${cleared60.rows}/${cleared60.countText}`]),
+      ...(cleared60.clearInDom === false ? [] : ["清空后清空按钮应移出 DOM"]),
+      ...(notesHash() === hash60 ? [] : ["搜索不得改写 notes.json"]),
+      ...((await loadCalls()) === loadBase60 ? [] : ["搜索不得触发 notesLoad"]),
+    ],
+  );
+
+  // --- 60-3 Esc：清空 + 失焦 --------------------------------------------------
+  log("60-3 Esc：清空查询并把焦点交还窗口");
+  await setSearch("消融");
+  const beforeEsc60 = await searchProbe();
+  await pressSearchEsc();
+  const afterEsc60 = await searchProbe();
+  await capturePage(win, "60d-notes-search-cleared.png");
+  record("notes-search", { phase: "esc", before: beforeEsc60, after: afterEsc60 }, [
+    ...(beforeEsc60.focused === true ? [] : [`Esc 前输入框应聚焦（空断言防护）：${JSON.stringify(beforeEsc60)}`]),
+    ...(beforeEsc60.value === "消融" && beforeEsc60.rows === 1 ? [] : [`Esc 前现场异常：${JSON.stringify(beforeEsc60)}`]),
+    ...(afterEsc60.value === "" ? [] : [`Esc 后应清空：${afterEsc60.value}`]),
+    ...(afterEsc60.focused === false ? [] : ["Esc 后应失焦"]),
+    ...(afterEsc60.rows === 4 ? [] : [`Esc 后应回 4 行：${afterEsc60.rows}`]),
+    ...(afterEsc60.clearInDom === false ? [] : ["Esc 后清空按钮应移出 DOM"]),
+  ]);
+
+  // --- 60-4 清空按钮：清空 + 焦点交还输入框 ------------------------------------
+  log("60-4 清空按钮：清空并把焦点交还输入框");
+  await setSearch("消融");
+  await clickSearchClear();
+  const clearBtn60 = await searchProbe();
+  record("notes-search", { phase: "clear-button", ...clearBtn60, hashSame: notesHash() === hash60 }, [
+    ...(clearBtn60.value === "" ? [] : [`清空按钮后值异常：${clearBtn60.value}`]),
+    ...(clearBtn60.focused === true ? [] : ["清空按钮后焦点应在输入框"]),
+    ...(clearBtn60.rows === 4 ? [] : [`清空按钮后应回 4 行：${clearBtn60.rows}`]),
+    ...(notesHash() === hash60 ? [] : ["清空按钮不得改写 notes.json"]),
+  ]);
+
+  // --- 60-5 三维同时生效 ------------------------------------------------------
+  log("60-5 三维同时生效：搜索 × 章节过滤 × 仅看当前文档");
+  await enterNotesProbe();
+  await toggleCurrentDocOnly(true);
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  await setSearch("Table 2");
+  const three60 = { probe: await searchProbe(), chapterText: await chapterFilterText(), checked: await filterChecked() };
+  await capturePage(win, "60e-notes-search-three-dimensions.png");
+  await toggleCurrentDocOnly(false);
+  const off60 = await readRowsAndCount();
+  await toggleCurrentDocOnly(true);
+  const on60 = await readRowsAndCount();
+  record("notes-search", { phase: "three-dimensions", ...three60, off: off60, on: on60 }, [
+    ...(three60.probe.rows === 1 ? [] : [`三维应只剩 1 行：${three60.probe.rows}`]),
+    ...(three60.probe.value === "Table 2" ? [] : [`输入框值异常：${three60.probe.value}`]),
+    ...(three60.chapterText === "章节：2. Method Overview · 第 2 页" ? [] : [`过滤条文本异常：${three60.chapterText}`]),
+    ...(three60.checked === true ? [] : ["开关应为 ON"]),
+    ...(three60.probe.countText === "命中 1 条 / 共 4 条" ? [] : [`三维计数异常：${three60.probe.countText}`]),
+    ...(off60.rows === 1 && on60.rows === 1
+      ? []
+      : [`开关两态在章节区间内都应 1 行（AND 的数值证据）：${off60.rows}/${on60.rows}`]),
+  ]);
+
+  // --- 60-6 计数真值表 + 错误态 ------------------------------------------------
+  log("60-6 计数真值表六态 + 错误态");
+  await setSearch("");
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("过滤条消失", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)})`);
+  await toggleCurrentDocOnly(false);
+  const c1_60 = await readRowsAndCount();
+  await toggleCurrentDocOnly(true);
+  const c2_60 = await readRowsAndCount();
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  const c3_60 = await readRowsAndCount();
+  await setSearch("Table 2");
+  const c4_60 = await readRowsAndCount();
+  const c5_60 = await readRowsAndCount();
+  await setSearch("zzz");
+  const c6_60 = await readRowsAndCount();
+  await setSearch("Table 2");
+  await js(`document.querySelector(${JSON.stringify(SEL.tabLibrary)}).click(), true`);
+  await setLoadFailure("corrupt");
+  await js(`document.querySelector(${JSON.stringify(SEL.tabNotes)}).click(), true`);
+  await waitFor("笔记错误态", `document.querySelector(".notes-error")`);
+  const err60 = {
+    countText: await textOf(".notes-count"),
+    searchInDom: await has(SEL.searchInput),
+    sortInDom: await has(SEL.sortBtn),
+  };
+  await setLoadFailure(null);
+  await js(`document.querySelector(${JSON.stringify(SEL.tabLibrary)}).click(), true`);
+  await js(`document.querySelector(${JSON.stringify(SEL.tabNotes)}).click(), true`);
+  await waitFor("笔记面板回位", `document.querySelector(${JSON.stringify(SEL.searchInput)})`);
+  const recovered60 = await searchProbe();
+  record(
+    "notes-search",
+    {
+      phase: "counts",
+      plain: c1_60,
+      currentDoc: c2_60,
+      chapter: c3_60,
+      hit: c4_60,
+      threeDims: c5_60,
+      miss: c6_60,
+      error: err60,
+      recovered: recovered60,
+    },
+    [
+      ...(c1_60.countText === "共 4 条" ? [] : [`计数一态异常：${c1_60.countText}`]),
+      ...(c2_60.countText === "当前 3 条 / 共 4 条" ? [] : [`计数二态异常：${c2_60.countText}`]),
+      ...(c3_60.countText === "本章 2 条 / 共 4 条" ? [] : [`计数三态异常：${c3_60.countText}`]),
+      ...(c4_60.countText === "命中 1 条 / 共 4 条" ? [] : [`计数四态异常：${c4_60.countText}`]),
+      ...(c5_60.countText === "命中 1 条 / 共 4 条" ? [] : [`三维同时计数异常：${c5_60.countText}`]),
+      ...(c6_60.countText === "命中 0 条 / 共 4 条" ? [] : [`无匹配计数异常：${c6_60.countText}`]),
+      ...(err60.countText === "" ? [] : [`错误态计数应为空串：${JSON.stringify(err60.countText)}`]),
+      ...(err60.searchInDom === false && err60.sortInDom === false ? [] : ["错误态不得渲染搜索/排序行"]),
+      ...(recovered60.value === "Table 2" ? [] : [`错误态恢复后查询未保留：${recovered60.value}`]),
+    ],
+  );
+
+  // --- 60-7 空态矩阵（修订 4）--------------------------------------------------
+  log("60-7 空态矩阵：搜索类三态 + 章节/文档两态");
+  await enterNotesProbe();
+  await setSearch("zzz");
+  const e4c60 = await searchProbe();
+  await capturePage(win, "61-notes-search-empty.png");
+  await toggleCurrentDocOnly(true);
+  const e4b60 = await searchProbe();
+  await capturePage(win, "61b-notes-search-empty-doc.png");
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 0);
+  const e4a60 = await searchProbe();
+  const noOtherEmpty60 = { filteredEmpty: await has(".notes-filtered-empty"), chapterEmpty: await has(SEL.chapterEmpty) };
+  await capturePage(win, "61c-notes-search-empty-chapter.png");
+  record(
+    "notes-search",
+    { phase: "empty-search", plain: e4c60, doc: e4b60, chapter: e4a60, noOther: noOtherEmpty60 },
+    [
+      ...(e4c60.emptyText === "没有匹配「zzz」的笔记" ? [] : [`4c 文案异常：${e4c60.emptyText}`]),
+      ...(e4c60.rows === 0 ? [] : [`4c 应 0 行：${e4c60.rows}`]),
+      ...(e4b60.emptyText === "当前文档内没有匹配「zzz」的笔记" ? [] : [`4b 文案异常：${e4b60.emptyText}`]),
+      ...(e4a60.emptyText === "本章内没有匹配「zzz」的笔记" ? [] : [`4a 文案异常：${e4a60.emptyText}`]),
+      ...(noOtherEmpty60.filteredEmpty === false && noOtherEmpty60.chapterEmpty === false
+        ? []
+        : [`搜索类空态不得渲染另两个空态：${JSON.stringify(noOtherEmpty60)}`]),
+    ],
+  );
+  await setSearch("");
+  const chapterRange60 = await readRowsAndCount();
+  await deleteRowByText("Table 2 repo");
+  await deleteRowByText("结论：稀疏注意力");
+  const chapterEmpty60 = { text: await textOf(SEL.chapterEmpty), ...(await readRowsAndCount()) };
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("过滤条消失", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)})`);
+  const currentOnly60 = await readRowsAndCount();
+  await deleteRowByText("attention budget is the binding constraint");
+  const docEmpty60 = { text: await textOf(".notes-filtered-empty"), ...(await readRowsAndCount()) };
+  await toggleCurrentDocOnly(false);
+  const noDim60 = {
+    ...(await readRowsAndCount()),
+    empty: (await has(SEL.notesEmpty)) || (await has(SEL.searchEmpty)) || (await has(SEL.chapterEmpty)) || (await has(".notes-filtered-empty")),
+    texts: await rowTextSet(),
+  };
+  record("notes-search", { phase: "empty-matrix", chapterRange: chapterRange60, chapterEmpty: chapterEmpty60, currentOnly: currentOnly60, docEmpty: docEmpty60, noDim: noDim60 }, [
+    ...(chapterRange60.rows === 2 && chapterRange60.countText === "本章 2 条 / 共 4 条"
+      ? []
+      : [`清空查询后（章节过滤生效）异常：${JSON.stringify(chapterRange60)}`]),
+    ...(chapterEmpty60.text === "本章暂无笔记" ? [] : [`章节空态文案异常：${chapterEmpty60.text}`]),
+    ...(chapterEmpty60.countText === "本章 0 条 / 共 2 条" ? [] : [`章节空态计数异常：${chapterEmpty60.countText}`]),
+    ...(currentOnly60.countText === "当前 1 条 / 共 2 条" ? [] : [`清除章节过滤后计数异常：${currentOnly60.countText}`]),
+    ...(docEmpty60.text === "当前文档暂无笔记" ? [] : [`文档空态文案异常：${docEmpty60.text}`]),
+    ...(docEmpty60.countText === "当前 0 条 / 共 1 条" ? [] : [`文档空态计数异常：${docEmpty60.countText}`]),
+    ...(noDim60.rows === 1 && !noDim60.empty ? [] : [`关开关后应 1 行且无空态：${JSON.stringify(noDim60)}`]),
+    ...(noDim60.texts.length === 1 && noDim60.texts[0] === seedNotes()[2].text
+      ? []
+      : [`关开关后应只剩跨文档条目：${JSON.stringify(noDim60.texts)}`]),
+  ]);
+
+  // --- 60-8 空白查询 ----------------------------------------------------------
+  log("60-8 空白查询：不算搜索生效（独立复位）");
+  await enterNotesProbe();
+  await setSearch("   ");
+  const blank60 = await searchProbe();
+  record("notes-search", { phase: "blank-query", ...blank60 }, [
+    ...(blank60.clearInDom === false ? [] : ["空白查询不应渲染清空按钮"]),
+    ...(blank60.rows === 4 ? [] : [`空白查询应全量可见：${blank60.rows}`]),
+    ...(blank60.countText === "共 4 条" ? [] : [`空白查询计数异常：${blank60.countText}`]),
+  ]);
+  await setSearch("");
+
+  // --- 60-9 删空最后一条 + 摘录回位（N64-7）-----------------------------------
+  log("60-9 删空最后一条 + 摘录回位（独立复位）");
+  await enterNotesProbe();
+  await setSearch("Table 2 reports");
+  await deleteRowByText("Table 2 repo");
+  const d1_60 = await readRowsAndCount();
+  await setSearch("稀疏注意力");
+  await deleteRowByText("结论：稀疏注意力");
+  const d2_60 = await readRowsAndCount();
+  await setSearch("Reproducibility");
+  await deleteRowByText("Section 4. Reproducibility");
+  const d3_60 = await readRowsAndCount();
+  await setSearch("消融");
+  await deleteRowByText("We study retrieval");
+  const empty60 = {
+    ...(await readRowsAndCount()),
+    empty: await has(SEL.notesEmpty),
+    searchInDom: await has(SEL.searchInput),
+    sortInDom: await has(SEL.sortBtn),
+  };
+  await excerptFirstSpan();
+  const excerpted60 = await searchProbe();
+  record("notes-search", { phase: "delete-all-then-excerpt", steps: [d1_60, d2_60, d3_60], empty: empty60, excerpted: excerpted60 }, [
+    ...(d1_60.countText === "命中 0 条 / 共 3 条" ? [] : [`第 1 步计数异常：${d1_60.countText}`]),
+    ...(d2_60.countText === "命中 0 条 / 共 2 条" ? [] : [`第 2 步计数异常：${d2_60.countText}`]),
+    ...(d3_60.countText === "命中 0 条 / 共 1 条" ? [] : [`第 3 步计数异常：${d3_60.countText}`]),
+    ...(empty60.countText === "命中 0 条 / 共 0 条" ? [] : [`删空后计数异常：${empty60.countText}`]),
+    ...(empty60.empty ? [] : ["删空后应渲染 .notes-empty"]),
+    ...(empty60.searchInDom === false && empty60.sortInDom === false ? [] : ["无笔记时搜索/排序行不得渲染"]),
+    ...(excerpted60.value === "消融" ? [] : [`摘录后查询应保留原串：${excerpted60.value}`]),
+    ...(excerpted60.rows === 0 ? [] : [`摘录后应 0 命中：${excerpted60.rows}`]),
+    ...(excerpted60.countText === "命中 0 条 / 共 1 条" ? [] : [`摘录后计数异常：${excerpted60.countText}`]),
+    ...(excerpted60.emptyText === "没有匹配「消融」的笔记" ? [] : [`摘录后空态文案异常：${excerpted60.emptyText}`]),
+  ]);
+  await setSearch("");
+  await restoreStandardSeed();
+
+  // --- 62 排序 -----------------------------------------------------------------
+  log("62-1 默认按页码排序");
+  const seed62 = seedNotes();
+  await enterNotesProbe(seed62);
+  await capturePage(win, "62b-notes-sort-default.png");
+  const btn62 = await sortButtonProbe();
+  const group62 = await currentGroupProbe();
+  const heads62 = await groupHeads();
+  const order62 = group62 ? group62.map((row) => row.text) : [];
+  record("notes-sort", { phase: "default", button: btn62, group: order62, heads: heads62 }, [
+    ...(btn62 && btn62.text === "排序：页码" ? [] : [`排序按钮文案异常：${JSON.stringify(btn62)}`]),
+    ...(btn62 && btn62.title === "当前按页码排序，点击改为「最新优先」" ? [] : [`排序按钮 title 异常：${JSON.stringify(btn62)}`]),
+    ...(JSON.stringify(order62) === JSON.stringify([seed62[0].text, seed62[1].text, seed62[3].text])
+      ? []
+      : [`当前文档组行序异常：${JSON.stringify(order62)}`]),
+    ...(JSON.stringify(heads62.map((head) => head.title)) === JSON.stringify(["sample-paper.pdf", "archive/older-paper.pdf"])
+      ? []
+      : [`组头序异常：${JSON.stringify(heads62.map((head) => head.title))}`]),
+    ...(JSON.stringify(heads62.map((head) => head.count)) === JSON.stringify(["共 3 条", "共 1 条"])
+      ? []
+      : [`组计数异常：${JSON.stringify(heads62.map((head) => head.count))}`]),
+  ]);
+
+  log("62-2 切到「最新优先」");
+  const hash62 = notesHash();
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  const latest62 = { btn: await sortButtonProbe(), group: await currentGroupProbe(), heads: await groupHeads() };
+  await capturePage(win, "62-notes-sort-latest.png");
+  const latestOrder62 = latest62.group ? latest62.group.map((row) => row.text) : [];
+  record("notes-sort", { phase: "created", button: latest62.btn, group: latestOrder62, heads: latest62.heads, hashSame: notesHash() === hash62 }, [
+    ...(latest62.btn && latest62.btn.text === "排序：最新" ? [] : [`排序按钮文案异常：${JSON.stringify(latest62.btn)}`]),
+    ...(latest62.btn && latest62.btn.title === "当前按最新优先排序，点击改为「页码」" ? [] : [`排序按钮 title 异常：${JSON.stringify(latest62.btn)}`]),
+    ...(JSON.stringify(latestOrder62) === JSON.stringify([seed62[3].text, seed62[1].text, seed62[0].text])
+      ? []
+      : [`最新优先组内顺序异常：${JSON.stringify(latestOrder62)}`]),
+    ...(JSON.stringify(latest62.heads.map((head) => head.title)) === JSON.stringify(heads62.map((head) => head.title))
+      ? []
+      : ["排序不得改变组顺序"]),
+    ...(JSON.stringify(latest62.heads.map((head) => head.count)) === JSON.stringify(heads62.map((head) => head.count))
+      ? []
+      : ["排序不得改变组计数"]),
+    ...(notesHash() === hash62 ? [] : ["排序不得改写 notes.json"]),
+  ]);
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  const back62 = await sortButtonProbe();
+  record("notes-sort", { phase: "back-to-page", button: back62 }, [
+    ...(back62 && back62.text === "排序：页码" ? [] : ["再点一次应回到页码排序"]),
+  ]);
+
+  log("62-3 排序 × 搜索：可见集合不变");
+  await setSearch("稀疏注意力");
+  const search62 = await readRowsAndCount();
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  const searchCreated62 = await readRowsAndCount();
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  await setSearch("");
+  record("notes-sort", { phase: "with-search", page: search62, created: searchCreated62 }, [
+    ...(search62.rows === 1 && searchCreated62.rows === 1 ? [] : [`两种排序下行数都应为 1：${search62.rows}/${searchCreated62.rows}`]),
+    ...(search62.countText === "命中 1 条 / 共 4 条" && searchCreated62.countText === "命中 1 条 / 共 4 条"
+      ? []
+      : [`搜索计数异常：${search62.countText}/${searchCreated62.countText}`]),
+  ]);
+
+  log("62-4 排序 × 章节过滤：可见集合不变、组内顺序变化");
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 2);
+  const groupsBefore62 = await countOf(".notes-group");
+  const setBefore62 = await rowTextSet();
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  const setAfter62 = await rowTextSet();
+  const createdOrder62 = await currentGroupProbe();
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  record("notes-sort", { phase: "with-chapter", groups: groupsBefore62, before: setBefore62, after: setAfter62, order: createdOrder62 ? createdOrder62.map((row) => row.text) : [] }, [
+    ...(groupsBefore62 === 1 ? [] : [`章节过滤后组数异常：${groupsBefore62}`]),
+    ...(JSON.stringify([...setBefore62].sort()) === JSON.stringify([...setAfter62].sort()) ? [] : ["排序不得改可见集合"]),
+    ...(createdOrder62 && createdOrder62[0].text === seed62[3].text ? [] : ["最新优先下组内首行应为 n-current-3"]),
+  ]);
+
+  log("62-5 导出与注入顺序：排序不参与注入");
+  await js(`document.querySelector(".notes-export-btn").click(), true`);
+  await waitFor("导出提示", `document.querySelector(".notes-export-row .export-text")`);
+  const exportText62 = await textOf(".notes-export-row .export-text");
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("过滤条消失", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)})`);
+  await waitFor("回 4 行", `document.querySelectorAll(".note-row").length === 4`);
+  await js(`document.querySelector(${JSON.stringify(SEL.sortBtn)}).click(), true`);
+  await clickInRow(seed62[0].text, ".note-select-wrap");
+  await clickInRow(seed62[3].text, ".note-select-wrap");
+  await waitFor("已选 2 条", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 2 条") >= 0; })()`);
+  await js(`document.querySelector(".notes-ask-btn").click(), true`);
+  await clearSendCalls();
+  await typeAndSend("62：排序不改注入顺序");
+  await runTurn("62：排序不改注入顺序", "排序注入回答");
+  await waitSendCalls(1);
+  const send62 = await lastSend();
+  const message62 = send62 ? send62.message : "";
+  record("notes-sort", { phase: "export-and-injection", exportText: exportText62, hasBoth: message62.includes(seed62[0].text) && message62.includes(seed62[3].text), orderOk: message62.indexOf(seed62[0].text) < message62.indexOf(seed62[3].text) }, [
+    ...(exportText62 === "已导出 4 条 → .pix-read/notes.md" ? [] : [`导出提示异常：${exportText62}`]),
+    ...(message62.includes(seed62[0].text) && message62.includes(seed62[3].text) ? [] : ["注入载荷应同时含两条"]),
+    ...(message62.indexOf(seed62[0].text) < message62.indexOf(seed62[3].text)
+      ? []
+      : ["注入顺序应为 doc→page→createdAt，与屏幕顺序相反"]),
+  ]);
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+
+  log("62-6 文档切换保留、离开复位");
+  await backToLibraryTab();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await openNotesPanel(4);
+  const switch62 = await sortButtonProbe();
+  await goHome();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(5);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  const home62 = await sortButtonProbe();
+  record("notes-sort", { phase: "scope", afterDocSwitch: switch62, afterReenter: home62 }, [
+    ...(switch62 && switch62.text === "排序：最新" ? [] : [`切文档应保留排序：${JSON.stringify(switch62)}`]),
+    ...(home62 && home62.text === "排序：页码" ? [] : [`重进工作区应复位排序：${JSON.stringify(home62)}`]),
+  ]);
+  await restoreStandardSeed();
+
+  // --- 63 撤销 -----------------------------------------------------------------
+  log("63-1 删除即落盘 + 撤销行");
+  const seed63 = seedNotes();
+  await enterNotesProbe(seed63);
+  const hashBefore63 = notesHash();
+  const idsBefore63 = readNotes().map((note) => note.id);
+  await deleteRowByText("Table 2 repo");
+  const undo63 = await undoSnapshot();
+  await capturePage(win, "63-notes-undo.png");
+  const afterDelete63 = { ids: readNotes().map((note) => note.id), rows: await countOf(SEL.noteRow), hashChanged: notesHash() !== hashBefore63 };
+  record("notes-undo", { phase: "delete", undo: undo63, file: afterDelete63 }, [
+    ...(afterDelete63.ids.indexOf("n-current-2") < 0 ? [] : ["文件里该 id 应已消失"]),
+    ...(afterDelete63.hashChanged ? [] : ["删除应即时落盘"]),
+    ...(undo63.rowCount === 1 ? [] : [`撤销行数量应为 1：${undo63.rowCount}`]),
+    ...(undo63.text === "已删除「Table 2 repo…」· 第 2 页" ? [] : [`撤销行文案异常：${undo63.text}`]),
+    ...(undo63.btnText === "撤销" && undo63.btnTitle === "还原这条笔记" ? [] : [`撤销按钮异常：${undo63.btnText}/${undo63.btnTitle}`]),
+    ...(afterDelete63.rows === 3 ? [] : [`删除后应 3 行：${afterDelete63.rows}`]),
+  ]);
+
+  log("63-2 撤销：行回位 + 字节回复 + 成功通知");
+  await clickUndo();
+  await waitFor("成功通知", `document.querySelector(".notes-notice.is-success")`);
+  const order63 = await undoOrder();
+  const restored63 = {
+    rows: await countOf(SEL.noteRow),
+    notice: await textOf(".notes-notice.is-success"),
+    undoRowCount: (await undoSnapshot()).rowCount,
+    order: order63,
+    hashSame: notesHash() === hashBefore63,
+    ids: readNotes().map((note) => note.id),
+    createdAt: (readNotes().find((note) => note.id === "n-current-2") || {}).createdAt,
+  };
+  await capturePage(win, "63b-notes-undo-restored.png");
+  await closeNotice();
+  record("notes-undo", { phase: "restore", ...restored63, seedCreatedAt: seed63[1].createdAt }, [
+    ...(restored63.rows === 4 ? [] : [`还原后应回 4 行：${restored63.rows}`]),
+    ...(restored63.notice === "已还原该条笔记" ? [] : [`成功通知异常：${restored63.notice}`]),
+    ...(restored63.undoRowCount === 0 ? [] : ["还原成功后撤销行应消失"]),
+    ...(order63.hasNotice ? [] : ["成功路径应渲染通知（撤销行已收）"]),
+    ...(restored63.hashSame ? [] : ["还原应逐字节回复删除前"]),
+    ...(JSON.stringify(restored63.ids) === JSON.stringify(idsBefore63) ? [] : [`文件 id 序列应回复：${JSON.stringify(restored63.ids)}`]),
+    ...(restored63.createdAt === seed63[1].createdAt ? [] : ["updatedAt/createdAt 不得被刷新"]),
+  ]);
+
+  log("63-3 还原后参与三维过滤");
+  await setSearch("Table 2");
+  const search63 = await readRowsAndCount();
+  await setSearch("");
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("1. Abstract");
+  await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
+  const abstract63 = { group: await currentGroupProbe(), count: await textOf(".notes-count"), rows: await countOf(SEL.noteRow) };
+  const noEmpty63 = { chapterEmpty: await has(SEL.chapterEmpty), filteredEmpty: await has(".notes-filtered-empty") };
+  await js(`document.querySelector(${JSON.stringify(SEL.chapterFilterClear)}).click(), true`);
+  await waitFor("清除后回 4 行", `!document.querySelector(${JSON.stringify(SEL.chapterFilter)}) && document.querySelectorAll(".note-row").length === 4`);
+  const cleared63 = await readRowsAndCount();
+  record("notes-undo", { phase: "three-dimensions", search: search63, abstract: abstract63, noEmpty: noEmpty63, cleared: cleared63 }, [
+    ...(search63.rows === 1 ? [] : [`搜索命中异常：${search63.rows}`]),
+    ...(abstract63.rows === 1 && abstract63.group && abstract63.group[0].text === seed63[0].text
+      ? []
+      : [`1. Abstract 章节应只剩 n-current-1：${JSON.stringify(abstract63)}`]),
+    ...(abstract63.count === "本章 1 条 / 共 4 条" ? [] : [`章节计数异常：${abstract63.count}`]),
+    ...(noEmpty63.chapterEmpty === false && noEmpty63.filteredEmpty === false ? [] : ["非空列表不得渲染空态元素"]),
+    ...(cleared63.rows === 4 && cleared63.countText === "共 4 条" ? [] : [`清除后异常：${JSON.stringify(cleared63)}`]),
+  ]);
+
+  log("63-4 撤销与选择集：删除清选择、还原回选择");
+  await clickInRow("Table 2 reports", ".note-select-wrap");
+  await waitFor("已选 1 条", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.indexOf("已选 1 条") >= 0; })()`);
+  await deleteRowByText("Table 2 repo");
+  const selDelete63 = { countText: await textOf(".notes-selection-count"), bar: await has(".notes-selection-bar") };
+  await clickUndo();
+  await waitFor("成功通知", `document.querySelector(".notes-notice.is-success")`);
+  const selRestore63 = { countText: await textOf(".notes-selection-count"), chip: (await chipSnapshot()).notesLabel };
+  await closeNotice();
+  await clearSendCalls();
+  await typeAndSend("63：还原后注入");
+  await runTurn("63：还原后注入", "还原注入回答");
+  await waitSendCalls(1);
+  const send63 = await lastSend();
+  record("notes-undo", { phase: "selection", afterDelete: selDelete63, afterRestore: selRestore63, injected: !!send63 && send63.message.includes(seed63[1].text) }, [
+    ...(selDelete63.bar === false ? [] : [`删除后选择条应消失：${JSON.stringify(selDelete63)}`]),
+    ...(selRestore63.countText === "已选 1 条" ? [] : [`撤销后应回选择：${selRestore63.countText}`]),
+    ...(selRestore63.chip === "摘录 1 条" ? [] : [`撤销后 chip 异常：${selRestore63.chip}`]),
+    ...(send63 && send63.message.includes(seed63[1].text) ? [] : ["注入载荷应含还原条目"]),
+  ]);
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+  await waitFor("选择清空", `!document.querySelector(".notes-selection-bar")`);
+
+  log("63-5 连删两条：行数量恒 1、文案为后一条");
+  await deleteRowByText("We study retrieval");
+  const first63_5 = await undoSnapshot();
+  await deleteRowByText("Table 2 repo");
+  const second63_5 = await undoSnapshot();
+  await capturePage(win, "63c-notes-undo-consecutive.png");
+  await clickUndo();
+  await waitFor("成功通知", `document.querySelector(".notes-notice.is-success")`);
+  const after63_5 = { ids: readNotes().map((note) => note.id), rows: await countOf(SEL.noteRow) };
+  await closeNotice();
+  record("notes-undo", { phase: "consecutive", first: first63_5, second: second63_5, after: after63_5 }, [
+    ...(first63_5.rowCount === 1 && second63_5.rowCount === 1 ? [] : [`撤销行数量应恒 1：${first63_5.rowCount}/${second63_5.rowCount}`]),
+    ...(first63_5.text === "已删除「We study ret…」· 第 1 页" ? [] : [`第一次文案异常：${first63_5.text}`]),
+    ...(second63_5.text === "已删除「Table 2 repo…」· 第 2 页" ? [] : [`第二次文案异常：${second63_5.text}`]),
+    ...(after63_5.ids.indexOf("n-current-1") < 0 ? [] : ["n-current-1 不应被还原"]),
+    ...(after63_5.ids.indexOf("n-current-2") >= 0 ? [] : ["n-current-2 应被还原"]),
+    ...(after63_5.rows === 3 ? [] : [`还原后应 3 行：${after63_5.rows}`]),
+  ]);
+
+  log("63-6 撤销成功后再删同一条");
+  await restoreStandardSeed();
+  const hash63_6 = notesHash();
+  await deleteRowByText("Table 2 repo");
+  const firstRow63_6 = await undoSnapshot();
+  await clickUndo();
+  await waitFor("第一次成功通知", `document.querySelector(".notes-notice.is-success")`);
+  await closeNotice();
+  const firstRestore63_6 = { hashSame: notesHash() === hash63_6, rows: await countOf(SEL.noteRow) };
+  await deleteRowByText("Table 2 repo");
+  const secondRow63_6 = await undoSnapshot();
+  await clickUndo();
+  await waitFor("第二次成功通知", `document.querySelector(".notes-notice.is-success")`);
+  await closeNotice();
+  const secondRestore63_6 = { hashSame: notesHash() === hash63_6, rows: await countOf(SEL.noteRow) };
+  record("notes-undo", { phase: "repeat", firstRow: firstRow63_6, firstRestore: firstRestore63_6, secondRow: secondRow63_6, secondRestore: secondRestore63_6 }, [
+    ...(firstRow63_6.rowCount === 1 && secondRow63_6.rowCount === 1 ? [] : ["两轮都应出现新的撤销行"]),
+    ...(firstRestore63_6.hashSame && firstRestore63_6.rows === 4 ? [] : [`第一轮还原异常：${JSON.stringify(firstRestore63_6)}`]),
+    ...(secondRestore63_6.hashSame && secondRestore63_6.rows === 4 ? [] : [`第二轮还原异常：${JSON.stringify(secondRestore63_6)}`]),
+  ]);
+
+  log("63-7 写失败可重试");
+  await setRestoreFailure("write-failed");
+  await deleteRowByText("Table 2 repo");
+  await clickUndo();
+  await waitFor("失败通知", `document.querySelector(".notes-notice.is-error")`);
+  const fail63_7 = { notice: await textOf(".notes-notice.is-error"), undo: await undoSnapshot(), rows: await countOf(SEL.noteRow) };
+  await closeNotice();
+  await setRestoreFailure(null);
+  await clickUndo();
+  await waitFor("成功通知", `document.querySelector(".notes-notice.is-success")`);
+  const retry63_7 = { undo: await undoSnapshot(), rows: await countOf(SEL.noteRow) };
+  await closeNotice();
+  record("notes-undo", { phase: "write-failure-retry", failure: fail63_7, retry: retry63_7 }, [
+    ...(fail63_7.notice === "撤销失败：笔记写入失败" ? [] : [`写失败文案异常：${fail63_7.notice}`]),
+    ...(fail63_7.undo.rowCount === 1 ? [] : ["写失败后撤销行应保留"]),
+    ...(fail63_7.rows === 3 ? [] : [`写失败后行数不应变：${fail63_7.rows}`]),
+    ...(retry63_7.undo.rowCount === 0 ? [] : ["恢复后重试应成功收行"]),
+    ...(retry63_7.rows === 4 ? [] : [`恢复后应回 4 行：${retry63_7.rows}`]),
+  ]);
+
+  log("63-8 撤销行与过滤无关（独立复位）");
+  await enterNotesProbe();
+  const hash63_8 = notesHash();
+  await deleteRowByText("Table 2 repo");
+  await setSearch("zzz");
+  const hidden63_8 = { probe: await searchProbe(), undo: await undoSnapshot() };
+  await clickUndo();
+  await waitFor("成功通知", `document.querySelector(".notes-notice.is-success")`);
+  const after63_8 = { rows: (await readRowsAndCount()).rows, hashSame: notesHash() === hash63_8, undoRowCount: (await undoSnapshot()).rowCount };
+  await closeNotice();
+  await setSearch("");
+  const cleared63_8 = await readRowsAndCount();
+  record("notes-undo", { phase: "filter-independent", hidden: hidden63_8, afterUndo: after63_8, cleared: cleared63_8 }, [
+    ...(hidden63_8.probe.rows === 0 && hidden63_8.probe.emptyText === "没有匹配「zzz」的笔记"
+      ? []
+      : [`查询下应 0 行 + 搜索空态：${JSON.stringify(hidden63_8.probe)}`]),
+    ...(hidden63_8.undo.rowCount === 1 && hidden63_8.undo.text === "已删除「Table 2 repo…」· 第 2 页"
+      ? []
+      : [`撤销行应仍在且文案为该条：${JSON.stringify(hidden63_8.undo)}`]),
+    ...(after63_8.rows === 0 ? [] : [`还原后仍应 0 行（查询仍生效）：${after63_8.rows}`]),
+    ...(after63_8.hashSame ? [] : ["还原应回复删除前字节"]),
+    ...(after63_8.undoRowCount === 0 ? [] : ["成功还原后撤销行应消失"]),
+    ...(cleared63_8.rows === 4 ? [] : [`清空查询后应回 4 行：${cleared63_8.rows}`]),
+  ]);
+
+  // --- 64 过期与行生命周期 -------------------------------------------------------
+  log("64 过期窗口：5s 后点撤销不发 IPC");
+  await enterNotesProbe();
+  await deleteRowByText("Table 2 repo");
+  const hash64 = notesHash();
+  const calls64 = (await restoreCalls()).count;
+  await sleep(5200);
+  const row64 = await undoSnapshot();
+  await capturePage(win, "64-notes-undo-expired.png");
+  await clickUndo();
+  await waitFor("过期通知", `document.querySelector(".notes-notice.is-error")`);
+  const expired64 = {
+    notice: await textOf(".notes-notice.is-error"),
+    undoRowCount: (await undoSnapshot()).rowCount,
+    callsDelta: (await restoreCalls()).count - calls64,
+    hashSame: notesHash() === hash64,
+    rows: await countOf(SEL.noteRow),
+  };
+  await closeNotice();
+  record("notes-undo", { phase: "expired", rowBefore: row64.rowCount, ...expired64 }, [
+    ...(row64.rowCount === 1 ? [] : ["5.2s 时撤销行应仍在 DOM（8s 窗口）"]),
+    ...(expired64.notice === "撤销失败：撤销窗口已过期（超过 5 秒），笔记未能还原" ? [] : [`过期文案异常：${expired64.notice}`]),
+    ...(expired64.undoRowCount === 0 ? [] : ["过期后撤销行应立即消失"]),
+    ...(expired64.callsDelta === 0 ? [] : [`过期分支不得发 IPC：+${expired64.callsDelta}`]),
+    ...(expired64.hashSame ? [] : ["过期失败不得写盘"]),
+    ...(expired64.rows === 3 ? [] : [`过期后行数异常：${expired64.rows}`]),
+  ]);
+
+  log("64b 行到期 + 重挂不复活");
+  await deleteRowByText("We study retrieval");
+  await sleep(8200);
+  const gone64b = await undoSnapshot();
+  await backToLibraryTab();
+  await openNotesPanel(2);
+  const remount64b = await undoSnapshot();
+  await capturePage(win, "64b-notes-undo-row-gone.png");
+  record("notes-undo", { phase: "row-expired", beforeRemount: gone64b.rowCount, afterRemount: remount64b.rowCount, rows: await countOf(SEL.noteRow) }, [
+    ...(gone64b.rowCount === 0 ? [] : ["8s 后撤销行应自动消失"]),
+    ...(remount64b.rowCount === 0 ? [] : ["重挂载不得复活撤销行"]),
+    ...((await countOf(SEL.noteRow)) === 2 ? [] : ["行数应为 2（64 删 1 + 64b 删 1）"]),
+  ]);
+  await restoreStandardSeed();
+
+  log("64c 槽失效：没有可撤销的删除");
+  await deleteRowByText("Table 2 repo");
+  const hash64c = notesHash();
+  await clearSlot();
+  await clickUndo();
+  await waitFor("失败通知", `document.querySelector(".notes-notice.is-error")`);
+  const fail64c = { notice: await textOf(".notes-notice.is-error"), undo: await undoSnapshot(), rows: await countOf(SEL.noteRow), hashSame: notesHash() === hash64c, order: await undoOrder() };
+  await closeNotice();
+  record("notes-undo", { phase: "slot-cleared", ...fail64c }, [
+    ...(fail64c.notice === "撤销失败：没有可撤销的删除" ? [] : [`无槽文案异常：${fail64c.notice}`]),
+    ...(fail64c.hashSame ? [] : ["槽失效不得写盘"]),
+    ...(fail64c.rows === 3 ? [] : [`槽失效后行数不应变：${fail64c.rows}`]),
+    ...(fail64c.undo.rowCount === 1 ? [] : ["失败后撤销行应保留"]),
+    ...(fail64c.undo.btnDisabled === false ? [] : ["失败路径也必须复位 restoring"]),
+    ...(fail64c.order.hasNotice && fail64c.order.noticeBefore ? [] : [`撤销行应在通知之后：${JSON.stringify(fail64c.order)}`]),
+  ]);
+
+  log("64c-2 同 id 占用：该笔记已重新存在");
+  await enterNotesProbe();
+  await deleteRowByText("Table 2 repo");
+  const calls64c2 = (await restoreCalls()).count;
+  await restoreStandardSeed();
+  const hash64c2 = notesHash();
+  const undo64c2 = await undoSnapshot();
+  await clickUndo();
+  await waitFor("失败通知", `document.querySelector(".notes-notice.is-error")`);
+  const occ64c2 = { notice: await textOf(".notes-notice.is-error"), callsDelta: (await restoreCalls()).count - calls64c2, hashSame: notesHash() === hash64c2, rows: await countOf(SEL.noteRow), undo: await undoSnapshot() };
+  await closeNotice();
+  record("notes-undo", { phase: "same-id-occupied", before: undo64c2, ...occ64c2 }, [
+    ...(undo64c2.rowCount === 1 ? [] : ["清槽发生在 64c、本场景自带新槽"]),
+    ...(occ64c2.notice === "撤销失败：该笔记已重新存在，无法撤销" ? [] : [`同 id 占用文案异常：${occ64c2.notice}`]),
+    ...(occ64c2.callsDelta === 1 ? [] : [`应恰发 1 次 IPC：+${occ64c2.callsDelta}`]),
+    ...(occ64c2.hashSame ? [] : ["invalid-input 不得写盘"]),
+    ...(occ64c2.rows === 4 ? [] : [`占用失败后行数应保持 4：${occ64c2.rows}`]),
+    ...(occ64c2.undo.rowCount === 1 ? [] : ["失败后撤销行应保留"]),
+  ]);
+
+  log("64d 在途防重复：1 次 IPC + 新行按钮可用");
+  await enterNotesProbe();
+  const hash64d = notesHash();
+  const calls64d = (await restoreCalls()).count;
+  await setRestoreDelay(400);
+  await deleteRowByText("Table 2 repo");
+  await clickUndo();
+  const inFlight64d = await undoSnapshot();
+  await clickUndo();
+  await waitFor("撤销行消失", `!document.querySelector(${JSON.stringify(SEL.undoRow)})`);
+  const done64d = { rows: await countOf(SEL.noteRow), hashSame: notesHash() === hash64d, callsDelta: (await restoreCalls()).count - calls64d };
+  await deleteRowByText("结论：稀疏注意力");
+  const freshRow64d = await undoSnapshot();
+  await setRestoreDelay(0);
+  await restoreStandardSeed();
+  record("notes-undo", { phase: "in-flight", inFlight: inFlight64d, done: done64d, fresh: freshRow64d }, [
+    ...(inFlight64d.btnDisabled === true ? [] : ["在途按钮应 disabled"]),
+    ...(done64d.callsDelta === 1 ? [] : [`在途连点应只发 1 次 IPC：+${done64d.callsDelta}`]),
+    ...(done64d.rows === 4 && done64d.hashSame ? [] : [`在途撤销结果异常：${JSON.stringify(done64d)}`]),
+    ...(freshRow64d.rowCount === 1 && freshRow64d.btnDisabled === false ? [] : ["新行按钮不应 disabled（restoring 已复位）"]),
+  ]);
+
+  log("64e 新删除介入：stale 零副作用");
+  await enterNotesProbe();
+  await setRestoreDelay(1200);
+  await deleteRowByText("Table 2 repo");
+  await clickUndo();
+  await deleteRowByText("We study retrieval");
+  await sleep(1800);
+  const stale64e = { undo: await undoSnapshot(), rows: await countOf(SEL.noteRow), texts: await rowTextSet(), notice: await notesNotice(), file: readNotes().map((note) => note.id) };
+  await setRestoreDelay(0);
+  await restoreStandardSeed();
+  record("notes-undo", { phase: "stale-interleave", ...stale64e }, [
+    ...(stale64e.undo.rowCount === 1 && stale64e.undo.text === "已删除「We study ret…」· 第 1 页"
+      ? []
+      : [`撤销行应仍是 n-current-1 的文案：${JSON.stringify(stale64e.undo)}`]),
+    ...(stale64e.rows === 3 ? [] : [`行数应为 3：${stale64e.rows}`]),
+    ...(stale64e.texts.length === 3 && stale64e.texts.indexOf("We study retrieval over long documents where the attention budget is the binding constraint.") < 0
+      ? []
+      : [`迟到响应不得复活 n-current-1：${JSON.stringify(stale64e.texts)}`]),
+    ...(stale64e.notice === null || (!stale64e.notice.text.includes("已还原该条笔记") && !stale64e.notice.text.includes("撤销失败："))
+      ? []
+      : [`stale 必须零副作用：${JSON.stringify(stale64e.notice)}`]),
+    ...(stale64e.undo.btnDisabled === false ? [] : ["stale 后按钮必须复位"]),
+    ...(stale64e.file.indexOf("n-current-1") < 0 && stale64e.file.indexOf("n-current-2") >= 0
+      ? []
+      : [`真实 FIFO 落盘结果异常：${JSON.stringify(stale64e.file)}`]),
+  ]);
+
+  // --- 65 复制（修订 9：先 show + focus）--------------------------------------
+  log("65-0 复制前置：显示窗口并获焦");
+  win.show();
+  win.focus();
+  win.webContents.focus();
+  await waitFor("窗口获得焦点", "document.hasFocus()", 15000);
+  // 清空系统剪贴板：让「复制是否真的写入」有确定基线（不依赖上一次运行遗留）
+  clipboard.clear();
+  const focused65 = await js("document.hasFocus()");
+  record("notes-copy", { phase: "focus", hasFocus: focused65 }, [
+    ...(focused65 === true ? [] : ["离屏窗口未获焦：复制链路判据不可达（不得静默通过）"]),
+  ]);
+
+  log("65-1 单条复制：剪贴板逐字 + 已复制反馈");
+  await enterNotesProbe();
+  const hash65 = notesHash();
+  const pageBefore65 = await pageLabel();
+  const clipBefore65 = clipboard.readText();
+  await clickCopyByText("Table 2 reports");
+  const clip65 = await readClipboardChange(clipBefore65, "65-1 剪贴板写入");
+  const copyProbe65 = await rowCopyProbe("Table 2 reports");
+  await capturePage(win, "65-note-copy-feedback.png");
+  const pageAfter65 = await pageLabel();
+  record("notes-copy", { phase: "copy-one", clipboard: clip65, clipboardNormalized: normalizeClipboard(clip65), button: copyProbe65, pageBefore: pageBefore65, pageAfter: pageAfter65, hashSame: notesHash() === hash65 }, [
+    ...(normalizeClipboard(clip65) === COPY_SAMPLE_1 ? [] : [`剪贴板逐字不符：${JSON.stringify(clip65)}`]),
+    ...(copyProbe65 && copyProbe65.text === "已复制" && copyProbe65.copied && copyProbe65.title === "已复制"
+      ? []
+      : [`反馈态异常：${JSON.stringify(copyProbe65)}`]),
+    ...(pageAfter65 === pageBefore65 ? [] : ["复制不得触发跳回原文"]),
+    ...(notesHash() === hash65 ? [] : ["复制是只读动作"]),
+  ]);
+
+  log("65-2 反馈 1.2s 后回位");
+  await sleep(1400);
+  const reverted65 = await rowCopyProbe("Table 2 reports");
+  record("notes-copy", { phase: "feedback-reset", button: reverted65 }, [
+    ...(reverted65 && reverted65.text === "复制" && reverted65.copied === false && reverted65.title === "复制为 Markdown"
+      ? []
+      : [`反馈回位异常：${JSON.stringify(reverted65)}`]),
+  ]);
+
+  log("65-3 两段连续复制：片段模板与唯一反馈态");
+  const clipBefore65b = clipboard.readText();
+  await clickCopyByText("结论：稀疏注意力");
+  const clip65b = await readClipboardChange(clipBefore65b, "65-3 第二段写入");
+  await clickCopyByText("Reproducibility");
+  const clip65c = await readClipboardChange(clip65b, "65-3 第三段写入");
+  const feedback65b = await js(`(() => {
+    const copied = Array.from(document.querySelectorAll(".note-copy.is-copied"));
+    const row = copied[0] ? copied[0].closest(".note-row") : null;
+    const text = row ? row.querySelector(".note-text") : null;
+    return { count: copied.length, rowText: text ? text.textContent : null };
+  })()`);
+  await capturePage(win, "65b-note-copy-fragment.png");
+  log(`65-3 片段（AI 结论）：${JSON.stringify(clip65b)}`);
+  log(`65-3 片段（跨文档）：${JSON.stringify(clip65c)}`);
+  record("notes-copy", { phase: "two-fragments", first: clip65b, second: clip65c, feedback: feedback65b }, [
+    ...(normalizeClipboard(clip65b) === COPY_SAMPLE_2 ? [] : [`第二段逐字不符：${JSON.stringify(clip65b)}`]),
+    ...(normalizeClipboard(clip65c) === COPY_SAMPLE_3 ? [] : [`第三段逐字不符：${JSON.stringify(clip65c)}`]),
+    ...(feedback65b.count === 1 ? [] : [`反馈态数量应恒 1：${feedback65b.count}`]),
+    ...(feedback65b.rowText === "Section 4. Reproducibility: all runs use three seeds and report the median."
+      ? []
+      : ["反馈态应属最后点击的行"]),
+  ]);
+
+  log("65-4 两条链路都失败：非静默错误提示");
+  await js(`(() => {
+    window.__pixOrigWriteText = Clipboard.prototype.writeText;
+    window.__pixOrigExecCommand = Document.prototype.execCommand;
+    Clipboard.prototype.writeText = function () { return Promise.reject(new Error("injected")); };
+    Document.prototype.execCommand = function () { return false; };
+    return true;
+  })()`);
+  await clickCopyByText("Table 2 reports");
+  await waitFor("复制失败提示", `document.querySelector(".notes-notice.is-error")`);
+  const fail65 = { notice: await textOf(".notes-notice.is-error"), button: await rowCopyProbe("Table 2 reports"), hashSame: notesHash() === hash65, clipboardUnchanged: clipboard.readText() === clip65c };
+  await capturePage(win, "65c-note-copy-failure.png");
+  await js(`(() => {
+    Clipboard.prototype.writeText = window.__pixOrigWriteText;
+    Document.prototype.execCommand = window.__pixOrigExecCommand;
+    return true;
+  })()`);
+  await closeNotice();
+  record("notes-copy", { phase: "failure", ...fail65 }, [
+    ...(fail65.notice === "复制失败：无法访问剪贴板" ? [] : [`失败文案异常：${fail65.notice}`]),
+    ...(fail65.button && fail65.button.text === "复制" && fail65.button.copied === false ? [] : [`失败不得置反馈态：${JSON.stringify(fail65.button)}`]),
+    ...(fail65.hashSame ? [] : ["复制不得写盘"]),
+    ...(fail65.clipboardUnchanged ? [] : ["失败路径不得改写剪贴板"]),
+  ]);
+
+  log("65-5 行内动作几何");
+  const geo65 = await js(`(() => {
+    const row = ${rowFinder("Table 2 reports", false)};
+    if (!row) return null;
+    const actions = row.querySelector(".note-actions");
+    const body = row.querySelector(".note-body");
+    const copy = row.querySelector(".note-copy");
+    const wrap = row.querySelector(".note-ask-wrap");
+    const ask = row.querySelector(".note-ask");
+    const box = (el) => { const b = el.getBoundingClientRect(); return { x: b.x, y: b.y, w: b.width, h: b.height, right: b.right }; };
+    return {
+      copyBeforeAsk: !!(copy && wrap && (copy.compareDocumentPosition(wrap) & 4) === 4),
+      copyBox: copy ? box(copy) : null,
+      askBox: ask ? box(ask) : null,
+      actionsBox: actions ? box(actions) : null,
+      bodyBox: body ? box(body) : null,
+      actionsOverflow: actions ? actions.scrollWidth - actions.clientWidth : null,
+      lastChild: body ? body.lastElementChild.className : null,
+    };
+  })()`);
+  record("notes-copy", { phase: "geometry", ...geo65 }, [
+    ...(geo65 && geo65.copyBeforeAsk ? [] : [".note-copy 应在 .note-ask-wrap 之前"]),
+    ...(geo65 && geo65.copyBox && geo65.askBox && Math.abs(geo65.copyBox.y - geo65.askBox.y) <= 1
+      ? []
+      : ["复制与追问应在同一行"]),
+    ...(geo65 && geo65.bodyBox && geo65.actionsBox && Math.abs(geo65.bodyBox.right - geo65.actionsBox.right) <= 2
+      ? []
+      : ["动作区应右对齐"]),
+    ...(geo65 && geo65.actionsOverflow <= 1 ? [] : ["动作区不得换行/溢出"]),
+    ...(geo65 && geo65.lastChild === "note-actions" ? [] : [".note-actions 应仍是 .note-body 最后一个子节点"]),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
