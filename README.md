@@ -21,7 +21,7 @@ PiX-Read 是基于 [pi](https://github.com/earendil-works/pi) agent 内核的**�
 - 知识地图联动:章节节点显示该章笔记数与页码范围、头部显示阅读进度、已读章节弱化、点击笔记数徽标把笔记面板限定到该章节
 - 阅读向 agent 工具:`pdf_read_pages`(按页取正文)、`pdf_outline`(书签与页码),发送时注入文档路径/当前页/选中文本
 - agent 会话能力:流式输出、工具执行展示、steering/follow-up
-- 会话管理:新建与切换,按 workspace 目录隔离存储(删除有主进程接口,尚无界面入口)
+- 会话管理:新建、切换、重命名与删除,按 workspace 目录隔离存储
 - 模型与思考深度切换、API key 管理、MCP 服务器配置(经 pi-mcp-adapter)
 - 截图/附件发送;纯文本模型经 takeHerEyes 视觉预处理通道
 - agent 主动提问(request_user_input)以澄清卡片形式插入对话
@@ -35,10 +35,12 @@ pix/                           # Electron 应用(产品名 PiX-Read)
 │   │   ├── index.ts           # 应用入口(窗口/生命周期/剪贴板菜单)
 │   │   ├── preload.ts         # contextBridge 暴露 PixApi(IPC 单一来源)
 │   │   ├── session-bridge.ts  # AgentSession 桥接(prompt/steer/模型/认证/MCP/takeHerEyes 视觉预处理)
-│   │   ├── ipc-handlers.ts    # IPC 处理(会话/设置/资料库/更新)
+│   │   ├── ipc-handlers.ts    # IPC 处理(会话/设置/资料库/更新/笔记/阅读现场/窗口)
 │   │   ├── pdf-tools.ts       # 注册 pdf_read_pages / pdf_outline agent 工具
 │   │   ├── reading-prompt.ts  # 阅读助手系统提示词
 │   │   ├── library-root.ts    # 当前资料库根与路径越界校验(叶子模块)
+│   │   ├── notes-store.ts     # 笔记存储(工作区 .pix-read/notes.json)
+│   │   ├── reader-state-store.ts  # 阅读现场存储(工作区 .pix-read/reader-state.json)
 │   │   ├── chat-files.ts      # 附件处理(图片缩放等)
 │   │   ├── file-dialogs.ts    # 原生目录/附件选择对话框
 │   │   ├── pix-paths.ts       # PiX 自有存储位置唯一来源(%APPDATA%/PiX-Read,含 agent/sessions)
@@ -46,15 +48,15 @@ pix/                           # Electron 应用(产品名 PiX-Read)
 │   │   └── settings-store.ts  # pix-settings 持久化(electron-store)
 │   ├── renderer/              # Vue 渲染进程
 │   │   ├── main.ts / App.vue / router.ts
-│   │   ├── components/workspace/  # LibraryPanel / ReaderPanel / PdfViewer / KnowledgeMap / ChatPanel
-│   │   ├── components/session/    # MessageBlock / ToolExecutionBlock / ErrorBlock
+│   │   ├── components/workspace/  # LibraryPanel / NotesPanel / ReaderPanel / PdfViewer / PdfSearchPanel / PdfSelectionQuickAsk / KnowledgeMap / ChatPanel
+│   │   ├── components/session/    # MessageBlock / ToolExecutionBlock / ErrorBlock / GuideBlock
 │   │   ├── components/input/      # InputArea / ModelSelector / ThinkingSelector / ClarificationCard
 │   │   ├── components/settings/   # McpSettings(模型与密钥等已并入 SettingsPage)
 │   │   ├── components/layout/     # AppLayout
 │   │   ├── pages/             # HomePage / WorkspacePage / SettingsPage
-│   │   ├── stores/            # session / project / settings / auth / reader
-│   │   ├── composables/       # useRpc / useRegionCapture / useTheme
-│   │   ├── utils/             # markdown / reading-context / session-title
+│   │   ├── stores/            # session / project / settings / auth / reader / reader-state / notes
+│   │   ├── composables/       # useRpc / useRegionCapture / useTheme / useQuickAsk
+│   │   ├── utils/             # markdown / reading-context / session-title / note-capture / notes-path / notes-view / outline-notes / image-capture
 │   │   ├── types/             # ipc / rpc / session 类型声明
 │   │   └── assets/styles/     # main.css / variables.css
 │   └── shared/                # 主进程与渲染进程共享类型

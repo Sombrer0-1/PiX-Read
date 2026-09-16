@@ -25,8 +25,9 @@
 import { app, BrowserWindow, clipboard } from "electron";
 import { createServer } from "vite";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PIX_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -76,6 +77,18 @@ const SEL = {
   undoRow: ".notes-undo",
   undoBtn: ".notes-undo-btn",
   noteCopy: ".note-copy",
+  // R11 新增 11 项（设计档 §0.4）
+  pdfSearchBtn: '.pdf-toolbar button[title="在文档中搜索"]',
+  pdfSearchPanel: ".pdf-search-panel",
+  zoomInBtn: '.pdf-toolbar button[title="放大"]',
+  zoomLabel: ".zoom-label",
+  pdfScroll: ".pdf-scroll",
+  pdfViewer: ".pdf-viewer",
+  captureFabBtn: ".pdf-capture-fab button",
+  captureLayer: ".capture-layer",
+  layoutLeft: ".layout-left",
+  noteActions: ".note-actions",
+  noteText: ".note-text",
 };
 
 // ---------------------------------------------------------------------------
@@ -844,7 +857,9 @@ const api = {
   },
   /** 还原槽内那一条：校验顺序与错误文案逐字对齐 src/main/notes-store.ts 的 restoreNote。 */
   notesRestore: async function (id) {
-    notesRestoreCalls.push({ id: id });
+    // resolvedAt：响应真正回到渲染层的时刻（R11 / r11-6 的「迟到响应」空断言防护）
+    const call = { id: id, resolvedAt: null };
+    notesRestoreCalls.push(call);
     if (!id || typeof id !== "string") {
       return { success: false, notes: [], code: "invalid-input", error: NOTES_ERRORS["invalid-input"] };
     }
@@ -886,6 +901,7 @@ const api = {
     deleteSlot = null;
     // 延迟只推迟响应（真实 FIFO 下后续请求的快照会包含本次写回）
     if (notesRestoreDelayMs) await sleep(notesRestoreDelayMs);
+    call.resolvedAt = Date.now();
     return { success: true, notes: snapshot, note: clone([slotNote])[0] };
   },
   notesExport: async function () {
@@ -1225,6 +1241,12 @@ async function runScenario(win, log) {
     return true;
   })()`);
   await waitFor("摘录浮层重现", `document.querySelector(${JSON.stringify(SEL.quickAsk)}).offsetParent !== null`);
+  // N73-2b（R11 追加）：同文本的重复选区不再把反馈重置为 actions ⇒ 动作按钮需等反馈自然
+  // 回落（FEEDBACK_MS = 2500）后才回来；此处只补一个有界等待，既有判据与截图不变。
+  await waitFor(
+    "同文本重复选区后动作按钮回位（等反馈回落）",
+    `Array.from(document.querySelectorAll(".quick-ask-btn")).some((el) => (el.textContent || "").includes("摘录"))`,
+  );
   await js(`(() => {
     const buttons = Array.from(document.querySelectorAll(".quick-ask-btn"));
     const target = buttons.find((el) => (el.textContent || "").includes("摘录"));
@@ -4948,8 +4970,10 @@ async function runReaderStateScenarios(win, log) {
 
   /**
    * 在 PDF 第 1 页造选区并点「摘录」。
-   * 判据是「文件 + 面板」而不是浮层反馈：面板从空态切到列表会触发一次滚动，
-   * quick-ask 的 document 级 scroll 监听随即隐藏浮层（既有语义）⇒ 反馈态在此不可依赖（仅 60-9 命中）。
+   * 判据是「文件 + 面板」而不是浮层反馈：面板从空态切到列表会触发一次面板滚动，
+   * 而 R11 起浮层只对「目标在 .reader-stage 子树内」的滚动隐藏 ⇒ 面板滚动不再吞掉反馈；
+   * 入库引发的 DOM 更新会带出一次同文本 selectionchange，反馈态在该事件之后保持可见（N73-2b）；
+   * 60-9 在本条后追加逐字反馈断言（A1–A3）。
    */
   const excerptFirstSpan = async () => {
     await selectPageSpan(1);
@@ -4969,6 +4993,269 @@ async function runReaderStateScenarios(win, log) {
     }
     await waitFor("摘录后面板回位", `document.querySelector(${JSON.stringify(SEL.searchInput)})`);
   };
+
+  // --- R11 helper（设计档 §0.4：语义冻结、命名自由）----------------------------
+
+  /** 浮层现场：一次 js 读 inDom / display（computed）/ feedbackClass / feedbackText。 */
+  const quickAskProbe = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.quickAsk)});
+    const feedback = document.querySelector(".quick-ask-feedback");
+    return {
+      inDom: !!el,
+      display: el ? getComputedStyle(el).display : null,
+      feedbackClass: feedback ? feedback.className : null,
+      feedbackText: feedback ? feedback.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+
+  /** 有界等待反馈态（不以期望文案做轮询条件）：超时只回传现场，由调用方的断言判红。 */
+  const waitFeedbackOk = async (timeoutMs = 1500) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const probe = await quickAskProbe();
+      if (probe.feedbackClass !== null && probe.feedbackClass.includes("is-ok")) return probe;
+      if (Date.now() > deadline) return probe;
+      await sleep(60);
+    }
+  };
+
+  // --- N73-2b helper（设计档「追加-2 §2.4」：语义冻结、命名自由）-----------------
+
+  /** N73-2b 浮层现场：一次 js 读 inDom / display / feedbackClass / feedbackText / btnCount。 */
+  const quickAskStateProbe = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.quickAsk)});
+    const feedback = document.querySelector(".quick-ask-feedback");
+    return {
+      inDom: !!el,
+      display: el ? getComputedStyle(el).display : null,
+      feedbackClass: feedback ? feedback.className : null,
+      feedbackText: feedback ? feedback.textContent.replace(/\\s+/g, " ").trim() : null,
+      btnCount: el ? el.querySelectorAll(".quick-ask-btn").length : 0,
+    };
+  })()`);
+
+  /** N73-2b 选区现场：text 归一化空白 + trim；anchorInStage = 锚点在 .reader-stage 子树内。 */
+  const selectionProbe = () => js(`(() => {
+    const selection = document.getSelection();
+    const stage = document.querySelector(".reader-stage");
+    const anchor = selection ? selection.anchorNode : null;
+    return {
+      text: selection ? selection.toString().replace(/\\s+/g, " ").trim() : null,
+      collapsed: selection ? selection.isCollapsed : null,
+      anchorInStage: !!anchor && !!stage && stage.contains(anchor),
+    };
+  })()`);
+
+  /** 第 N 页文本层首个 span 的文本（归一化 + trim）：「同文本 / 不同文本」判定的现场值。 */
+  const pageSpanText = (page) => js(`(() => {
+    const span = document.querySelector('.pdf-page[data-page="${page}"] .textLayer span');
+    return span ? span.textContent.replace(/\\s+/g, " ").trim() : null;
+  })()`);
+
+  /** 把目标页带进渲染窗口（scrollIntoView 会触发阅读区滚动 ⇒ 隐藏浮层，故必须在选区之前调用）。 */
+  const focusPage = async (page) => {
+    await js(`(() => {
+      const target = document.querySelector('.pdf-page[data-page="${page}"]');
+      if (target) target.scrollIntoView({ block: "center" });
+      return true;
+    })()`);
+    await waitFor(`第 ${page} 页文本层`, `document.querySelector('.pdf-page[data-page="${page}"] .textLayer span')`);
+  };
+
+  /**
+   * 修复轮.5 入口前置加固：有界静默 + 「可摘录态」复核（最多 attempts 次）。
+   * 迟到的阅读区滚动可能在 selectPageSpan 之后才隐藏浮层（既有语义，指针落在 hide 路径）⇒
+   * 静默等待本身不能证明「静默之前没被隐藏」，故静默后复核浮层是否仍为可见 actions 态且选区
+   * 仍在 stage 内；不成立则重建选区（有界重取）后再静默复核。超限返回 ok:false，由调用方以
+   * 独立文案判为前置失败（不得降级为跳过）。
+   */
+  const ensureQuickAskExcerptReady = async (page, attempts = 3) => {
+    const trail = [];
+    let quiet = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      quiet = await waitStageScrollQuiet();
+      const state = await quickAskStateProbe();
+      const selection = await selectionProbe();
+      const spanText = await pageSpanText(page);
+      const ready =
+        state.display !== null &&
+        state.display !== "none" &&
+        state.feedbackClass === null &&
+        state.btnCount === 2 &&
+        selection.collapsed === false &&
+        selection.anchorInStage === true &&
+        selection.text === spanText;
+      trail.push({ attempt, quiet, state, selection, spanText, ready });
+      if (ready) return { ok: true, attempts: attempt, quiet, trail };
+      if (attempt < attempts) await selectPageSpan(page); // 重取：选区重建后浮层回到可见 actions 态
+    }
+    return { ok: false, attempts, quiet, trail };
+  };
+
+  /**
+   * 点浮层的「摘录」并等文件条数 +1（≤20 s），随后等面板回位：相位 4/5 的公共前置。
+   * 按钮缺失时回传现场（不再抛渲染层裸错误），由调用方按前置失败判红。
+   */
+  const excerptViaQuickAsk = async () => {
+    const before = readNotes().length;
+    const clicked = await js(`(() => {
+      const el = document.querySelector(${JSON.stringify(SEL.quickAsk)});
+      const buttons = Array.from(document.querySelectorAll(".quick-ask-btn"));
+      const target = buttons.find((item) => (item.textContent || "").includes("摘录"));
+      if (!target) {
+        return { clicked: false, inDom: !!el, display: el ? getComputedStyle(el).display : null, btnCount: buttons.length };
+      }
+      target.click();
+      return { clicked: true, inDom: !!el, display: el ? getComputedStyle(el).display : null, btnCount: buttons.length };
+    })()`);
+    if (!clicked.clicked) throw new Error(`摘录按钮不可点击（入口前置被破坏）：${JSON.stringify(clicked)}`);
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      if (readNotes().length === before + 1) break;
+      if (Date.now() > deadline) throw new Error(`等待超时：摘录入库（notes.json 条数未从 ${before} 增加）`);
+      await sleep(120);
+    }
+    await waitFor("摘录后面板回位", `document.querySelector(${JSON.stringify(SEL.searchInput)})`);
+  };
+
+  /**
+   * N73-2b 的到期观测：有界轮询（60 ms）直到 feedbackClass === null；
+   * 超时不抛错，返回 { probe, at } 由调用方的断言判红（与 waitFeedbackOk 同风格）。
+   * 命名说明：设计档建议的 waitFeedbackGone 与既有 helper（同作用域）重名 ⇒ 改用 waitFeedbackCleared。
+   */
+  const waitFeedbackCleared = async (timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const probe = await quickAskStateProbe();
+      if (probe.feedbackClass === null) return { probe, at: Date.now() };
+      if (Date.now() > deadline) return { probe, at: Date.now() };
+      await sleep(60);
+    }
+  };
+
+  /** 空态文案：容器只判「在 DOM」，文案从 .empty-title / .empty-subtitle 读（M3）。 */
+  const notesEmptyProbe = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.notesEmpty)});
+    const text = (selector) => {
+      const node = el ? el.querySelector(selector) : null;
+      return node ? node.textContent.replace(/\\s+/g, " ").trim() : null;
+    };
+    return { inDom: !!el, title: text(".empty-title"), subtitle: text(".empty-subtitle") };
+  })()`);
+
+  /** 阅读区滚动现场：一次 js 读 scrollHeight / clientHeight / scrollTop / scaleText。 */
+  const stageScrollProbe = () => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.pdfScroll)});
+    const zoom = document.querySelector(${JSON.stringify(SEL.zoomLabel)});
+    return {
+      scrollHeight: el ? el.scrollHeight : null,
+      clientHeight: el ? el.clientHeight : null,
+      scrollTop: el ? el.scrollTop : null,
+      scaleText: zoom ? zoom.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+
+  // --- 修复轮.5 helper（取证面稳定性）：阅读区滚动静默观测 ---------------------
+  //
+  // 相位 4/5 的反馈窗口只有 2500 ms，任何 target 落在 .reader-stage 子树内的滚动都会按既有
+  // 语义隐藏浮层（PdfSelectionQuickAsk.onStageScroll）⇒ 环境性前置破坏与产品行为会混为一红。
+  // 这里装一个只读计数器 + 有界静默等待，把「窗口内是否有阅读区滚动」变成可判读的读数。
+
+  /**
+   * 安装阅读区滚动计数器（幂等；计数跨相位累积）。
+   * document 级 capture 监听：scroll 不冒泡，但 capture 阶段能命中子树内滚动元素；
+   * 只统计 target 在 .reader-stage 子树内的滚动事件与最近时刻（与产品 hide 判据同源）。
+   */
+  const installStageScrollWatch = () => js(`(() => {
+    if (window.__pixStageScrollWatch) return true;
+    const watch = { count: 0, lastAt: null };
+    document.addEventListener("scroll", (event) => {
+      const target = event.target;
+      const stage = document.querySelector(".reader-stage");
+      if (target instanceof Node && stage && stage.contains(target)) {
+        watch.count += 1;
+        watch.lastAt = Date.now();
+      }
+    }, true);
+    window.__pixStageScrollWatch = watch;
+    return true;
+  })()`);
+
+  /** 阅读区滚动读数：scrollTop + 累计事件计数 + 最近事件时刻（epoch ms；未发生为 null）。 */
+  const stageScrollWatchProbe = () => js(`(() => {
+    const watch = window.__pixStageScrollWatch || { count: null, lastAt: null };
+    const el = document.querySelector(${JSON.stringify(SEL.pdfScroll)});
+    return { scrollTop: el ? el.scrollTop : null, count: watch.count, lastAt: watch.lastAt };
+  })()`);
+
+  /**
+   * 有界滚动静默等待（修复轮.5）：连续 quietMs 无新增阅读区滚动事件才返回 ok:true；
+   * 到 timeoutMs 仍有新增 ⇒ ok:false —— 调用方按「前置失败」判红（不得静默降级为通过）。
+   */
+  const waitStageScrollQuiet = async (quietMs = 400, timeoutMs = 6000) => {
+    await installStageScrollWatch();
+    const startedAt = Date.now();
+    const deadline = startedAt + timeoutMs;
+    let seen = (await stageScrollWatchProbe()).count;
+    const from = seen;
+    let lastChangeAt = startedAt;
+    for (;;) {
+      await sleep(60);
+      const probe = await stageScrollWatchProbe();
+      const now = Date.now();
+      if (probe.count !== seen) {
+        seen = probe.count;
+        lastChangeAt = now;
+      }
+      if (now - lastChangeAt >= quietMs) {
+        return { ok: true, quietMs, timeoutMs, waitedMs: now - startedAt, absorbed: seen - from, lastAt: probe.lastAt };
+      }
+      if (now >= deadline) {
+        return { ok: false, quietMs, timeoutMs, waitedMs: now - startedAt, absorbed: seen - from, lastAt: probe.lastAt };
+      }
+    }
+  };
+
+  /** 在 document.body 上派发 Escape：不经过输入框 ⇒ 元素级监听不执行，用作阅读区既有语义的对照控制。 */
+  const pressBodyEsc = () => js(`(() => {
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return true;
+  })()`);
+
+  /** 窄栏几何：一次 js 读完 .layout-left / 每行动作区（M4 判定表的全部判据）。 */
+  const narrowProbe = () => js(`(() => {
+    const left = document.querySelector(${JSON.stringify(SEL.layoutLeft)});
+    const fontNode = document.querySelector(${JSON.stringify(SEL.noteText)});
+    const fontSize = fontNode ? parseFloat(getComputedStyle(fontNode).fontSize) : null;
+    const box = (el) => {
+      const b = el.getBoundingClientRect();
+      return { left: b.left, right: b.right, y: b.top, w: b.width, h: b.height };
+    };
+    const rows = Array.from(document.querySelectorAll(${JSON.stringify(SEL.noteRow)})).map((row) => {
+      const actions = row.querySelector(${JSON.stringify(SEL.noteActions)});
+      const body = row.querySelector(".note-body");
+      const copy = row.querySelector(".note-copy");
+      const wrap = row.querySelector(".note-ask-wrap");
+      return {
+        scrollOverflow: actions ? actions.scrollWidth - actions.clientWidth : null,
+        actions: actions ? box(actions) : null,
+        body: body ? box(body) : null,
+        copy: copy ? box(copy) : null,
+        askWrap: wrap ? box(wrap) : null,
+        dom: {
+          copyFirst: !!(actions && copy && actions.firstElementChild === copy),
+          askAfterCopy: !!(actions && copy && wrap && (copy.compareDocumentPosition(wrap) & 4) === 4),
+          actionsLast: !!(body && actions && body.lastElementChild === actions),
+        },
+      };
+    });
+    return {
+      leftWidth: left ? Math.round(left.getBoundingClientRect().width) : null,
+      leftRight: left ? left.getBoundingClientRect().right : null,
+      threshold: { node: ${JSON.stringify(SEL.noteText)}, fontSize, T: fontSize == null ? null : 1.5 * Math.max(fontSize * 1.5) },
+      rows,
+    };
+  })()`);
 
   // 三段逐字样例（设计档 §4.1）：断言直接引用这些字面量，不由产品函数生成
   const COPY_SAMPLE_1 =
@@ -5268,8 +5555,15 @@ async function runReaderStateScenarios(win, log) {
     sortInDom: await has(SEL.sortBtn),
   };
   await excerptFirstSpan();
+  // N73-2b：反馈态在入库引发的同文本 selectionchange 之后保持可见（不重置 mode / 不清 feedback / 不重算几何 / 不重开计时器）；
+  // 本条随后追加逐字反馈断言（A1–A3，需求档 N73-2 的【离屏·追加】原字面）。
+  const feedbackStart60 = Date.now();
+  const feedback60a = await waitFeedbackOk(1500);
+  const feedbackWaitMs60 = Date.now() - feedbackStart60;
+  await sleep(400); // 拦 ~1 ms 闪现造成的假绿
+  const feedback60b = await quickAskStateProbe();
   const excerpted60 = await searchProbe();
-  record("notes-search", { phase: "delete-all-then-excerpt", steps: [d1_60, d2_60, d3_60], empty: empty60, excerpted: excerpted60 }, [
+  record("notes-search", { phase: "delete-all-then-excerpt", steps: [d1_60, d2_60, d3_60], empty: empty60, excerpted: excerpted60, excerptFeedback: { waitMs: feedbackWaitMs60, first: feedback60a, after400ms: feedback60b } }, [
     ...(d1_60.countText === "命中 0 条 / 共 3 条" ? [] : [`第 1 步计数异常：${d1_60.countText}`]),
     ...(d2_60.countText === "命中 0 条 / 共 2 条" ? [] : [`第 2 步计数异常：${d2_60.countText}`]),
     ...(d3_60.countText === "命中 0 条 / 共 1 条" ? [] : [`第 3 步计数异常：${d3_60.countText}`]),
@@ -5280,6 +5574,12 @@ async function runReaderStateScenarios(win, log) {
     ...(excerpted60.rows === 0 ? [] : [`摘录后应 0 命中：${excerpted60.rows}`]),
     ...(excerpted60.countText === "命中 0 条 / 共 1 条" ? [] : [`摘录后计数异常：${excerpted60.countText}`]),
     ...(excerpted60.emptyText === "没有匹配「消融」的笔记" ? [] : [`摘录后空态文案异常：${excerpted60.emptyText}`]),
+    // A1–A3（N73-2b）：反馈态必须在入库引发的同文本 selectionchange 之后保持可见
+    ...(String(feedback60a.feedbackClass).includes("is-ok") && feedback60a.display !== null && feedback60a.display !== "none"
+      ? [] : [`摘录后浮层未停在反馈态：${JSON.stringify(feedback60a)}`]),
+    ...(feedback60a.feedbackText === "已摘录 · 第 1 页" ? [] : [`摘录反馈文本异常：${JSON.stringify(feedback60a)}`]),
+    ...(String(feedback60b.feedbackClass).includes("is-ok") && feedback60b.feedbackText === "已摘录 · 第 1 页"
+      ? [] : [`摘录反馈未保持（+400 ms 复采）：${JSON.stringify(feedback60b)}`]),
   ]);
   await setSearch("");
   await restoreStandardSeed();
@@ -5837,6 +6137,594 @@ async function runReaderStateScenarios(win, log) {
     ...(geo65 && geo65.actionsOverflow <= 1 ? [] : ["动作区不得换行/溢出"]),
     ...(geo65 && geo65.lastChild === "note-actions" ? [] : [".note-actions 应仍是 .note-body 最后一个子节点"]),
   ]);
+
+  // ===========================================================================
+  // R11 收口（N73-1 / N73-2 / N74）：新增场景一律追加在末尾，每个场景自带复位，
+  // 不引用其它场景的局部变量；既有场景 / label / 截图名零改动。
+  // ===========================================================================
+
+  // --- r11-1 / r11-2：笔记搜索框内的 Esc 不得越界（组 r11-esc-scope）-----------
+  log("r11-1 笔记搜索框内的 Esc 不关闭 PDF 搜索面板");
+  await enterNotesProbe();
+  const hashR11 = notesHash();
+  await js(`(() => {
+    const btn = document.querySelector(${JSON.stringify(SEL.pdfSearchBtn)});
+    if (!btn) throw new Error("pdf search button not found");
+    btn.click();
+    return true;
+  })()`);
+  await waitFor("PDF 搜索面板", `document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)})`);
+  await setSearch("Table");
+  const probeR11a = await searchProbe();
+  await pressSearchEsc();
+  const probeR11b = await searchProbe();
+  const panelInDomR11 = await has(SEL.pdfSearchPanel);
+  await capturePage(win, "r11-1-esc-pdf-search-panel.png");
+  record(
+    "r11-esc-scope",
+    { phase: "pdf-search-open", before: probeR11a, after: probeR11b, panelInDom: panelInDomR11, hashSame: notesHash() === hashR11 },
+    [
+      ...(probeR11a.focused === true ? [] : [`Esc 前输入框应获焦（空断言防护）：${JSON.stringify(probeR11a)}`]),
+      ...(panelInDomR11 === true ? [] : ["笔记搜索框内的 Esc 不得关闭 PDF 搜索面板"]),
+      ...(probeR11b.value === "" ? [] : [`Esc 后查询应为空：${probeR11b.value}`]),
+      ...(probeR11b.focused === false ? [] : ["Esc 后输入框应失焦"]),
+      ...(probeR11b.rows === 4 ? [] : [`Esc 后行数应为 4：${probeR11b.rows}`]),
+      ...(probeR11b.countText === "共 4 条" ? [] : [`Esc 后计数异常：${probeR11b.countText}`]),
+      ...(notesHash() === hashR11 ? [] : ["Esc 不得改写 notes.json"]),
+    ],
+  );
+
+  log("r11-1 对照：body 上的 Esc 仍关闭 PDF 搜索面板");
+  await pressBodyEsc();
+  await waitFor("PDF 搜索面板关闭", `!document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)})`);
+  const panelGoneR11 = await has(SEL.pdfSearchPanel);
+  record("r11-esc-scope", { phase: "pdf-search-close-control", panelInDom: panelGoneR11 }, [
+    ...(panelGoneR11 === false ? [] : ["body 上的 Esc 应关闭 PDF 搜索面板（阅读区既有语义不得改坏）"]),
+  ]);
+
+  log("r11-2 笔记搜索框内的 Esc 不退出框选模式");
+  await enterNotesProbe();
+  const hashR11b = notesHash();
+  const layerPreR11b = await has(SEL.captureLayer);
+  if (!layerPreR11b) {
+    await js(`(() => {
+      const btn = document.querySelector(${JSON.stringify(SEL.captureFabBtn)});
+      if (!btn) throw new Error("capture fab button not found");
+      btn.click();
+      return true;
+    })()`);
+  }
+  await waitFor("框选层", `document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  const captureState = () => js(`(() => {
+    const viewer = document.querySelector(${JSON.stringify(SEL.pdfViewer)});
+    return {
+      layerInDom: !!document.querySelector(${JSON.stringify(SEL.captureLayer)}),
+      viewerCapture: !!viewer && viewer.classList.contains("capture-mode"),
+    };
+  })()`);
+  const entryR11b = await captureState();
+  await setSearch("Table");
+  const probeR11c = await searchProbe();
+  await pressSearchEsc();
+  const probeR11d = await searchProbe();
+  const afterR11b = await captureState();
+  await capturePage(win, "r11-2-esc-capture-mode.png");
+  record(
+    "r11-esc-scope",
+    {
+      phase: "capture-mode",
+      entry: entryR11b,
+      before: probeR11c,
+      after: probeR11d,
+      layerInDom: afterR11b.layerInDom,
+      viewerCapture: afterR11b.viewerCapture,
+      hashSame: notesHash() === hashR11b,
+    },
+    [
+      ...(entryR11b.layerInDom === true && entryR11b.viewerCapture === true ? [] : [`进入框选模式失败（空断言防护）：${JSON.stringify(entryR11b)}`]),
+      ...(probeR11c.focused === true ? [] : [`Esc 前输入框应获焦（空断言防护）：${JSON.stringify(probeR11c)}`]),
+      ...(afterR11b.layerInDom === true ? [] : ["笔记搜索框内的 Esc 不得退出框选模式（.capture-layer 应仍在 DOM）"]),
+      ...(afterR11b.viewerCapture === true ? [] : ["笔记搜索框内的 Esc 不得移除 .pdf-viewer 的 capture-mode 类"]),
+      ...(probeR11d.value === "" ? [] : [`Esc 后查询应为空：${probeR11d.value}`]),
+      ...(probeR11d.focused === false ? [] : ["Esc 后输入框应失焦"]),
+      ...(probeR11d.rows === 4 ? [] : [`Esc 后行数应为 4：${probeR11d.rows}`]),
+      ...(notesHash() === hashR11b ? [] : ["Esc 不得改写 notes.json"]),
+    ],
+  );
+
+  log("r11-2 对照：body 上的 Esc 仍退出框选模式");
+  await setSearch("");
+  await pressBodyEsc();
+  await waitFor("退出框选模式", `!document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  const exitR11b = await captureState();
+  record("r11-esc-scope", { phase: "capture-mode-exit-control", layerInDom: exitR11b.layerInDom, viewerCapture: exitR11b.viewerCapture, hashSame: notesHash() === hashR11b }, [
+    ...(exitR11b.layerInDom === false ? [] : ["body 上的 Esc 应退出框选模式（阅读区既有语义不得改坏）"]),
+    ...(exitR11b.viewerCapture === false ? [] : [".pdf-viewer 不应再含 capture-mode"]),
+    ...(notesHash() === hashR11b ? [] : ["Esc 不得改写 notes.json"]),
+  ]);
+
+  // --- r11-3：面板滚动不再吞掉摘录反馈（组 r11-quick-ask-scroll-scope）----------
+  log("r11-3 摘录反馈不被面板滚动吞掉 + 阅读区滚动仍隐藏");
+  await enterNotesProbe([], 0);
+  // F2：0 条时 openNotesPanel(0) 的等待式恒真 ⇒ 必须显式有界等待空态就绪，再核对空断言防护
+  await waitFor(
+    "笔记空态就绪（.notes-empty 在 DOM、无搜索行、0 行）",
+    `document.querySelector(${JSON.stringify(SEL.notesEmpty)}) && !document.querySelector(${JSON.stringify(SEL.searchInput)}) && document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 0`,
+  );
+  await selectPageSpan(1);
+  const beforeExcerpt11c = readNotes().length;
+  await js(`(() => {
+    const buttons = Array.from(document.querySelectorAll(".quick-ask-btn"));
+    const target = buttons.find((el) => (el.textContent || "").includes("摘录"));
+    if (!target) throw new Error("excerpt button not found");
+    target.click();
+    return true;
+  })()`);
+  const deadline11c = Date.now() + 20000;
+  for (;;) {
+    if (readNotes().length === beforeExcerpt11c + 1) break;
+    if (Date.now() > deadline11c) throw new Error(`等待超时：摘录入库（notes.json 条数未从 ${beforeExcerpt11c} 增加）`);
+    await sleep(120);
+  }
+  const hashAfterExcerpt11c = notesHash();
+  await waitFor("摘录后面板回位", `document.querySelector(${JSON.stringify(SEL.searchInput)})`);
+  // 相位 1 → 相位 2 之间不得插入 sleep、不得重拍截图（2500 ms 反馈窗口）
+  const feedbackStart11c = Date.now();
+  const feedback11c = await waitFeedbackOk(1500);
+  const rows11c = await readRowsAndCount();
+  const searchInDom11c = await has(SEL.searchInput);
+  await capturePage(win, "r11-3-excerpt-feedback-visible.png");
+  record(
+    "r11-quick-ask-scroll-scope",
+    { phase: "excerpt-into-empty-panel", rows: rows11c.rows, searchInDom: searchInDom11c, quickAsk: feedback11c, waitMs: Date.now() - feedbackStart11c },
+    [
+      ...(searchInDom11c === true && rows11c.rows === 1 ? [] : [`面板应从空态切到列表：${JSON.stringify(rows11c)}`]),
+      ...(feedback11c.display !== null && feedback11c.display !== "none" ? [] : [`浮层应可见：${JSON.stringify(feedback11c)}`]),
+      ...(feedback11c.feedbackText === "已摘录 · 第 1 页" && String(feedback11c.feedbackClass).includes("is-ok")
+        ? []
+        : [`反馈态异常：${JSON.stringify(feedback11c)}`]),
+    ],
+  );
+
+  log("r11-3 面板滚动不隐藏浮层");
+  await js(`(() => {
+    const panel = document.querySelector(${JSON.stringify(SEL.notesPanel)});
+    if (!panel) throw new Error("notes panel not found");
+    panel.dispatchEvent(new Event("scroll"));
+    return true;
+  })()`);
+  const afterPanelScroll11c = await quickAskProbe();
+  const elapsedSinceFeedback11c = Date.now() - feedbackStart11c;
+  const fileCount11c = readNotes().length;
+  record(
+    "r11-quick-ask-scroll-scope",
+    { phase: "notes-panel-scroll", quickAsk: afterPanelScroll11c, fileCount: fileCount11c, hashSame: notesHash() === hashAfterExcerpt11c, elapsedSinceFeedbackMs: elapsedSinceFeedback11c },
+    [
+      ...(afterPanelScroll11c.display !== null && afterPanelScroll11c.display !== "none" ? [] : [`面板滚动不得隐藏浮层：${JSON.stringify(afterPanelScroll11c)}`]),
+      ...(afterPanelScroll11c.feedbackText === "已摘录 · 第 1 页" ? [] : [`反馈文本异常：${JSON.stringify(afterPanelScroll11c)}`]),
+      ...(fileCount11c === 1 && notesHash() === hashAfterExcerpt11c ? [] : [`滚动不得改数据：${fileCount11c}`]),
+    ],
+  );
+
+  log("r11-3 阅读区滚动仍隐藏浮层（对照）");
+  let scroll11c = await stageScrollProbe();
+  let zoomClicks11c = 0;
+  while (scroll11c.scrollHeight <= scroll11c.clientHeight + 40 && zoomClicks11c < 40) {
+    const percent = Number(String(scroll11c.scaleText || "").replace("%", ""));
+    if (Number.isFinite(percent) && percent >= 300) break; // MAX_SCALE = 3
+    await js(`(() => {
+      const btn = document.querySelector(${JSON.stringify(SEL.zoomInBtn)});
+      if (!btn) throw new Error("zoom-in button not found");
+      btn.click();
+      return true;
+    })()`);
+    zoomClicks11c += 1;
+    await repaint(win);
+    scroll11c = await stageScrollProbe();
+  }
+  const beforeScrollQuickAsk11c = await quickAskProbe();
+  const scrollTopBefore11c = scroll11c.scrollTop;
+  await js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.pdfScroll)});
+    if (!el) throw new Error("pdf scroll container not found");
+    el.scrollTop = 200;
+    return true;
+  })()`);
+  await waitFor(
+    "阅读区滚动后浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !el || getComputedStyle(el).display === "none"; })()`,
+  );
+  const scrollAfter11c = await stageScrollProbe();
+  const afterReaderScroll11c = await quickAskProbe();
+  record(
+    "r11-quick-ask-scroll-scope",
+    {
+      phase: "reader-scroll-control",
+      scroll: { before: scrollTopBefore11c, after: scrollAfter11c.scrollTop, scrollHeight: scroll11c.scrollHeight, clientHeight: scroll11c.clientHeight, scrollHeightAfterZoom: scrollAfter11c.scrollHeight },
+      zoom: { text: scroll11c.scaleText, clicks: zoomClicks11c },
+      quickAskBeforeScroll: beforeScrollQuickAsk11c,
+      quickAskAfterScroll: afterReaderScroll11c,
+      fileCount: fileCount11c,
+      hashSame: notesHash() === hashAfterExcerpt11c,
+    },
+    [
+      ...(scroll11c.scrollHeight > scroll11c.clientHeight + 40 ? [] : [`阅读区放大到上限仍不可滚动（不得降级为跳过）：${JSON.stringify(scroll11c)}`]),
+      ...(beforeScrollQuickAsk11c.display !== null && beforeScrollQuickAsk11c.display !== "none"
+        ? []
+        : [`放大不得使反馈消失（否则下文是假绿）：${JSON.stringify(beforeScrollQuickAsk11c)}`]),
+      ...(scrollAfter11c.scrollTop > 0 && scrollAfter11c.scrollTop !== scrollTopBefore11c
+        ? []
+        : [`阅读区未真实滚动（空断言防护）：before=${scrollTopBefore11c} after=${scrollAfter11c.scrollTop}`]),
+      ...(afterReaderScroll11c.display === "none" ? [] : [`阅读区滚动应隐藏浮层（既有语义不得放松）：${JSON.stringify(afterReaderScroll11c)}`]),
+      ...(fileCount11c === 1 && notesHash() === hashAfterExcerpt11c ? [] : ["滚动不得改数据"]),
+    ],
+  );
+
+  // --- r11-3 相位 4（N73-2b）：同一文本的 selectionchange 不得重置摘录反馈 ---------
+  log("r11-3 相位 4：同文本 selectionchange 后反馈保持（N73-2b）");
+  await focusPage(2); // 该滚动会隐藏浮层 —— 既有语义，故必须在选区之前
+  await selectPageSpan(2);
+  // 修复轮.5 入口前置：前序相位（reader-scroll-control 的放大与 scrollTop 赋值）留下的迟到
+  // scroll 必须先静默再开始观测窗，否则它会在窗口内按既有语义隐藏浮层（把环境噪声记成产品行为）。
+  const preQuietP4 = await ensureQuickAskExcerptReady(2);
+  log(`r11-3 相位 4 入口前置：ok=${preQuietP4.ok} attempts=${preQuietP4.attempts} quiet=${JSON.stringify(preQuietP4.quiet)}${preQuietP4.ok ? "" : ` trail=${JSON.stringify(preQuietP4.trail)}`}`);
+  await excerptViaQuickAsk();
+  const hashAfterExcerpt11c4 = notesHash();
+  const t0P4 = Date.now();
+  const watchT0P4 = await stageScrollWatchProbe();
+  const feedbackP4 = await waitFeedbackOk(1500);
+  const waitMsP4 = Date.now() - t0P4;
+  while (Date.now() - t0P4 < 900) await sleep(60); // 可判别性下限：派发必须落在反馈窗口的靠后位置
+  const dispatchAtMsP4 = Date.now() - t0P4;
+  const beforeDispatchP4 = await quickAskStateProbe();
+  const watchDispatchP4 = await stageScrollWatchProbe();
+  const selectionBeforeP4 = await selectionProbe();
+  const spanText2P4 = await pageSpanText(2);
+  await js(`document.dispatchEvent(new Event("selectionchange")), true`); // 不改选区：同文本的冗余事件
+  await repaint(win);
+  const afterDispatchP4 = await quickAskStateProbe();
+  await capturePage(win, "r11-3b-feedback-after-spurious-selectionchange.png");
+  await sleep(600); // < FEEDBACK_MS = 2500
+  const after600P4 = await quickAskStateProbe();
+  const watchAfter600P4 = await stageScrollWatchProbe();
+  const goneP4 = await waitFeedbackCleared(t0P4 + 2500 + 700 - Date.now());
+  const feedbackGoneAtMsP4 = goneP4.at - t0P4;
+  const watchResampleP4 = await stageScrollWatchProbe();
+  // 修复轮.5：观测窗 [t0, 复采] 的阅读区滚动读数（窗口内计数增加 ⇒ 环境噪声，独立判红）
+  const stageScrollP4 = {
+    t0: watchT0P4,
+    dispatch: watchDispatchP4,
+    after600ms: watchAfter600P4,
+    resample: watchResampleP4,
+    windowCount: watchResampleP4.count - watchT0P4.count,
+    windowLastEventMs: watchResampleP4.lastAt === null ? null : watchResampleP4.lastAt - t0P4,
+    sinceLastEventAtT0Ms: watchT0P4.lastAt === null ? null : t0P4 - watchT0P4.lastAt,
+  };
+  const fileCountP4 = readNotes().length;
+  const selectionAfterP4 = await selectionProbe();
+  record(
+    "r11-quick-ask-scroll-scope",
+    {
+      phase: "spurious-selectionchange",
+      waitMs: waitMsP4,
+      dispatchAtMs: dispatchAtMsP4,
+      feedbackGoneAtMs: feedbackGoneAtMsP4,
+      feedbackAfterExcerpt: feedbackP4,
+      before: beforeDispatchP4,
+      afterDispatch: afterDispatchP4,
+      after600ms: after600P4,
+      atExpiry: goneP4.probe,
+      selectionBefore: selectionBeforeP4,
+      selectionAfter: selectionAfterP4,
+      spanText2: spanText2P4,
+      fileCount: fileCountP4,
+      hashSame: notesHash() === hashAfterExcerpt11c4,
+      stageScroll: stageScrollP4,
+      preQuiet: preQuietP4,
+    },
+    [
+      // 修复轮.5 前置（独立文案，不混入 B/C 判据）：观测窗入口必须先静默（超时 = 前置失败），
+      // 且 t0 前 quietMs 内不得再有阅读区滚动（否则窗口起点已不可判）。
+      ...(preQuietP4.ok ? [] : [`环境噪声：观测窗入口前置不成立（${preQuietP4.attempts} 次静默 + 可摘录态复核均未通过，末次静默=${JSON.stringify(preQuietP4.quiet)}）`]),
+      ...(preQuietP4.ok && (stageScrollP4.sinceLastEventAtT0Ms === null || stageScrollP4.sinceLastEventAtT0Ms >= preQuietP4.quiet.quietMs)
+        ? [] : [`环境噪声：观测窗开始前 ${preQuietP4.quiet.quietMs} ms 内有阅读区滚动（距上次 = ${stageScrollP4.sinceLastEventAtT0Ms} ms）`]),
+      // 修复轮.5 窗口判据（独立文案）：窗口内计数增加 ⇒ 环境噪声（不放松 B1/B2/B3 的语义判据）
+      ...(stageScrollP4.windowCount === 0
+        ? [] : [`环境噪声：窗口内发生阅读区滚动（${stageScrollP4.windowCount} 次，最近一次 = t0${stageScrollP4.windowLastEventMs >= 0 ? "+" : ""}${stageScrollP4.windowLastEventMs} ms，scrollTop t0=${watchT0P4.scrollTop} 复采=${watchResampleP4.scrollTop}）`]),
+      // B1 前置 / 防空：反馈态可见 + 「同文本」现场成立 + 派发时刻可判别
+      ...(String(beforeDispatchP4.feedbackClass).includes("is-ok") && beforeDispatchP4.feedbackText === "已摘录 · 第 2 页" && beforeDispatchP4.display !== "none"
+        ? [] : [`派发前应为反馈态：${JSON.stringify(beforeDispatchP4)}`]),
+      ...(selectionBeforeP4.collapsed === false && selectionBeforeP4.anchorInStage === true && selectionBeforeP4.text === spanText2P4
+        ? [] : [`「同文本」现场不成立：${JSON.stringify(selectionBeforeP4)} spanText2=${spanText2P4}`]),
+      ...(dispatchAtMsP4 >= 900 && dispatchAtMsP4 < 2100 ? [] : [`派发时刻越界（可判别性下限 / 反馈窗口）：${dispatchAtMsP4}`]),
+      // B2 派发后立即：仍为反馈态且动作行未渲染
+      ...(String(afterDispatchP4.feedbackClass).includes("is-ok") && afterDispatchP4.feedbackText === "已摘录 · 第 2 页" && afterDispatchP4.display !== "none" && afterDispatchP4.btnCount === 0
+        ? [] : [`同文本 selectionchange 不得重置反馈：${JSON.stringify(afterDispatchP4)}`]),
+      // B3 再等 600 ms（< FEEDBACK_MS）后仍为反馈态
+      ...(String(after600P4.feedbackClass).includes("is-ok") && after600P4.feedbackText === "已摘录 · 第 2 页" && after600P4.display !== "none" && after600P4.btnCount === 0
+        ? [] : [`反馈未保持（+600 ms 复采）：${JSON.stringify(after600P4)}`]),
+      // B4 独立前置（修复轮.5）：派发前与 +600 ms 复采时刻都必须处于反馈态，否则该条为空断言
+      ...(String(beforeDispatchP4.feedbackClass).includes("is-ok") && String(after600P4.feedbackClass).includes("is-ok")
+        ? [] : [`B4 前置不成立（派发前与复采时刻均须为反馈态）：before=${JSON.stringify(beforeDispatchP4)} after600ms=${JSON.stringify(after600P4)}`]),
+      // B4 计时未被重置：下界 = 未被提前清掉；上界 = 早于被重置后的到期时刻
+      ...(goneP4.probe.feedbackClass === null && feedbackGoneAtMsP4 >= 2500 - 600 && feedbackGoneAtMsP4 <= dispatchAtMsP4 + 2500 - 300
+        ? [] : [`反馈计时被重置或提前清除：goneAt=${feedbackGoneAtMsP4} dispatchAt=${dispatchAtMsP4} probe=${JSON.stringify(goneP4.probe)}`]),
+      // B5 到期后回落 actions 态且浮层仍在；数据不变
+      ...(goneP4.probe.feedbackClass === null && goneP4.probe.btnCount === 2 && goneP4.probe.display !== "none" && fileCountP4 === 2 && notesHash() === hashAfterExcerpt11c4
+        ? [] : [`到期后应回落 actions 态：${JSON.stringify(goneP4.probe)} fileCount=${fileCountP4}`]),
+    ],
+  );
+
+  // --- r11-3 相位 5（N73-2b 对照组）：不同文本的 selectionchange 重置为 actions ----
+  log("r11-3 相位 5：不同文本 selectionchange 重置为 actions（对照）");
+  await focusPage(2); // 先读第 2 页现场（「不同文本」对照的前提）
+  const spanText2P5 = await pageSpanText(2);
+  await focusPage(3);
+  await selectPageSpan(3);
+  const spanText3P5 = await pageSpanText(3);
+  // 修复轮.5 入口前置：同相位 4 —— focusPage / 选区引起的滚动先静默，再开始观测窗
+  const preQuietP5 = await ensureQuickAskExcerptReady(3);
+  log(`r11-3 相位 5 入口前置：ok=${preQuietP5.ok} attempts=${preQuietP5.attempts} quiet=${JSON.stringify(preQuietP5.quiet)}${preQuietP5.ok ? "" : ` trail=${JSON.stringify(preQuietP5.trail)}`}`);
+  await excerptViaQuickAsk();
+  const hashAfterExcerpt11c5 = notesHash();
+  const t0P5 = Date.now();
+  const watchT0P5 = await stageScrollWatchProbe();
+  const feedbackP5 = await waitFeedbackOk(1500);
+  const fileCountBeforeP5 = readNotes().length;
+  await selectPageSpan(2); // 真实 DOM 选区变更（不同文本）+ 合成 selectionchange
+  const watchDispatchP5 = await stageScrollWatchProbe();
+  await repaint(win);
+  const afterDifferentTextP5 = await quickAskStateProbe();
+  const afterDifferentTextP5b = await quickAskStateProbe();
+  const watchResampleP5 = await stageScrollWatchProbe();
+  // 修复轮.5：观测窗 [t0, 复采] 的阅读区滚动读数（窗口内计数增加 ⇒ 环境噪声，独立判红）
+  const stageScrollP5 = {
+    t0: watchT0P5,
+    dispatch: watchDispatchP5,
+    resample: watchResampleP5,
+    windowCount: watchResampleP5.count - watchT0P5.count,
+    windowLastEventMs: watchResampleP5.lastAt === null ? null : watchResampleP5.lastAt - t0P5,
+    sinceLastEventAtT0Ms: watchT0P5.lastAt === null ? null : t0P5 - watchT0P5.lastAt,
+  };
+  const selectionAfterP5 = await selectionProbe();
+  const fileCountAfterP5 = readNotes().length;
+  record(
+    "r11-quick-ask-scroll-scope",
+    {
+      phase: "different-text-reset",
+      feedbackBefore: feedbackP5,
+      spanText2: spanText2P5,
+      spanText3: spanText3P5,
+      afterDifferentText: afterDifferentTextP5,
+      afterDifferentTextRecheck: afterDifferentTextP5b,
+      selectionAfter: selectionAfterP5,
+      fileCount: fileCountAfterP5,
+      hashSame: notesHash() === hashAfterExcerpt11c5,
+      stageScroll: stageScrollP5,
+      preQuiet: preQuietP5,
+    },
+    [
+      // 修复轮.5 前置（独立文案，不混入 C 判据）：观测窗入口必须先静默（超时 = 前置失败），
+      // 且 t0 前 quietMs 内不得再有阅读区滚动（否则窗口起点已不可判）。
+      ...(preQuietP5.ok ? [] : [`环境噪声：观测窗入口前置不成立（${preQuietP5.attempts} 次静默 + 可摘录态复核均未通过，末次静默=${JSON.stringify(preQuietP5.quiet)}）`]),
+      ...(preQuietP5.ok && (stageScrollP5.sinceLastEventAtT0Ms === null || stageScrollP5.sinceLastEventAtT0Ms >= preQuietP5.quiet.quietMs)
+        ? [] : [`环境噪声：观测窗开始前 ${preQuietP5.quiet.quietMs} ms 内有阅读区滚动（距上次 = ${stageScrollP5.sinceLastEventAtT0Ms} ms）`]),
+      // 修复轮.5 窗口判据（独立文案）：窗口内计数增加 ⇒ 环境噪声（不放松 C1–C4 的语义判据）
+      ...(stageScrollP5.windowCount === 0
+        ? [] : [`环境噪声：窗口内发生阅读区滚动（${stageScrollP5.windowCount} 次，最近一次 = t0${stageScrollP5.windowLastEventMs >= 0 ? "+" : ""}${stageScrollP5.windowLastEventMs} ms，scrollTop t0=${watchT0P5.scrollTop} 复采=${watchResampleP5.scrollTop}）`]),
+      // C1 前置 / 防空：反馈态可见 + 文件 3 条 + 「不同文本」前提
+      ...(String(feedbackP5.feedbackClass).includes("is-ok") && feedbackP5.feedbackText === "已摘录 · 第 3 页"
+        ? [] : [`第 3 页摘录反馈异常：${JSON.stringify(feedbackP5)}`]),
+      ...(fileCountBeforeP5 === 3 ? [] : [`前置文件应为 3 条：${fileCountBeforeP5}`]),
+      ...(spanText2P5 !== null && spanText3P5 !== null && spanText3P5 !== spanText2P5
+        ? [] : [`「不同文本」前提不成立：spanText2=${spanText2P5} spanText3=${spanText3P5}`]),
+      // C2 派发后立即：反馈被重置（不同文本不得命中保态分支）
+      ...(afterDifferentTextP5.feedbackClass === null && afterDifferentTextP5.feedbackText === null
+        ? [] : [`不同文本应重置反馈：${JSON.stringify(afterDifferentTextP5)}`]),
+      // C3 复采：浮层仍可见且回到 actions 态
+      ...(afterDifferentTextP5b.display !== "none" && afterDifferentTextP5b.btnCount === 2
+        ? [] : [`不同文本后应回到 actions 态：${JSON.stringify(afterDifferentTextP5b)}`]),
+      // C4 选区与数据现场
+      ...(selectionAfterP5.text === spanText2P5 && selectionAfterP5.collapsed === false && selectionAfterP5.anchorInStage === true
+        ? [] : [`选区现场异常：${JSON.stringify(selectionAfterP5)} spanText2=${spanText2P5}`]),
+      ...(fileCountAfterP5 === 3 && notesHash() === hashAfterExcerpt11c5 ? [] : [`派发不得改数据：${fileCountAfterP5}`]),
+    ],
+  );
+
+  // --- r11-4：删空最后一条后撤销行仍在且撤销成功（组 r11-undo-after-empty）-------
+  log("r11-4 删空最后一条后撤销行仍在且撤销成功");
+  await enterNotesProbe(seedNotes().slice(0, 1), 1);
+  const hashBefore11d = notesHash();
+  const before11d = await readRowsAndCount();
+  const emptyBefore11d = await has(SEL.notesEmpty);
+  record("r11-undo-after-empty", { phase: "before-delete", rows: before11d.rows, countText: before11d.countText, emptyInDom: emptyBefore11d }, [
+    ...(before11d.rows === 1 ? [] : [`前置应为 1 行：${before11d.rows}`]),
+    ...(before11d.countText === "共 1 条" ? [] : [`前置计数异常：${before11d.countText}`]),
+    ...(emptyBefore11d === false ? [] : ["1 行时 .notes-empty 不得在 DOM（空断言防护）"]),
+  ]);
+
+  await deleteRowByText("We study retrieval");
+  const after11d = await readRowsAndCount();
+  const emptyAfter11d = await notesEmptyProbe();
+  const undoAfter11d = await undoSnapshot();
+  await capturePage(win, "r11-4-undo-row-after-empty.png");
+  record(
+    "r11-undo-after-empty",
+    { phase: "after-delete-empty", rows: after11d.rows, countText: after11d.countText, empty: emptyAfter11d, undo: undoAfter11d, hashChanged: notesHash() !== hashBefore11d },
+    [
+      ...(after11d.rows === 0 ? [] : [`删空后应 0 行：${after11d.rows}`]),
+      ...(emptyAfter11d.inDom === true ? [] : [".notes-empty 应在 DOM"]),
+      ...(emptyAfter11d.title === "还没有摘录" ? [] : [`.notes-empty .empty-title 文案异常：${emptyAfter11d.title}`]),
+      ...(emptyAfter11d.subtitle === "在 PDF 中选中文字，点「摘录」保存到这里" ? [] : [`.notes-empty .empty-subtitle 文案异常：${emptyAfter11d.subtitle}`]),
+      ...(after11d.countText === "共 0 条" ? [] : [`删空后计数异常：${after11d.countText}`]),
+      ...(undoAfter11d.rowCount === 1 ? [] : [`.notes-undo 应仍在 DOM：${JSON.stringify(undoAfter11d)}`]),
+      ...(undoAfter11d.text === "已删除「We study ret…」· 第 1 页" ? [] : [`撤销行文案异常：${undoAfter11d.text}`]),
+      ...(undoAfter11d.btnText === "撤销" && undoAfter11d.btnTitle === "还原这条笔记" ? [] : [`撤销按钮异常：${JSON.stringify(undoAfter11d)}`]),
+      ...(notesHash() !== hashBefore11d ? [] : ["删除应真实落盘"]),
+    ],
+  );
+
+  await clickUndo();
+  await waitFor("还原后行数回到 1", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 1`);
+  // ⑭ 必须紧随 waitFor（撤销通知 4 s、撤销行 8 s）：中间不得插入 sleep
+  const restored11d = {
+    rows: await countOf(SEL.noteRow),
+    emptyInDom: await has(SEL.notesEmpty),
+    undoRowInDom: await has(SEL.undoRow),
+    notice: await notesNotice(),
+    searchInDom: await has(SEL.searchInput),
+    hashSame: notesHash() === hashBefore11d,
+  };
+  record("r11-undo-after-empty", { phase: "restored", ...restored11d }, [
+    ...(restored11d.rows === 1 ? [] : [`还原后应 1 行：${restored11d.rows}`]),
+    ...(restored11d.emptyInDom === false ? [] : ["还原后 .notes-empty 应退出 DOM"]),
+    ...(restored11d.undoRowInDom === false ? [] : ["还原后 .notes-undo 应退出 DOM"]),
+    ...(restored11d.notice && restored11d.notice.isSuccess && restored11d.notice.text === "已还原该条笔记" ? [] : [`通知异常：${JSON.stringify(restored11d.notice)}`]),
+    ...(restored11d.hashSame ? [] : ["还原后文件字节应回复删除前"]),
+    ...(restored11d.searchInDom === true ? [] : ["还原后 .notes-search 行应回到 DOM"]),
+  ]);
+  await restoreStandardSeed();
+
+  // --- r11-5：左栏 220px 下动作区不溢出（组 r11-note-actions-narrow）-------------
+  log("r11-5 左栏 220px 下 .note-actions 不溢出（M4 判定表）");
+  await enterNotesProbe(seedNotes().slice(0, 2), 2);
+  const rowData11e = (row) => ({
+    scrollOverflow: row.scrollOverflow,
+    actionsLeft: row.actions ? row.actions.left : null,
+    actionsRight: row.actions ? row.actions.right : null,
+    actionsHeight: row.actions ? row.actions.h : null,
+    bodyLeft: row.body ? row.body.left : null,
+    copyLeft: row.copy ? row.copy.left : null,
+    copyRight: row.copy ? row.copy.right : null,
+    askWrapLeft: row.askWrap ? row.askWrap.left : null,
+    askWrapRight: row.askWrap ? row.askWrap.right : null,
+    copyY: row.copy ? row.copy.y : null,
+    askWrapY: row.askWrap ? row.askWrap.y : null,
+    dom: row.dom,
+  });
+  const widthOk11e = (probe) => Math.abs(probe.leftWidth - 268) <= 2;
+  const default11e = await narrowProbe();
+  record("r11-note-actions-narrow", { phase: "default-width", layoutLeftWidth: default11e.leftWidth, rows: default11e.rows.map(rowData11e) }, [
+    ...(widthOk11e(default11e) ? [] : [`.layout-left 默认宽应为 268±2：${default11e.leftWidth}`]),
+    ...(default11e.rows.every((row) => row.scrollOverflow !== null && row.scrollOverflow <= 1)
+      ? []
+      : [`默认宽度下动作区不得溢出：${JSON.stringify(default11e.rows.map((row) => row.scrollOverflow))}`]),
+  ]);
+
+  await js(`document.documentElement.style.setProperty("--pix-left-width", "220px"), true`);
+  await repaint(win);
+  const narrow11e = await narrowProbe();
+  await capturePage(win, "r11-5-note-actions-narrow.png", await rectOfSelector(SEL.layoutLeft, 2));
+  await capturePage(win, "r11-5b-note-actions-narrow-row.png", await rectOfSelector(SEL.noteRow, 2));
+  const threshold11e = narrow11e.threshold;
+  record(
+    "r11-note-actions-narrow",
+    { phase: "narrow-220", layoutLeftWidth: narrow11e.leftWidth, threshold: threshold11e, rows: narrow11e.rows.map(rowData11e) },
+    [
+      ...(narrow11e.leftWidth >= 218 && narrow11e.leftWidth <= 222 ? [] : [`窄宽未生效（空断言防护）：${narrow11e.leftWidth}`]),
+      ...(narrow11e.rows.every((row) => row.scrollOverflow !== null && row.scrollOverflow <= 1)
+        ? []
+        : [`动作区 end 侧溢出：${JSON.stringify(narrow11e.rows.map((row) => row.scrollOverflow))}`]),
+      ...(narrow11e.rows.every((row) => row.actions && row.body && row.actions.left >= row.body.left - 1)
+        ? []
+        : [`动作区 start 侧越界：${JSON.stringify(narrow11e.rows.map((row) => ({ a: row.actions && row.actions.left, b: row.body && row.body.left })))}`]),
+      ...(narrow11e.rows.every(
+        (row) => row.actions && row.copy && row.askWrap && row.copy.left >= row.actions.left - 1 && row.askWrap.left >= row.actions.left - 1,
+      )
+        ? []
+        : [`动作区内子元素 start 侧越界：${JSON.stringify(narrow11e.rows.map((row) => ({ copy: row.copy && row.copy.left, ask: row.askWrap && row.askWrap.left, a: row.actions && row.actions.left })))}`]),
+      ...(narrow11e.rows.every(
+        (row) =>
+          row.actions &&
+          row.copy &&
+          row.askWrap &&
+          row.actions.right <= narrow11e.leftRight + 1 &&
+          row.copy.right <= narrow11e.leftRight + 1 &&
+          row.askWrap.right <= narrow11e.leftRight + 1,
+      )
+        ? []
+        : [`动作区右侧越界：${JSON.stringify(narrow11e.rows.map((row) => ({ a: row.actions && row.actions.right, c: row.copy && row.copy.right, w: row.askWrap && row.askWrap.right })))}`]),
+      ...(narrow11e.rows.every((row) => row.copy && row.askWrap && Math.abs(row.copy.y - row.askWrap.y) <= 1 && row.actions && row.actions.h <= threshold11e.T)
+        ? []
+        : [`动作区换行（阈值 ${threshold11e.T}px）：${JSON.stringify(narrow11e.rows.map((row) => ({ copyY: row.copy && row.copy.y, askY: row.askWrap && row.askWrap.y, h: row.actions && row.actions.h })))}`]),
+      ...(narrow11e.rows.every((row) => row.dom.copyFirst && row.dom.askAfterCopy && row.dom.actionsLast)
+        ? []
+        : [`DOM 关系变化：${JSON.stringify(narrow11e.rows.map((row) => row.dom))}`]),
+    ],
+  );
+
+  await js(`document.documentElement.style.removeProperty("--pix-left-width"), true`);
+  await repaint(win);
+  const restored11e = await narrowProbe();
+  record("r11-note-actions-narrow", { phase: "restored-width", layoutLeftWidth: restored11e.leftWidth, rows: restored11e.rows.map(rowData11e) }, [
+    ...(widthOk11e(restored11e) ? [] : [`.layout-left 复位后应为 268±2：${restored11e.leftWidth}`]),
+    ...(restored11e.rows.every((row) => row.scrollOverflow !== null && row.scrollOverflow <= 1)
+      ? []
+      : [`复位后动作区不得溢出：${JSON.stringify(restored11e.rows.map((row) => row.scrollOverflow))}`]),
+  ]);
+  await restoreStandardSeed();
+
+  // --- r11-6（可选 / N74-3）：undoScope 守卫的运行时场景 ---------------------------
+  log("r11-6 跨工作区迟到撤销响应零副作用（undoScope 守卫）");
+  // 建议值 6000；实测「点撤销 → goHome → 重回工作区 → 面板就绪」耗时后上浮到 9000，保证 ≥ 2000 ms 余量（上浮不影响判据）
+  const NOTES_RESTORE_DELAY_MS = 9000;
+  await enterNotesProbe();
+  await deleteRowByText("Table 2 repo");
+  const callsBefore11f = (await restoreCalls()).count;
+  await setRestoreDelay(NOTES_RESTORE_DELAY_MS);
+  const undoClickAt11f = Date.now();
+  await clickUndo();
+  await goHome();
+  // ④ 直接改写库内 notes.json 为「另两条」（模拟外部改动；不含刚删除的 n-current-2）
+  const staleSeed11f = [seedNotes()[0], seedNotes()[3]];
+  writeFileSync(NOTES_FILE, `${JSON.stringify({ version: 1, notes: staleSeed11f }, null, 2)}\n`, "utf8");
+  const hashAfterRewrite11f = notesHash();
+  // ⑤ 重回工作区并打开笔记面板（2 行）
+  await enterWorkspace(LIBRARY_NAME);
+  await openNotesPanel(2);
+  const panelReadyAt11f = Date.now();
+  // ⑥ 等迟到响应到达
+  await sleep(NOTES_RESTORE_DELAY_MS + 500);
+  const calls11f = await restoreCalls();
+  const lastCall11f = calls11f.payloads.slice(-1)[0] ?? null;
+  const after11f = {
+    rows: await countOf(SEL.noteRow),
+    countText: (await readRowsAndCount()).countText,
+    texts: await rowTextSet(),
+    notice: await notesNotice(),
+    hashSame: notesHash() === hashAfterRewrite11f,
+  };
+  await setRestoreDelay(0);
+  await capturePage(win, "r11-6-stale-scope.png");
+  record(
+    "r11-undo-scope-stale",
+    {
+      phase: "stale-scope",
+      restoreCallsDelta: calls11f.count - callsBefore11f,
+      resolvedAt: lastCall11f ? lastCall11f.resolvedAt : null,
+      panelReadyAt: panelReadyAt11f,
+      rows: after11f.rows,
+      countText: after11f.countText,
+      texts: after11f.texts,
+      notice: after11f.notice,
+      hashSame: after11f.hashSame,
+      delayMs: NOTES_RESTORE_DELAY_MS,
+      sinceUndoClickMs: panelReadyAt11f - undoClickAt11f,
+    },
+    [
+      ...(calls11f.count - callsBefore11f === 1 ? [] : [`restoreCalls 增量应恰 1（防空断言）：${calls11f.count - callsBefore11f}`]),
+      ...(lastCall11f && typeof lastCall11f.resolvedAt === "number" && lastCall11f.resolvedAt > panelReadyAt11f
+        ? []
+        : [`迟到响应应晚于面板就绪：${JSON.stringify({ resolvedAt: lastCall11f && lastCall11f.resolvedAt, panelReadyAt: panelReadyAt11f })}`]),
+      ...(after11f.rows === 2 && JSON.stringify(after11f.texts) === JSON.stringify(staleSeed11f.map((note) => note.text))
+        ? []
+        : [`行应恒为第 ④ 步写入的两条：${JSON.stringify(after11f.texts)}`]),
+      ...(after11f.countText === "共 2 条" ? [] : [`计数异常：${after11f.countText}`]),
+      ...(after11f.notice === null ? [] : [`迟到响应必须零副作用：${JSON.stringify(after11f.notice)}`]),
+      ...(after11f.hashSame ? [] : ["迟到响应不得改写文件"]),
+    ],
+  );
+  await restoreStandardSeed();
 }
 
 // ---------------------------------------------------------------------------
@@ -5849,9 +6737,36 @@ if (process.env.PIX_SHOT_SCALE) {
   app.commandLine.appendSwitch("force-device-scale-factor", process.env.PIX_SHOT_SCALE);
 }
 
+/**
+ * 启动守卫（N73-3）：PIX_SHOT_ROOT 必须严格位于 os.tmpdir() 之下，且与 PIX_DIR 互不包含。
+ * main() 的第一条语句：失败路径零副作用（不建目录、不删路径、不设 userData）。
+ */
+function assertOutRootSafe() {
+  const outRoot = resolve(OUT_ROOT);
+  const tmpRoot = resolve(tmpdir());
+  const norm = (value) => (process.platform === "win32" ? value.toLowerCase() : value);
+  const o = norm(outRoot);
+  const t = norm(tmpRoot);
+  const pix = norm(resolve(PIX_DIR));
+  const inside = (child, parent) => child !== parent && child.startsWith(parent + sep);
+  const inTmp = inside(o, t);
+  const crossesRepo = inside(o, pix) || inside(pix, o) || o === pix;
+  if (!inTmp || crossesRepo) {
+    console.error(
+      "[ui-shot] 拒绝启动：PIX_SHOT_ROOT 必须位于系统临时目录内，且不得与仓库路径互相包含（当前：" + outRoot + "）",
+    );
+    app.exit(1);
+    return;
+  }
+}
+
 async function main() {
+  assertOutRootSafe();
   app.setPath("userData", join(OUT_ROOT, "electron-userdata"));
   mkdirSync(OUT_ROOT, { recursive: true });
+  // 产物目录自净：只删 <OUT_ROOT>/shots（library / library-b / electron-userdata / vite-cache / stub-preload.cjs 保留），
+  // 随后由 writeFixtures() 内的 mkdirSync(SHOTS_DIR, { recursive: true }) 重建。
+  rmSync(SHOTS_DIR, { recursive: true, force: true });
   writeFixtures();
   writeFileSync(STUB_PATH, buildStub());
   console.log(`[ui-shot] fixture 资料库：${LIBRARY_DIR}`);
@@ -5922,6 +6837,27 @@ async function main() {
   );
   writeFileSync(join(SHOTS_DIR, "MEASUREMENTS.json"), JSON.stringify(measurements, null, 2));
   for (const entry of measurements) console.log(`[ui-shot] 测量 ${entry.label}: ${JSON.stringify(entry.data)}`);
+
+  // 结束自检（N73-3）：截图集合与清单双向相等 + 目录无白名单外条目；只追加 errors，不覆盖 failure。
+  {
+    const disk = readdirSync(SHOTS_DIR, { withFileTypes: true });
+    const diskPng = disk
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".png"))
+      .map((entry) => entry.name)
+      .sort();
+    const manifestPng = shots.map((shot) => basename(shot.file)).sort();
+    const missingFromDisk = manifestPng.filter((name) => !diskPng.includes(name));
+    const missingFromManifest = diskPng.filter((name) => !manifestPng.includes(name));
+    if (missingFromDisk.length || missingFromManifest.length) {
+      errors.push(
+        `截图目录与清单不一致：磁盘 ${diskPng.length} 张 / 清单 ${manifestPng.length} 张，差集 [${[...missingFromDisk, ...missingFromManifest].join(", ")}]`,
+      );
+    }
+    const strays = disk
+      .filter((entry) => !(entry.isFile() && (entry.name.endsWith(".png") || entry.name === "MANIFEST.json" || entry.name === "MEASUREMENTS.json")))
+      .map((entry) => entry.name);
+    if (strays.length) errors.push(`截图目录存在白名单外条目：[${strays.join(", ")}]`);
+  }
 
   await server.close();
   win.destroy();

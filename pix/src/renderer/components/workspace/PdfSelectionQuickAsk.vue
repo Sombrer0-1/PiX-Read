@@ -131,11 +131,18 @@ function onSelectionChange(): void {
     hide();
     return;
   }
+  // 反馈态可见期间，入库引发的 DOM 更新会带出一次「选区未变」的 selectionchange；
+  // 同文本（trim 后逐字相等）不得把反馈重置为 actions（不重置 mode / 不清 feedback / 不重算几何 / 不重开计时器）。
+  if (mode.value === "feedback" && visible.value && text.trim() === cachedText) return;
   void showFor(selection.getRangeAt(0), text.trim());
 }
 
-function onStageScroll(): void {
-  if (visible.value) hide();
+function onStageScroll(event: Event): void {
+  const stage = resolveStage();
+  if (!stage) return;                          // 阅读区不存在 ⇒ 不隐藏
+  if (!(event.target instanceof Node)) return; // 非节点目标 ⇒ 不隐藏
+  if (!stage.contains(event.target)) return;   // 目标不在 stage 子树内 ⇒ 不隐藏
+  if (visible.value) hide();                   // 阅读区滚动 ⇒ 隐藏（既有语义）
 }
 
 function onButtonClick(): void {

@@ -197,10 +197,11 @@ function onToggleSort(): void {
   notesStore.setSortMode(notesStore.sortMode === "page" ? "created" : "page");
 }
 
-/** Esc 只清空查询并交出焦点；不 stopPropagation（既有 window 级 Esc 语义保留）。 */
-function onSearchEsc(): void {
+/** Esc 只清空查询并交出焦点，并阻断冒泡：本输入框内的 Esc 不触发阅读区的 Escape 语义（框选模式 / PDF 搜索面板）。 */
+function onSearchEsc(event: KeyboardEvent): void {
   notesStore.clearSearchQuery();
   searchInputRef.value?.blur();
+  event.stopPropagation();
 }
 
 /** 清空按钮：置空后把焦点交还输入框，便于继续输入。 */
