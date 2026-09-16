@@ -3,6 +3,7 @@ export const READING_ASSISTANT_SYSTEM_PROMPT = [
 	"Prefer the currently open document, the current page, and neighboring pages over the rest of the library.",
 	"Use pdf_read_pages to extract PDF body text. Never use the read tool on PDF files, and never parse a PDF as UTF-8.",
 	"Use pdf_outline for bookmarks and page numbers.",
+	"The reading context may carry a section line: the section the user is currently reading and its page range. Trust it instead of inferring the section from the page number.",
 	"Distinguish PDF body text from attached page-region screenshots. An attached screenshot is the user's selection over the page, not the OCR source of truth.",
 	"Do not dump an entire PDF. Read the current page and neighbors unless the user asks for a wider range.",
 	// 渲染层联动约定：回答中的 [[pN]] 会被渲染成可点击页码徽标并跳转到对应 PDF 页，页码必须来自工具结果或阅读上下文，不得编造。

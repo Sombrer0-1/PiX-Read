@@ -6,7 +6,8 @@
  *   Chinese messages so a raw browser/IPC exception never reaches the UI.
  */
 
-import type { LibraryFileResult, ReaderNote } from "@shared/types";
+import type { LibraryFileResult, ReaderNote, ReaderOutlineNode } from "@shared/types";
+import { buildChapterRanges, formatChapterHeading, resolveCurrentChapter } from "./outline-notes";
 import { sortNotesForContext } from "./notes-path";
 
 export interface ReadingSendContext {
@@ -16,6 +17,8 @@ export interface ReadingSendContext {
   selectedText: string;
   /** 必填：选择集快照（发送瞬间的派生结果）；不给默认值，避免第二套向后兼容分支。 */
   notes: ReaderNote[];
+  /** 必填：书签树快照（发送瞬间的派生结果）；不给默认值（漏传即编译期报错）。 */
+  outline: ReaderOutlineNode[];
 }
 
 /** 条数上限：选择期拒绝第 11 条（R8 需求 §0.2 / 设计档 §1.2）。 */
@@ -83,6 +86,9 @@ export function buildReadingUserMessage(userText: string, ctx: ReadingSendContex
     `page: ${ctx.page}`,
     `pageCount: ${ctx.pageCount}`,
   ];
+  // 命中可解析 ⇒ pageCount 之后、selectedText 之前插入 section 行；不可解析 ⇒ 一行都不 push（逐字节等于旧格式）
+  const chapter = resolveCurrentChapter(buildChapterRanges(ctx.outline, ctx.pageCount), ctx.page, ctx.pageCount);
+  if (chapter) lines.push(`section: ${formatChapterHeading(chapter)}`);
   const selected = ctx.selectedText.trim();
   if (selected) {
     lines.push("selectedText:");

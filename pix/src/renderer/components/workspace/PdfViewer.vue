@@ -27,6 +27,8 @@ import {
   technicalDetail,
 } from "../../utils/reading-context";
 import type { LibraryReadFailure } from "../../utils/reading-context";
+import { buildChapterRanges, formatChapterHeading, resolveChapterNav, resolveCurrentChapter } from "../../utils/outline-notes";
+import type { ChapterRange } from "../../utils/outline-notes";
 import type { PageCapture, ReaderOutlineNode } from "@shared/types";
 import PdfSearchPanel from "./PdfSearchPanel.vue";
 
@@ -64,6 +66,15 @@ const failureMessage = computed(() => (failure.value ? libraryReadFailureMessage
 const failureIcon = computed(() =>
   failure.value === "no-library-root" ? "mdi-folder-key-outline" : "mdi-alert-circle-outline",
 );
+
+// 章节命中与导航来自 outline-notes.ts 的同一份 ranges（组件层不写第二份区间比较）。
+// 依赖恰为 outline / page / pageCount ⇒ 翻页、切文档、面板开关、缩放（不改页码）都自动带上新值。
+const chapterRanges = computed(() => buildChapterRanges(readerStore.outline, readerStore.pageCount));
+const currentChapter = computed(() => {
+  const hit = resolveCurrentChapter(chapterRanges.value, readerStore.page, readerStore.pageCount);
+  return hit ? { range: hit, text: formatChapterHeading(hit) } : null;
+});
+const chapterNav = computed(() => resolveChapterNav(chapterRanges.value, readerStore.page, readerStore.pageCount));
 
 /** Matches the kernel's resizeImage cap so captures never bloat the request. */
 const CAPTURE_MAX_EDGE = 2000;
@@ -317,6 +328,12 @@ function gotoPage(pageNumber: number): void {
   scrollToPage(readerStore.page);
 }
 
+/** 章节跳转的唯一写入点：按钮与 [ / ] 共用；目标为 null 时零副作用（与按钮 disabled 一一对应）。 */
+function jumpToChapter(target: ChapterRange | null): void {
+  if (!target) return;
+  readerStore.gotoPage = target.start;
+}
+
 async function beginPageEdit(): Promise<void> {
   pageDraft.value = String(readerStore.page);
   pageEditing.value = true;
@@ -383,6 +400,16 @@ function onWindowKeydown(event: KeyboardEvent): void {
     return;
   }
   if (readerStore.pageCount <= 0 || isEditableTarget(event.target)) return;
+  if (event.key === "[" || event.key === "]") {
+    // 框选模式：本轮为 [ / ] 新增的屏蔽（既有七键位在框选模式下仍生效，见设计档 §2.1）
+    if (readerStore.captureMode) return;
+    const target = event.key === "[" ? chapterNav.value.prev : chapterNav.value.next;
+    // 目标为 null 时不 preventDefault、零副作用（与按钮 disabled 一一对应）
+    if (!target) return;
+    event.preventDefault();
+    jumpToChapter(target);
+    return;
+  }
   if (event.key === "/") {
     event.preventDefault();
     openSearch();
@@ -919,6 +946,31 @@ defineExpose({ gotoPage });
       />
     </div>
 
+    <div
+      v-if="currentChapter || chapterNav.prev || chapterNav.next"
+      class="reader-section"
+    >
+      <v-btn
+        class="reader-section-prev"
+        icon="mdi-chevron-double-left"
+        size="x-small"
+        variant="text"
+        title="上一节（快捷键 [）"
+        :disabled="chapterNav.prev === null"
+        @click="jumpToChapter(chapterNav.prev)"
+      />
+      <span v-if="currentChapter" class="reader-section-chip" :title="currentChapter.text">{{ currentChapter.text }}</span>
+      <v-btn
+        class="reader-section-next"
+        icon="mdi-chevron-double-right"
+        size="x-small"
+        variant="text"
+        title="下一节（快捷键 ]）"
+        :disabled="chapterNav.next === null"
+        @click="jumpToChapter(chapterNav.next)"
+      />
+    </div>
+
     <div v-if="readerStore.pageCount > 0" class="pdf-page-indicator">
       <v-btn
         icon="mdi-chevron-up"
@@ -1124,6 +1176,41 @@ defineExpose({ gotoPage });
 
 .status-icon {
   color: var(--pix-text-muted);
+}
+
+.reader-section {
+  position: absolute;
+  left: 50%;
+  bottom: 46px;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100% - 24px);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(31, 41, 51, 0.78);
+  color: #fff;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.reader-section :deep(.v-btn--disabled) {
+  opacity: 0.45;
+}
+
+.reader-section-chip {
+  min-width: 0;
+  max-width: 360px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.reader-section-prev,
+.reader-section-next {
+  pointer-events: auto;
 }
 
 .pdf-page-indicator {

@@ -359,6 +359,7 @@ async function send(): Promise<void> {
     pageCount: readerStore.pageCount,
     selectedText: excluded.has("selection") ? "" : readerStore.selectedText,
     notes: notesSnapshot,
+    outline: readerStore.outline,
   };
   const anchor: ReadingAnchor | null = readContext.filePath
     ? { docFilePath: readContext.filePath, page: readContext.page }

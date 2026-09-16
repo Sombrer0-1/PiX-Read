@@ -89,6 +89,15 @@ const SEL = {
   layoutLeft: ".layout-left",
   noteActions: ".note-actions",
   noteText: ".note-text",
+  // R12 新增 8 项（设计档 §0.3 / §1.6.1）
+  readerSection: ".reader-section",
+  readerSectionChip: ".reader-section-chip",
+  readerSectionPrev: ".reader-section-prev",
+  readerSectionNext: ".reader-section-next",
+  pageIndicator: ".pdf-page-indicator",
+  pageInput: ".page-input",
+  readerMain: ".reader-main",
+  composerInput: ".input-area",
 };
 
 // ---------------------------------------------------------------------------
@@ -2826,7 +2835,7 @@ async function runReaderStateScenarios(win, log) {
   await runTurn(TURN35A, "第一轮回答");
   await sleep(200);
   // 第二轮故意让确认文本与乐观文本不同 ⇒ 追加一条无锚点用户块
-  const confirmed35B = `<reading_context>\npath: ${join(LIBRARY_DIR, "sample-paper.pdf")}\npage: 1\npageCount: 3\n</reading_context>\n\n${TURN35B}`;
+  const confirmed35B = `<reading_context>\npath: ${join(LIBRARY_DIR, "sample-paper.pdf")}\npage: 1\npageCount: 3\nsection: 1. Abstract · 第 1 页\n</reading_context>\n\n${TURN35B}`;
   await typeAndSend(TURN35B);
   await runTurn(TURN35B, "第二轮回答", confirmed35B);
   await sleep(200);
@@ -3652,6 +3661,9 @@ async function runReaderStateScenarios(win, log) {
   await waitPage(1, 3);
   await clickNext();
   await waitPage(2, 3);
+  // 页码 pill 可见严格早于章节派生（先 setPageCount/scrollToPage，再 getOutline → setOutline）：
+  // 就地内联等待，不得调用后置 helper（runReaderStateScenarios 闭包末段的 const 存在 TDZ）。
+  await waitFor("章节控件就绪", `document.querySelector(${JSON.stringify(SEL.readerSection)}) !== null`);
   // 选区必须晚于 textarea 写值：向聚焦中的 .input-area 写入值会把 document 选区收进输入框，
   // readerStore.selectedText 随之被 PdfViewer 的 selectionchange 清空（既有行为，R8 不改）。
   await setDraft(ASK43);
@@ -3683,6 +3695,7 @@ async function runReaderStateScenarios(win, log) {
         "   page: 1",
         "   text: We study retrieval over long documents where the attention budget is the binding constraint.",
         "   comment: 与第 3 节消融实验对照",
+        "section: 2. Method Overview · 第 2 页",
       ]),
       orderOk: prompt43.message.indexOf("1. doc: archive/older-paper.pdf") < prompt43.message.indexOf("2. doc: sample-paper.pdf"),
       entryBlockNoBackslash: entryBlock43.indexOf("\\") < 0,
@@ -3695,9 +3708,9 @@ async function runReaderStateScenarios(win, log) {
       endsWithUserText: prompt43.message.endsWith("\n\n" + ASK43),
     },
     [
-      ...(missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:"]).length === 0
+      ...(missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:", "section: 2. Method Overview · 第 2 页"]).length === 0
         ? []
-        : [`载荷缺少骨架行：${missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:"]).join(" / ")}`]),
+        : [`载荷缺少骨架行：${missingLines(prompt43.message, ["<reading_context>", "page: 2", "selectedText:", "reader_notes:", "section: 2. Method Overview · 第 2 页"]).join(" / ")}`]),
       ...(prompt43.message.indexOf("1. doc: archive/older-paper.pdf") < prompt43.message.indexOf("2. doc: sample-paper.pdf")
         ? []
         : "注入顺序应为 docPathKey 升序（archive 在前）"),
@@ -6722,6 +6735,529 @@ async function runReaderStateScenarios(win, log) {
       ...(after11f.countText === "共 2 条" ? [] : [`计数异常：${after11f.countText}`]),
       ...(after11f.notice === null ? [] : [`迟到响应必须零副作用：${JSON.stringify(after11f.notice)}`]),
       ...(after11f.hashSame ? [] : ["迟到响应不得改写文件"]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // =========================================================================
+  // R12 章节语义贯通（N78–N81）：helper 块 + 场景 r12-1 … r12-4
+  //
+  // 就绪纪律：页码 pill 可见严格早于章节派生（PdfViewer 先 setPageCount → measurePages →
+  // scrollToPage，再 getOutline → setOutline）⇒ 有书签文档一律先 waitSectionReady()；无书签
+  // 文档用 settleEmptyOutline()（限额见设计档 §3 第 1 行：它只证明地图已渲染空态）。
+  // 插值纪律：进入页面上下文的字符串一律 JSON.stringify 插值，Node 侧常量名不得进页面。
+  // =========================================================================
+
+  /** 点击原语：既有 click（runScenario:1062）在本函数作用域不可见，故按同一写法重声明。 */
+  const clickEl = (selector) => js(`document.querySelector(${JSON.stringify(selector)}).click(), true`);
+
+  /** 在 document.body 上派发 keydown（与 pressBodyEsc 同范式：打在窗口监听上）。 */
+  const pressReaderKey = (key) => js(`(() => {
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: ${JSON.stringify(key)}, bubbles: true }));
+    return true;
+  })()`);
+
+  /** 在真实元素上派发 keydown；元素不存在即抛错（守卫判据必须打在真实输入元素上）。 */
+  const pressKeyOn = (selector, key) => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) throw new Error("keydown target not found: " + ${JSON.stringify(selector)});
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ${JSON.stringify(key)}, bubbles: true }));
+    return true;
+  })()`);
+
+  /** 章节控件现场：存在性 / 文本 / title / 两禁用态 / 三 rect / 三 pointer-events / viewer 宽。 */
+  const sectionProbe = () => js(`(() => {
+    const rect = (el) => {
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const container = document.querySelector(${JSON.stringify(SEL.readerSection)});
+    const chip = document.querySelector(${JSON.stringify(SEL.readerSectionChip)});
+    const prev = document.querySelector(${JSON.stringify(SEL.readerSectionPrev)});
+    const next = document.querySelector(${JSON.stringify(SEL.readerSectionNext)});
+    const viewer = document.querySelector(${JSON.stringify(SEL.pdfViewer)});
+    return {
+      containerInDom: !!container,
+      chipInDom: !!chip,
+      chipText: text(chip),
+      chipTitle: chip ? chip.getAttribute("title") : null,
+      prevDisabled: prev ? prev.disabled : null,
+      nextDisabled: next ? next.disabled : null,
+      containerRect: container ? rect(container) : null,
+      containerPointerEvents: container ? getComputedStyle(container).pointerEvents : null,
+      prevPointerEvents: prev ? getComputedStyle(prev).pointerEvents : null,
+      nextPointerEvents: next ? getComputedStyle(next).pointerEvents : null,
+      viewerWidth: viewer ? Math.round(viewer.getBoundingClientRect().width) : null,
+    };
+  })()`);
+
+  /** 既有四控件现场（r12-2 ⑤ 的 ±1px 判据）：页码 pill / 页码文本 / 工具栏 / 框选按钮 + 缩放文本。 */
+  const pillProbe = () => js(`(() => {
+    const rect = (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return null;
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    };
+    const text = (selector) => {
+      const el = document.querySelector(selector);
+      return el ? el.textContent.replace(/\\s+/g, " ").trim() : null;
+    };
+    return {
+      indicator: { text: text(${JSON.stringify(SEL.pageIndicator)}), rect: rect(${JSON.stringify(SEL.pageIndicator)}) },
+      pageLabel: { text: text(".page-label"), rect: rect(".page-label") },
+      toolbar: { rect: rect(".pdf-toolbar") },
+      captureFab: { rect: rect(".pdf-capture-fab") },
+      zoomText: text(${JSON.stringify(SEL.zoomLabel)}),
+    };
+  })()`);
+
+  /** 有书签文档的唯一就绪点（无书签文档永不出现，不得使用）。 */
+  const waitSectionReady = () =>
+    waitFor("章节控件就绪", `document.querySelector(${JSON.stringify(SEL.readerSection)}) !== null`);
+
+  /** 关地图（幂等）：已关直接返回，开着则再点一次开关并等槽位退出 DOM。 */
+  const closeMap = async () => {
+    if (!(await has(SEL.mapSlot))) return;
+    await js(`document.querySelector(${JSON.stringify(SEL.mapToggle)}).click(), true`);
+    await waitFor("知识地图槽位退出", `!document.querySelector(${JSON.stringify(SEL.mapSlot)})`);
+  };
+
+  /** 无书签文档的「空 outline 已落地」信号：开地图等空态 + 进度（与 50c 同口径）后关地图。 */
+  const settleEmptyOutline = async () => {
+    await ensureMapOpen();
+    await waitFor(
+      "地图空态与进度就绪",
+      `document.querySelector(${JSON.stringify(SEL.mapEmpty)}) && document.querySelector(${JSON.stringify(SEL.mapProgress)})`,
+    );
+    await closeMap();
+  };
+
+  /** 地图上全部 .map-row.current 的 .label 文本（空白归一化；元素缺失项为 null）。 */
+  const mapCurrentLabels = () => js(`Array.from(document.querySelectorAll(".map-row.current")).map((row) => {
+    const label = row.querySelector(".label");
+    return label ? label.textContent.replace(/\\s+/g, " ").trim() : null;
+  })`);
+
+  // --- r12-1：有书签文档的章节 chip 与两个按钮（组 r12-section-visible，5 条 record）---------
+  log("r12-1 章节 chip：三页文本 / 禁用态 / 几何与指针事件 / 翻页与缩放不变性");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitSectionReady();
+  const section1a = await sectionProbe();
+  const pill1a = await pillProbe();
+  await capturePage(win, "r12-1-section-chip-page1.png", await rectOfSelector(SEL.readerMain));
+  const overlap1a = {
+    containerBottom: section1a.containerRect ? section1a.containerRect.y + section1a.containerRect.height : null,
+    indicatorTop: pill1a.indicator.rect ? pill1a.indicator.rect.y : null,
+    containerWidth: section1a.containerRect ? section1a.containerRect.width : null,
+    viewerWidth: section1a.viewerWidth,
+  };
+  record("r12-section-visible", { phase: "page-1", section: section1a, pill: pill1a, overlap: overlap1a }, [
+    ...(section1a.containerInDom && section1a.chipInDom ? [] : [`章节控件应在 DOM：${JSON.stringify(section1a)}`]),
+    ...(section1a.chipText === "1. Abstract · 第 1 页" && section1a.chipTitle === "1. Abstract · 第 1 页"
+      ? []
+      : [`chip 文本/title 异常：${JSON.stringify({ text: section1a.chipText, title: section1a.chipTitle })}`]),
+    ...(section1a.prevDisabled === true && section1a.nextDisabled === false
+      ? []
+      : [`禁用态异常：${JSON.stringify({ prev: section1a.prevDisabled, next: section1a.nextDisabled })}`]),
+    ...(pill1a.pageLabel.text === "第 1 / 3 页" ? [] : [`页码 pill 文本变化：${pill1a.pageLabel.text}`]),
+    ...(overlap1a.containerBottom !== null && overlap1a.indicatorTop !== null && overlap1a.containerBottom <= overlap1a.indicatorTop + 1
+      ? []
+      : [`章节控件未在 pill 上方：${JSON.stringify(overlap1a)}`]),
+    ...(overlap1a.containerWidth !== null && overlap1a.viewerWidth !== null && overlap1a.containerWidth < overlap1a.viewerWidth
+      ? []
+      : [`章节控件宽度应小于 viewer 宽：${JSON.stringify(overlap1a)}`]),
+    ...(section1a.containerPointerEvents === "none" ? [] : [`容器 pointer-events 应为 none：${section1a.containerPointerEvents}`]),
+    ...(section1a.prevPointerEvents === "auto" && section1a.nextPointerEvents === "auto"
+      ? []
+      : [`两按钮 pointer-events 应为 auto：${JSON.stringify({ prev: section1a.prevPointerEvents, next: section1a.nextPointerEvents })}`]),
+  ]);
+
+  await clickNext();
+  await waitPage(2, 3);
+  const section1b = await sectionProbe();
+  await capturePage(win, "r12-1b-section-chip-page2.png", await rectOfSelector(SEL.readerMain));
+  record("r12-section-visible", { phase: "page-2", section: section1b }, [
+    ...(section1b.chipText === "2. Method Overview · 第 2 页" ? [] : [`第 2 页 chip 异常：${section1b.chipText}`]),
+    ...(section1b.prevDisabled === false && section1b.nextDisabled === false
+      ? []
+      : [`第 2 页两按钮均应可点：${JSON.stringify({ prev: section1b.prevDisabled, next: section1b.nextDisabled })}`]),
+  ]);
+
+  await clickNext();
+  await waitPage(3, 3);
+  const section1c = await sectionProbe();
+  await capturePage(win, "r12-1c-section-chip-page3.png", await rectOfSelector(SEL.readerMain));
+  record("r12-section-visible", { phase: "page-3", section: section1c }, [
+    ...(section1c.chipText === "2.2 Positional prior · 第 3 页" ? [] : [`第 3 页 chip 异常：${section1c.chipText}`]),
+    ...(section1c.nextDisabled === true ? [] : [`末节下一节应禁用：${JSON.stringify(section1c)}`]),
+  ]);
+
+  // invariance：地图开合 / 缩放往返 / 面板切标签各读一次 chip（只判文本与存在性，不判矩形）。
+  const reading12a = async (at) => {
+    const probe = await sectionProbe();
+    return { at, chipText: probe.chipText, containerInDom: probe.containerInDom };
+  };
+  const readings12a = [];
+  readings12a.push(await reading12a("before-map"));
+  await ensureMapOpen();
+  await waitFor("地图当前行 3 条", `document.querySelectorAll(".map-row.current").length === 3`);
+  readings12a.push(await reading12a("map-open"));
+  const currentLabels12a = await mapCurrentLabels();
+  await closeMap();
+  readings12a.push(await reading12a("map-closed"));
+  await clickEl(SEL.zoomInBtn);
+  await repaint(win);
+  const zoomAfterIn12a = (await pillProbe()).zoomText;
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await repaint(win);
+  const zoomBack12a = (await pillProbe()).zoomText;
+  readings12a.push(await reading12a("zoom-roundtrip"));
+  await openNotesPanel(4);
+  await clickEl(SEL.tabLibrary);
+  readings12a.push(await reading12a("notes-panel"));
+  record(
+    "r12-section-visible",
+    {
+      phase: "invariance",
+      readings: readings12a,
+      zoomAfterIn: zoomAfterIn12a,
+      zoomBack: zoomBack12a,
+      currentLabels: currentLabels12a,
+    },
+    [
+      ...(readings12a.length === 5 && readings12a.every((entry) => entry.chipText === "2.2 Positional prior · 第 3 页")
+        ? []
+        : [`五次读数的 chip 文本应逐字节相等：${JSON.stringify(readings12a)}`]),
+      ...(readings12a.every((entry) => entry.containerInDom === true) ? [] : [`容器应全程在 DOM：${JSON.stringify(readings12a)}`]),
+      ...(zoomAfterIn12a === "110%" ? [] : [`放大后缩放读数应为 110%（防空断言）：${zoomAfterIn12a}`]),
+      ...(zoomBack12a === "100%" ? [] : [`缩小后应回到 100%：${zoomBack12a}`]),
+      ...(currentLabels12a.length === 3 &&
+      currentLabels12a.includes("2.2 Positional prior") &&
+      currentLabels12a.includes("Appendix B")
+        ? []
+        : [`地图 in-range 集合应与 chip 同源：${JSON.stringify(currentLabels12a)}`]),
+    ],
+  );
+
+  // page-input：越界提交保持钳制 + 章节不漂移；合法页提交后 chip 跟随。
+  const setPageDraft12a = (value) => js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.pageInput)});
+    if (!input) throw new Error("page input not found");
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(input, ${JSON.stringify(String(value))});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  await clickEl(".page-label");
+  await waitFor("页码输入框", `document.querySelector(${JSON.stringify(SEL.pageInput)})`);
+  await setPageDraft12a(99);
+  await pressKeyOn(SEL.pageInput, "Enter");
+  await waitFor("页码输入框退出 DOM", `!document.querySelector(${JSON.stringify(SEL.pageInput)})`);
+  const afterOutOfRange12a = { pageText: await pageLabel(), section: await sectionProbe() };
+  await clickEl(".page-label");
+  await waitFor("页码输入框（第二次）", `document.querySelector(${JSON.stringify(SEL.pageInput)})`);
+  await setPageDraft12a(2);
+  await pressKeyOn(SEL.pageInput, "Enter");
+  await waitPage(2, 3);
+  const afterValid12a = { pageText: await pageLabel(), section: await sectionProbe() };
+  record("r12-section-visible", { phase: "page-input", afterOutOfRange: afterOutOfRange12a, afterValid: afterValid12a }, [
+    ...(afterOutOfRange12a.pageText === "第 3 / 3 页" ? [] : [`越界提交应保持第 3 页（既有钳制语义）：${afterOutOfRange12a.pageText}`]),
+    ...(afterOutOfRange12a.section.chipText === "2.2 Positional prior · 第 3 页"
+      ? []
+      : [`越界提交后 chip 不得漂移：${afterOutOfRange12a.section.chipText}`]),
+    ...(afterValid12a.pageText === "第 2 / 3 页" ? [] : [`合法页提交应落第 2 页：${afterValid12a.pageText}`]),
+    ...(afterValid12a.section.chipText === "2. Method Overview · 第 2 页" ? [] : [`合法页提交后 chip 异常：${afterValid12a.section.chipText}`]),
+  ]);
+
+  // --- r12-2：无书签文档的零占位与四选择器零位移（组 r12-section-degrade，2 条 record）-----
+  log("r12-2 无书签文档：章节控件整行不存在 + 四选择器跨文档 ±1px");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await settleEmptyOutline();
+  const pageTextBefore12b = await pageLabel();
+  const hashBefore12b = notesHash();
+  const sectionBefore12b = await sectionProbe();
+  await pressReaderKey("]");
+  await pressReaderKey("[");
+  const sectionAfter12b = await sectionProbe();
+  const pageTextAfter12b = await pageLabel();
+  await capturePage(win, "r12-2-no-outline-degrade.png", await rectOfSelector(SEL.readerMain));
+  record(
+    "r12-section-degrade",
+    {
+      phase: "no-outline",
+      section: sectionAfter12b,
+      sectionBefore: sectionBefore12b,
+      pageTextBefore: pageTextBefore12b,
+      pageTextAfter: pageTextAfter12b,
+      hashSame: notesHash() === hashBefore12b,
+    },
+    [
+      ...(sectionBefore12b.containerInDom === false && sectionBefore12b.chipInDom === false
+        ? []
+        : [`无 outline 时不得渲染章节控件（零占位）：${JSON.stringify(sectionBefore12b)}`]),
+      ...(pageTextBefore12b === "第 1 / 2 页" && pageTextAfter12b === "第 1 / 2 页"
+        ? []
+        : [`无目标按键必须零副作用：${JSON.stringify({ before: pageTextBefore12b, after: pageTextAfter12b })}`]),
+      ...(sectionAfter12b.containerInDom === false && sectionAfter12b.chipInDom === false
+        ? []
+        : [`两次派发后仍不得渲染：${JSON.stringify(sectionAfter12b)}`]),
+      ...(notesHash() === hashBefore12b ? [] : ["派发按键不得改写 notes.json"]),
+    ],
+  );
+
+  const pillWithout12b = await pillProbe();
+  await openRow("sample-paper.pdf");
+  await waitPage(1, 3);
+  await waitSectionReady();
+  const sectionOnSample12b = await sectionProbe();
+  const pillWith12b = await pillProbe();
+  const rectDelta12b = (before, after) =>
+    before && after
+      ? {
+          x: Math.abs(after.x - before.x),
+          y: Math.abs(after.y - before.y),
+          width: Math.abs(after.width - before.width),
+          height: Math.abs(after.height - before.height),
+        }
+      : null;
+  const rectSame12b = (delta) => !!delta && delta.x <= 1 && delta.y <= 1 && delta.width <= 1 && delta.height <= 1;
+  const delta12b = {
+    indicator: rectDelta12b(pillWithout12b.indicator.rect, pillWith12b.indicator.rect),
+    pageLabel: rectDelta12b(pillWithout12b.pageLabel.rect, pillWith12b.pageLabel.rect),
+    toolbar: rectDelta12b(pillWithout12b.toolbar.rect, pillWith12b.toolbar.rect),
+    captureFab: rectDelta12b(pillWithout12b.captureFab.rect, pillWith12b.captureFab.rect),
+  };
+  await openRow("older-paper.pdf");
+  await waitPage(1, 2);
+  await settleEmptyOutline();
+  const sectionAfterReturn12b = await sectionProbe();
+  record(
+    "r12-section-degrade",
+    {
+      phase: "zero-displacement",
+      pillWithout: pillWithout12b,
+      pillWith: pillWith12b,
+      delta: delta12b,
+      pageTexts: { without: pillWithout12b.pageLabel.text, with: pillWith12b.pageLabel.text },
+      zoomTexts: { without: pillWithout12b.zoomText, with: pillWith12b.zoomText },
+      sectionOnSample: sectionOnSample12b,
+      sectionAfterReturn: sectionAfterReturn12b,
+    },
+    [
+      ...(Object.values(delta12b).every((delta) => rectSame12b(delta)) ? [] : [`四选择器几何位移 > 1px：${JSON.stringify(delta12b)}`]),
+      ...(pillWithout12b.pageLabel.text === "第 1 / 2 页" && pillWith12b.pageLabel.text === "第 1 / 3 页"
+        ? []
+        : [`换文档证据缺失（防空断言）：${JSON.stringify({ without: pillWithout12b.pageLabel.text, with: pillWith12b.pageLabel.text })}`]),
+      ...(pillWithout12b.zoomText === "100%" && pillWith12b.zoomText === "100%"
+        ? []
+        : [`两端缩放前提应为 100%：${JSON.stringify({ without: pillWithout12b.zoomText, with: pillWith12b.zoomText })}`]),
+      ...(sectionOnSample12b.containerInDom === true ? [] : [`有书签文档上控件应在 DOM（防空断言）：${JSON.stringify(sectionOnSample12b)}`]),
+      ...(sectionAfterReturn12b.containerInDom === false
+        ? []
+        : [`切回无书签文档后控件应缺席：${JSON.stringify(sectionAfterReturn12b)}`]),
+    ],
+  );
+
+  // --- r12-3：按钮与快捷键同源 + 两条守卫（组 r12-section-nav，7 条 record）----------------
+  log("r12-3 章节导航：按钮 / [ ] 快捷键 / 输入框与框选模式守卫");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitSectionReady();
+  await clickEl(SEL.readerSectionNext);
+  await waitPage(2, 3);
+  const nextJump12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  await capturePage(win, "r12-3-section-nav-after-next.png", await rectOfSelector(SEL.readerMain));
+  record("r12-section-nav", { phase: "next-jump", pageText: nextJump12c.pageText, section: nextJump12c.section }, [
+    ...(nextJump12c.pageText === "第 2 / 3 页" ? [] : [`点下一节应落第 2 页：${nextJump12c.pageText}`]),
+    ...(nextJump12c.section.chipText === "2. Method Overview · 第 2 页" ? [] : [`chip 异常：${nextJump12c.section.chipText}`]),
+    ...(nextJump12c.section.prevDisabled === false && nextJump12c.section.nextDisabled === false
+      ? []
+      : [`第 2 页两按钮均应可点：${JSON.stringify(nextJump12c.section)}`]),
+  ]);
+
+  await clickEl(SEL.readerSectionNext);
+  await waitPage(3, 3);
+  const lastDisabled12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  record("r12-section-nav", { phase: "next-last-disabled", pageText: lastDisabled12c.pageText, section: lastDisabled12c.section }, [
+    ...(lastDisabled12c.pageText === "第 3 / 3 页" ? [] : [`点下一节应落第 3 页：${lastDisabled12c.pageText}`]),
+    ...(lastDisabled12c.section.nextDisabled === true ? [] : [`末节应禁用下一节：${JSON.stringify(lastDisabled12c.section)}`]),
+    ...(lastDisabled12c.section.prevDisabled === false ? [] : [`末节上一节应仍可点：${JSON.stringify(lastDisabled12c.section)}`]),
+  ]);
+
+  await clickEl(SEL.readerSectionPrev);
+  await waitPage(2, 3);
+  const prevJump12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  record("r12-section-nav", { phase: "prev-jump", pageText: prevJump12c.pageText, section: prevJump12c.section }, [
+    ...(prevJump12c.pageText === "第 2 / 3 页" ? [] : [`上一节目标 = 2.1（start 2）应真实后退一页：${prevJump12c.pageText}`]),
+    ...(prevJump12c.section.chipText === "2. Method Overview · 第 2 页" ? [] : [`chip 异常：${prevJump12c.section.chipText}`]),
+  ]);
+
+  await clickPrev();
+  await waitPage(1, 3);
+  const beforeShortcut12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  await pressReaderKey("]");
+  await waitPage(2, 3);
+  const afterShortcut12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  record("r12-section-nav", { phase: "shortcut-next", before: beforeShortcut12c, after: afterShortcut12c }, [
+    ...(beforeShortcut12c.pageText === "第 1 / 3 页" && beforeShortcut12c.section.prevDisabled === true
+      ? []
+      : [`派发前应停在第 1 页且上一节禁用（防空断言）：${JSON.stringify(beforeShortcut12c)}`]),
+    ...(afterShortcut12c.pageText === "第 2 / 3 页" ? [] : [`快捷键 ] 应落第 2 页：${afterShortcut12c.pageText}`]),
+    ...(afterShortcut12c.section.chipText === "2. Method Overview · 第 2 页"
+      ? []
+      : [`快捷键与按钮目标应同源：${afterShortcut12c.section.chipText}`]),
+  ]);
+
+  await pressReaderKey("[");
+  await waitPage(1, 3);
+  const prevShortcut12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  await capturePage(win, "r12-3b-section-nav-shortcut-prev.png", await rectOfSelector(SEL.readerMain));
+  record("r12-section-nav", { phase: "shortcut-prev", pageText: prevShortcut12c.pageText, section: prevShortcut12c.section }, [
+    ...(prevShortcut12c.pageText === "第 1 / 3 页" ? [] : [`快捷键 [ 应落第 1 页：${prevShortcut12c.pageText}`]),
+    ...(prevShortcut12c.section.chipText === "1. Abstract · 第 1 页" ? [] : [`chip 异常：${prevShortcut12c.section.chipText}`]),
+    ...(prevShortcut12c.section.prevDisabled === true ? [] : [`首节上一节应禁用：${JSON.stringify(prevShortcut12c.section)}`]),
+  ]);
+
+  // 守卫 ①：页码输入框与 composer（isEditableTarget 早退）；后半句是真正的守卫证据。
+  await clickEl(".page-label");
+  await waitFor("页码输入框（守卫相位）", `document.querySelector(${JSON.stringify(SEL.pageInput)})`);
+  await pressKeyOn(SEL.pageInput, "]");
+  const pageInputState12c = await js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.pageInput)});
+    return {
+      value: input ? input.value : null,
+      tag: document.activeElement ? document.activeElement.tagName : null,
+    };
+  })()`);
+  await pressKeyOn(SEL.pageInput, "Escape");
+  const pageTextAfterPageInput12c = await pageLabel();
+  await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).focus(), true`);
+  const composerTag12c = await js("document.activeElement ? document.activeElement.tagName : null");
+  await pressKeyOn(SEL.composerInput, "]");
+  const composerState12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  record(
+    "r12-section-nav",
+    {
+      phase: "shortcut-guard-editable",
+      targets: { pageInput: pageInputState12c.tag, composer: composerTag12c },
+      pageInputValue: pageInputState12c.value,
+      pageText: { afterPageInput: pageTextAfterPageInput12c, afterComposer: composerState12c.pageText },
+      section: composerState12c.section,
+    },
+    [
+      ...(pageInputState12c.value === "1" ? [] : [`页码输入框内派发不得改写草图：${pageInputState12c.value}`]),
+      ...(pageTextAfterPageInput12c === "第 1 / 3 页"
+        ? []
+        : [`输入框守卫失效（取消编辑后页码应仍是第 1 页）：${pageTextAfterPageInput12c}`]),
+      ...(composerState12c.pageText === "第 1 / 3 页" ? [] : [`composer 内派发不得翻页：${composerState12c.pageText}`]),
+      ...(composerState12c.section.chipText === "1. Abstract · 第 1 页" ? [] : [`chip 不得变化：${composerState12c.section.chipText}`]),
+      ...(pageInputState12c.tag === "INPUT" && composerTag12c === "TEXTAREA"
+        ? []
+        : [`派发目标应为真实输入元素（防空断言）：${JSON.stringify({ pageInput: pageInputState12c.tag, composer: composerTag12c })}`]),
+    ],
+  );
+
+  // 守卫 ②：框选模式内 [ / ] 不生效（新分支自检 captureMode），退出后同一按键恢复。
+  if (!(await has(SEL.captureLayer))) {
+    await clickEl(SEL.captureFabBtn);
+  }
+  await waitFor("框选层就绪", `document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  await pressReaderKey("]");
+  const inCapture12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  await pressBodyEsc();
+  await waitFor("框选层退出", `!document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  await pressReaderKey("]");
+  await waitPage(2, 3);
+  const afterCapture12c = { pageText: await pageLabel(), section: await sectionProbe() };
+  record("r12-section-nav", { phase: "shortcut-guard-capture", inCapture: inCapture12c, afterExit: afterCapture12c }, [
+    ...(inCapture12c.pageText === "第 1 / 3 页" ? [] : [`框选模式内 [ / ] 不得生效：${inCapture12c.pageText}`]),
+    ...(afterCapture12c.pageText === "第 2 / 3 页" ? [] : [`退出框选后同一按键应恢复生效：${afterCapture12c.pageText}`]),
+    ...(afterCapture12c.section.chipText === "2. Method Overview · 第 2 页"
+      ? []
+      : [`退出框选后 chip 异常：${afterCapture12c.section.chipText}`]),
+  ]);
+
+  // --- r12-4：载荷 section 行与「不可解析时逐字节等于旧格式」（组 r12-section-context，2 条）---
+  log("r12-4 上下文注入：section 行 / 行序 / 删行后逐字节等于旧格式");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitSectionReady();
+  await clickNext();
+  await waitPage(2, 3);
+  await clearSendCalls();
+  const T12 = "12：这一节的假设是什么？";
+  const T13 = "13：没有书签的文档也要能正常提问。";
+  const countOccurrences = (text, needle) => text.split(needle).length - 1;
+  await typeAndSend(T12);
+  await waitSendCalls(1);
+  const prompt12 = await lastSend();
+  await capturePage(win, "r12-4-section-context-sent.png");
+  const sectionLine12 = "section: 2. Method Overview · 第 2 页";
+  const oldFormat12 = `<reading_context>\npath: ${join(LIBRARY_DIR, "sample-paper.pdf")}\npage: 2\npageCount: 3\n</reading_context>\n\n${T12}`;
+  const withoutSection12 = prompt12.message.replace(`${sectionLine12}\n`, "");
+  record(
+    "r12-section-context",
+    {
+      phase: "with-section",
+      message: prompt12.message,
+      sectionLine: sectionLine12,
+      withoutSectionEqualsOld: withoutSection12 === oldFormat12,
+      selectedTextInPayload: prompt12.message.includes("selectedText:"),
+      notesInPayload: countOccurrences(prompt12.message, "reader_notes:"),
+      displayText: prompt12.displayText,
+    },
+    [
+      ...(prompt12.message.includes(sectionLine12) ? [] : [`载荷缺少 section 行：${prompt12.message}`]),
+      ...(prompt12.message.indexOf("pageCount: 3") < prompt12.message.indexOf("section: ") &&
+      prompt12.message.indexOf("section: ") < prompt12.message.indexOf("</reading_context>")
+        ? []
+        : ["section 行位置异常"]),
+      ...(withoutSection12 === oldFormat12
+        ? []
+        : [`删掉 section 行后应与旧格式逐字节相等：${JSON.stringify({ actual: withoutSection12, expected: oldFormat12 })}`]),
+      ...(prompt12.displayText === T12 ? [] : [`气泡文案应逐字等于输入：${prompt12.displayText}`]),
+      ...(prompt12.message.includes("selectedText:") === false ? [] : ["无选区时不得输出 selectedText:"]),
+      ...(countOccurrences(prompt12.message, "reader_notes:") === 0 ? [] : ["无选择集时不得输出 reader_notes:"]),
+    ],
+  );
+
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await settleEmptyOutline();
+  await clearSendCalls();
+  await typeAndSend(T13);
+  await waitSendCalls(1);
+  const prompt13 = await lastSend();
+  const exactFormat13 = `<reading_context>\npath: ${join(LIBRARY_DIR, "archive", "older-paper.pdf")}\npage: 1\npageCount: 2\n</reading_context>\n\n${T13}`;
+  record(
+    "r12-section-context",
+    {
+      phase: "without-outline",
+      message: prompt13.message,
+      exact: prompt13.message === exactFormat13,
+      selectedTextInPayload: prompt13.message.includes("selectedText:"),
+      notesInPayload: countOccurrences(prompt13.message, "reader_notes:"),
+    },
+    [
+      ...(prompt13.message === exactFormat13
+        ? []
+        : [`不可解析时应逐字节等于旧格式：${JSON.stringify({ actual: prompt13.message, expected: exactFormat13 })}`]),
+      ...(prompt13.message.includes("section:") === false ? [] : [`无 outline 时不得输出 section 行：${prompt13.message}`]),
+      ...(prompt13.message.includes("selectedText:") === false ? [] : ["无选区时不得输出 selectedText:"]),
+      ...(countOccurrences(prompt13.message, "reader_notes:") === 0 ? [] : ["无选择集时不得输出 reader_notes:"]),
     ],
   );
   await restoreStandardSeed();
