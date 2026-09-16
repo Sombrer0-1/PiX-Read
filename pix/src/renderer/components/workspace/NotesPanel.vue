@@ -27,6 +27,12 @@ const COLLAPSED_TEXT_LENGTH = 180;
 /** 删除待确认与瞬时提示的复位窗口。 */
 const DELETE_CONFIRM_MS = 3000;
 const NOTICE_MS = 4000;
+/** 定位退化文案：只描述「筛选结果里没有这一页」，loading 在等待窗口内被吸收。 */
+const ANCHOR_MISS_MESSAGE = "本页笔记不在当前筛选结果中";
+/** 定位等待上限：面板 loading 窗口必须被吸收，超时才退化。 */
+const LOCATE_WAIT_MS = 3000;
+/** 定位成功后目标行的瞬时高亮时长。 */
+const ANCHOR_HIGHLIGHT_MS = 2000;
 /** 复制按钮的「已复制」反馈窗口（与 ChatPanel 同值，不抽公共模块）。 */
 const COPY_FEEDBACK_MS = 1200;
 
@@ -73,6 +79,10 @@ const restoring = ref(false);
 const refreshing = ref(false);
 const copiedNoteId = ref<string | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
+/** 面板根节点：目标行查找的起点（不缓存行引用，每次定位重查）。 */
+const panelEl = ref<HTMLElement | null>(null);
+/** 瞬时高亮的目标行 id：与行数据同源（列表重渲染后仍有效）。 */
+const anchoredNoteId = ref<string | null>(null);
 /** 逃生口成功后的备份路径：「在文件夹中显示」所指；任何新提示先清空，不会指向上一份备份。 */
 const lastBackupPath = ref("");
 
@@ -80,6 +90,8 @@ let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 let undoRowTimer: ReturnType<typeof setTimeout> | null = null;
 let copyTimer: ReturnType<typeof setTimeout> | null = null;
+let anchorTimer: ReturnType<typeof setTimeout> | null = null;
+let locateWaitId: number | null = null;
 
 /** 两个「追问」入口的禁用与 title 判据（R8 设计档 §1.4）：可用 ⇔ 本次会注入 reader_notes。 */
 const askDisabledTitle = computed(() => {
@@ -445,12 +457,121 @@ function onGroupOpen(group: NoteGroup): void {
   emit("open-note-doc", group.docPath);
 }
 
+/** 与 R11 搜索的 scrollToRange 同款：系统偏好减少动效时用瞬时滚动。 */
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+/**
+ * 目标行（判定只看 DOM 顺序）：当前文档组（含「当前文档」chip）内页徽标逐字 `第 {N} 页` 的第一行。
+ * 行序不参与判定；组内行与 store 组内 notes 同序，故下标可直接取回 note.id（模板类绑定用）。
+ */
+function targetRow(): { row: HTMLElement; id: string } | null {
+  const list = panelEl.value?.querySelector<HTMLElement>(".notes-list") ?? null;
+  if (!list) return null;
+  const groupEls = Array.from(list.querySelectorAll<HTMLElement>(".notes-group"));
+  const groupIndex = groupEls.findIndex((el) => !!el.querySelector(".notes-group-head .v-chip"));
+  if (groupIndex < 0) return null;
+  const group = notesStore.groups[groupIndex];
+  if (!group) return null;
+  const want = `第 ${notesStore.pageFocusPage} 页`;
+  const rows = Array.from(groupEls[groupIndex].querySelectorAll<HTMLElement>(".note-row"));
+  const rowIndex = rows.findIndex((row) => row.querySelector(".note-page-badge")?.textContent?.trim() === want);
+  const note = rowIndex >= 0 ? group.notes[rowIndex] : undefined;
+  if (!note) return null;
+  return { row: rows[rowIndex], id: note.id };
+}
+
+/** 新一次定位替换目标行：先撤上一行的类与定时器。 */
+function clearAnchorHighlight(): void {
+  if (anchorTimer) {
+    clearTimeout(anchorTimer);
+    anchorTimer = null;
+  }
+  anchoredNoteId.value = null;
+}
+
+/** 成功：滚动到目标行（不被 sticky 头部遮挡）+ 起瞬时高亮。 */
+function applyAnchor(hit: { row: HTMLElement; id: string }): void {
+  clearAnchorHighlight();
+  hit.row.scrollIntoView({ block: "center", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+  anchoredNoteId.value = hit.id;
+  anchorTimer = setTimeout(() => {
+    anchorTimer = null;
+    anchoredNoteId.value = null;
+  }, ANCHOR_HIGHLIGHT_MS);
+}
+
+/** 退化：不滚动、不加类，只复用既有错误提示容器（4s 自动消失）。 */
+function degradeAnchor(): void {
+  setNotice("error", ANCHOR_MISS_MESSAGE);
+}
+
+function cancelLocateWait(): void {
+  if (locateWaitId !== null) {
+    cancelAnimationFrame(locateWaitId);
+    locateWaitId = null;
+  }
+}
+
+/**
+ * 有界等待定位（令牌 = 本次页定位请求值）：按帧轮询到「status === 'ready' 且目标行入 DOM」即成功；
+ * 等待期内令牌再变（新一次定位）或组件卸载即作废（丢弃：不滚动、不加类、不提示）；
+ * 退化两态：error（立即）与 ready 后连续 2 帧仍无目标行（不空等满 3s）；上限到期同样退化。
+ */
+function locatePageNote(token: number): void {
+  const deadline = performance.now() + LOCATE_WAIT_MS;
+  let readyFrames = 0;
+  const poll = () => {
+    locateWaitId = null;
+    if (token !== notesStore.pageFocusToken) return;
+    if (notesStore.status === "error") {
+      degradeAnchor();
+      return;
+    }
+    if (notesStore.status === "ready") {
+      const hit = targetRow();
+      if (hit) {
+        applyAnchor(hit);
+        return;
+      }
+      // 只在 ready 之后开始计数：loading 与 ready 的边界不算退化
+      readyFrames += 1;
+      if (readyFrames >= 2) {
+        degradeAnchor();
+        return;
+      }
+    }
+    if (performance.now() >= deadline) {
+      degradeAnchor();
+      return;
+    }
+    locateWaitId = requestAnimationFrame(poll);
+  };
+  locateWaitId = requestAnimationFrame(poll);
+}
+
+// 页标记定位：复位 0 不构成请求；新一次定位先撤旧等待（作废语义）。
+watch(
+  () => notesStore.pageFocusToken,
+  (token, previous) => {
+    if (token <= 0 || token <= previous) return;
+    cancelLocateWait();
+    locatePageNote(token);
+  },
+);
+
 onMounted(() => {
   window.addEventListener("focus", onWindowFocus);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("focus", onWindowFocus);
+  cancelLocateWait();
+  if (anchorTimer) {
+    clearTimeout(anchorTimer);
+    anchorTimer = null;
+  }
   if (noticeTimer) {
     clearTimeout(noticeTimer);
     noticeTimer = null;
@@ -469,7 +590,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="notes-panel">
+  <div ref="panelEl" class="notes-panel">
     <div class="notes-header">
       <div class="notes-header-top">
         <span class="notes-count">{{ countLabel }}</span>
@@ -694,7 +815,11 @@ onBeforeUnmount(() => {
           v-for="note in group.notes"
           :key="note.id"
           class="note-row"
-          :class="{ confirming: confirmingDeleteId === note.id, selected: notesStore.isNoteSelected(note.id) }"
+          :class="{
+            confirming: confirmingDeleteId === note.id,
+            selected: notesStore.isNoteSelected(note.id),
+            'is-anchored': anchoredNoteId === note.id,
+          }"
           @click="emit('open-note', note)"
         >
           <!-- 点击落点唯一：切换只挂在包裹元素上，复选框本体只挂受控属性（本体再挂 toggle 会双触发） -->
@@ -1373,6 +1498,12 @@ onBeforeUnmount(() => {
 .note-row.confirming {
   border-color: var(--pix-error-light, #f1d9d6);
   background: var(--pix-error-bg, #fff4f2);
+}
+
+/* 定位命中行的瞬时态（2s 后移除）；只换边框与底色，不改任何几何 */
+.note-row.is-anchored {
+  border-color: var(--pix-accent, #31424f);
+  background: var(--pix-bg-hover, #eef2f6);
 }
 
 .note-head {

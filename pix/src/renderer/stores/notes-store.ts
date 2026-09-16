@@ -120,6 +120,10 @@ export const useNotesStore = defineStore("notes", () => {
   const chapterFilter = ref<{ title: string; label: string; start: number; end: number } | null>(null);
   /** 一次性聚焦请求信号：单调递增（focusChapter 每次 +1），resetNotes 归 0；复位不构成聚焦请求。 */
   const chapterFocusToken = ref(0);
+  /** 页标记定位的目标页号（一次性载荷；与 chapterFocusToken 同纪律：复位不清不构成定位请求）。 */
+  const pageFocusPage = ref<number | null>(null);
+  /** 一次性页定位请求信号：单调递增（每次点击页标记 +1），resetNotes 归 0。 */
+  const pageFocusToken = ref(0);
 
   /**
    * 选择集只存 id，整组替换式更新（不做就地 add/delete）；允许含失效 id，
@@ -416,6 +420,8 @@ export const useNotesStore = defineStore("notes", () => {
     currentDocOnly.value = false;
     chapterFilter.value = null;
     chapterFocusToken.value = 0;
+    pageFocusPage.value = null;
+    pageFocusToken.value = 0;
     searchQuery.value = "";
     sortMode.value = "page";
     pendingUndo.value = null;
@@ -455,6 +461,19 @@ export const useNotesStore = defineStore("notes", () => {
   /** 清除只把过滤置 null：不改标签、不改阅读位置、不改选择集、不写盘、不发 IPC。 */
   function clearChapterFilter(): void {
     chapterFilter.value = null;
+  }
+
+  /**
+   * 页标记点击入口：一次性定位（滚动 + 瞬时高亮），不新增任何持久过滤维度。
+   * 唯一被改动的视图状态 = 既有章节过滤被单向清除（直接寻址优先于范围限制）；
+   * 搜索 / 排序 / 仅看当前文档 / 选择集 / 阅读位置 / 缩放零变化。
+   * currentDocKey === null（资料库外文件）时 no-op：此时页标记本就不渲染。
+   */
+  function focusPageNotes(page: number): void {
+    if (currentDocKey.value === null) return;
+    chapterFilter.value = null;
+    pageFocusPage.value = page;
+    pageFocusToken.value += 1;
   }
 
   function isNoteSelected(id: string): boolean {
@@ -500,6 +519,8 @@ export const useNotesStore = defineStore("notes", () => {
     visibleCount,
     chapterFilter,
     chapterFocusToken,
+    pageFocusPage,
+    pageFocusToken,
     selectedNotes,
     selectedCount,
     selectionFull,
@@ -527,6 +548,7 @@ export const useNotesStore = defineStore("notes", () => {
     clearPendingUndo,
     focusChapter,
     clearChapterFilter,
+    focusPageNotes,
     isNoteSelected,
     toggleNoteSelected,
     replaceSelectionWith,

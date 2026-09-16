@@ -110,6 +110,11 @@ const SEL = {
   staleRefresh: ".notes-stale .stale-refresh",
   groupName: ".notes-group-head .group-name",
   centerDocLabel: ".center-pill .pill-label",
+  // R16 新增 4 项（设计档 §5.3.1）
+  pageNotes: ".page-notes",
+  noteRowAnchored: ".note-row.is-anchored",
+  pageBoxOne: '.pdf-page[data-page="1"]',
+  notePageBadge: ".note-page-badge",
 };
 
 // ---------------------------------------------------------------------------
@@ -9247,6 +9252,986 @@ async function runReaderStateScenarios(win, log) {
       ...(lateListDelta === 0 ? [] : [`agent_start 不得再触发工作区同步（listSessions 调用 +${lateListDelta}）`]),
     ],
   );
+
+  // ===========================================================================
+  // R16 收口（N91–N95）：页标记 / 定位 / 原文锚点 / 叠加与降级。
+  // 新增场景一律追加在末尾，每个场景以自己的 restoreStandardSeed() 收尾；
+  // 既有场景 / label / 截图名 / helper 零改动；stub 面零改动。
+  // ===========================================================================
+
+  /** r16-2 专用夹具：标准 4 条 + 页 2 的 9 条填充摘录 + 页 3 的 1 条摘录 = 14 行（页 2 = 11 行）。 */
+  const seedR16Focus = () => {
+    const now = Date.now();
+    const fillers = Array.from({ length: 9 }, (_, index) => ({
+      id: `n-r16-f${index + 1}`,
+      kind: "excerpt",
+      docPath: "sample-paper.pdf",
+      page: 2,
+      text: `R16 填充摘录 ${index + 1}：页 2 的列表密度样本。`,
+      comment: "",
+      createdAt: now - (9 - index) * MINUTE,
+      updatedAt: now - (9 - index) * MINUTE,
+    }));
+    return [
+      ...seedNotes(),
+      ...fillers,
+      {
+        id: "n-r16-p3",
+        kind: "excerpt",
+        docPath: "sample-paper.pdf",
+        page: 3,
+        text: "Sparse attention keeps recall at one third of the dense budget,",
+        comment: "",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ];
+  };
+
+  /** 页 1 摘录的手写期望串（手写，不由被测函数生成）；比较一律先去掉全部空白。 */
+  const R16_ANCHOR_TEXT = "We study retrieval over long documents where the attention budget is the binding constraint.";
+  const stripWs = (value) => String(value ?? "").replace(/\s+/g, "");
+
+  /**
+   * 页标记现场（一次 js 读完）：页矩形 / 标记文本与 title / 子元素类名序列 / 文字层 span 计数与矩形 /
+   * 既有控件矩形（搜索面板在场时读，否则 null）/ 标记与 span、与控件的相交判定。
+   */
+  const pageNotesProbe = (page) => js(`(() => {
+    const box = (el) => { const b = el.getBoundingClientRect(); return { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) }; };
+    const raw = (el) => el.getBoundingClientRect();
+    const hit = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const pageEl = document.querySelector('.pdf-page[data-page="${page}"]');
+    if (!pageEl) return null;
+    const marker = pageEl.querySelector(".page-notes");
+    const layer = pageEl.querySelector(".textLayer");
+    const spans = layer ? Array.from(layer.querySelectorAll("span")) : [];
+    const controls = {};
+    const controlRects = {};
+    for (const selector of [".pdf-toolbar", ".pdf-page-indicator", ".reader-section", ".pdf-capture-fab", ".pdf-search-panel"]) {
+      const el = document.querySelector(selector);
+      controls[selector] = el ? box(el) : null;
+      controlRects[selector] = el ? raw(el) : null;
+    }
+    const markerRect = marker ? raw(marker) : null;
+    const markerStyle = marker ? getComputedStyle(marker) : null;
+    const canvas = pageEl.querySelector("canvas");
+    return {
+      page: ${page},
+      pageBox: box(pageEl),
+      pageCount: document.querySelectorAll(".pdf-page").length,
+      exists: !!marker,
+      text: text(marker),
+      title: marker ? marker.getAttribute("title") : null,
+      rect: marker ? box(marker) : null,
+      position: markerStyle ? markerStyle.position : null,
+      zIndex: markerStyle ? markerStyle.zIndex : null,
+      children: Array.from(pageEl.children).map((el) => String(el.className).split(" ")[0]),
+      spans: { count: spans.length, boxes: spans.map((el) => box(el)) },
+      markerVsSpans: markerRect ? spans.some((el) => hit(markerRect, raw(el))) : null,
+      markerVsControls: markerRect
+        ? Object.keys(controlRects).filter((key) => controlRects[key] !== null && hit(markerRect, controlRects[key]))
+        : [],
+      canvas: canvas ? { styleWidth: canvas.style.width, scaleFactor: pageEl.style.getPropertyValue("--scale-factor") } : null,
+      controls,
+    };
+  })()`);
+
+  /** 锚点高亮现场：三个注册表的存在性 / size / 区间文本、区间所属页、当前页读数、提示与 [pdf-viewer] 日志行数。 */
+  const anchorProbe = async () => {
+    const probe = await js(`(() => {
+      const read = (name) => {
+        const highlight = CSS.highlights.get(name);
+        return highlight ? { size: highlight.size, texts: Array.from(highlight, (range) => range.toString()) } : null;
+      };
+      const pageOf = (range) => {
+        let node = range.startContainer;
+        while (node && node.nodeType !== 1) node = node.parentNode;
+        const el = node && node.closest ? node.closest(".pdf-page") : null;
+        return el ? el.getAttribute("data-page") : null;
+      };
+      const anchorRanges = Array.from(CSS.highlights.get("pix-note-anchor") || []);
+      const pageEl = document.querySelector('.pdf-page[data-page="1"]');
+      const canvas = pageEl ? pageEl.querySelector("canvas") : null;
+      const notice = document.querySelector(".notes-notice");
+      const noticeText = notice ? notice.querySelector(".notice-text") : null;
+      const label = document.querySelector(".page-label");
+      return {
+        registry: { anchor: read("pix-note-anchor"), search: read("pix-search"), current: read("pix-search-current") },
+        anchorPage: anchorRanges.length ? pageOf(anchorRanges[0]) : null,
+        pageLabel: label ? label.textContent.replace(/\\s+/g, " ").trim() : null,
+        pageOneSpans: pageEl ? pageEl.querySelectorAll(".textLayer span").length : null,
+        pageOneMarks: pageEl ? pageEl.querySelectorAll("mark").length : null,
+        scaleFactor: pageEl ? pageEl.style.getPropertyValue("--scale-factor") : null,
+        canvasWidth: canvas ? canvas.style.width : null,
+        notice: notice
+          ? { isError: notice.classList.contains("is-error"), text: noticeText ? noticeText.textContent.replace(/\\s+/g, " ").trim() : null }
+          : null,
+      };
+    })()`);
+    return { ...probe, viewerLogs: rendererLogs.filter((line) => line.includes("[pdf-viewer]")).length };
+  };
+
+  /** 面板行现场：面板/头部矩形与滚动位置、当前文档组内目标行（含瞬时态与计算样式）、四维视图状态。 */
+  const panelRowProbe = (page) => js(`(() => {
+    const box = (el) => { const b = el.getBoundingClientRect(); return { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), top: Math.round(b.top), bottom: Math.round(b.bottom) }; };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const panel = document.querySelector(".notes-panel");
+    if (!panel) return null;
+    const header = document.querySelector(".notes-header");
+    const list = document.querySelector(".notes-list");
+    const groups = list ? Array.from(list.querySelectorAll(".notes-group")) : [];
+    const group = groups.find((el) => !!el.querySelector(".notes-group-head .v-chip")) || null;
+    const rows = group ? Array.from(group.querySelectorAll(".note-row")) : [];
+    const want = "第 ${page} 页";
+    const row = rows.find((el) => text(el.querySelector(".note-page-badge")) === want) || null;
+    const style = row ? getComputedStyle(row) : null;
+    const input = document.querySelector(".notes-search-input");
+    const sort = document.querySelector(".notes-sort-btn");
+    const filter = document.querySelector(".notes-filter input");
+    return {
+      panel: box(panel),
+      header: header ? box(header) : null,
+      scrollTop: panel.scrollTop,
+      listPresent: !!list,
+      rowCount: document.querySelectorAll(".note-row").length,
+      groupRows: rows.length,
+      badges: rows.map((el) => text(el.querySelector(".note-page-badge"))),
+      target: row
+        ? {
+            box: box(row),
+            anchored: row.classList.contains("is-anchored"),
+            borderColor: style.borderTopColor,
+            backgroundColor: style.backgroundColor,
+          }
+        : null,
+      search: input ? input.value : null,
+      sort: text(sort),
+      currentDocOnly: filter ? filter.checked : null,
+      selectionBar: !!document.querySelector(".notes-selection-bar"),
+      chapterFilter: !!document.querySelector(".notes-chapter-filter"),
+    };
+  })()`);
+
+  /** 文字层结构快照：childNodes 的 nodeName 序列与各节点文本（两次快照逐字比对零结构改动）。 */
+  const textLayerSnapshot = (page) => js(`(() => {
+    const layer = document.querySelector('.pdf-page[data-page="${page}"] .textLayer');
+    if (!layer) return null;
+    return Array.from(layer.childNodes).map((node) => ({ type: node.nodeName, text: node.nodeValue || node.textContent || "" }));
+  })()`);
+
+  /** 清空该页文字层子节点（模拟扫描件无文字层；唯一写 DOM 的 helper）。 */
+  const emptyTextLayer = (page) => js(`(() => {
+    const layer = document.querySelector('.pdf-page[data-page="${page}"] .textLayer');
+    if (!layer) throw new Error("text layer not found");
+    layer.replaceChildren();
+    return true;
+  })()`);
+
+  /** 页 1 首个 span 的部分选区（Range + Selection + selectionchange），返回选中的字符串。 */
+  const selectionOnPageOne = async () => {
+    await waitFor("页 1 文字层（选区）", `document.querySelector('.pdf-page[data-page="1"] .textLayer span')`);
+    const selected = await js(`(() => {
+      const span = document.querySelector('.pdf-page[data-page="1"] .textLayer span');
+      const node = span.firstChild;
+      if (!node) throw new Error("first span has no text node");
+      const range = document.createRange();
+      range.setStart(node, 0);
+      range.setEnd(node, Math.min(12, node.nodeValue.length));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+      return selection.toString();
+    })()`);
+    await waitFor("摘录浮层（选择链路）", `document.querySelector(".quick-ask") && document.querySelector(".quick-ask").offsetParent !== null`);
+    return selected;
+  };
+
+  /** PDF 搜索面板写值：原生 setter + input 事件（面板自身 300ms debounce 后全文档扫描）。 */
+  const pdfSearchSet = (value) => js(`(() => {
+    const input = document.querySelector(".pdf-search-panel .search-input");
+    if (!input) throw new Error("pdf search input not found");
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(input, ${JSON.stringify(value)});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+
+  /** 搜索面板「下一处」（相位保证已命中：totalHits > 0 时按钮才可用）。 */
+  const pdfSearchNext = () => js(`(() => {
+    const btn = document.querySelector('.pdf-search-panel button[title="下一处"]');
+    if (!btn) throw new Error("pdf search next not found");
+    btn.click();
+    return true;
+  })()`);
+
+  /** 搜索面板「关闭搜索」（面板卸载 ⇒ 搜索侧自清自己的两个注册表）。 */
+  const pdfSearchClose = () => js(`(() => {
+    const btn = document.querySelector('.pdf-search-panel button[title="关闭搜索"]');
+    if (!btn) throw new Error("pdf search close not found");
+    btn.click();
+    return true;
+  })()`);
+
+  /** 页码指示器现场：页码文本 + 上/下一页按钮的 disabled（性能采样的防空用）。 */
+  const pageLabelProbe = () => js(`(() => {
+    const label = document.querySelector(".page-label");
+    const prev = document.querySelector('.pdf-page-indicator button[title="上一页"]');
+    const next = document.querySelector('.pdf-page-indicator button[title="下一页"]');
+    return {
+      label: label ? label.textContent.replace(/\\s+/g, " ").trim() : null,
+      prevDisabled: prev ? prev.disabled : null,
+      nextDisabled: next ? next.disabled : null,
+    };
+  })()`);
+
+  // r15-f16 收尾停在首页，而 enterNotesProbe 入口序列的第一步是点工作区内的「返回首页」
+  // ⇒ 先回到工作区（首页没有该按钮，直接调用会抛错）。
+  if (!(await has(SEL.workspace))) {
+    await enterWorkspace(LIBRARY_NAME);
+  }
+
+  // --- r16-1 页标记：文案 / 位次 / 几何 / 实时跟随 / 跨文档（组 r16-page-badge）-------
+  log("r16-1 页标记：页 1 / 页 2 各一枚、页 3 零占位、不压正文与控件");
+  await enterNotesProbe();
+  const hashR16a = notesHash();
+  await waitFor("页标记 2 枚", `document.querySelectorAll(${JSON.stringify(SEL.pageNotes)}).length === 2`);
+  // 文字层就绪防空：几何与 span 计数判据必须有真实片段可读
+  await waitFor(
+    "页 1 / 页 2 文字层就绪",
+    `document.querySelector('.pdf-page[data-page="1"] .textLayer span') && document.querySelector('.pdf-page[data-page="2"] .textLayer span')`,
+  );
+  const p16a1 = await pageNotesProbe(1);
+  const p16a2 = await pageNotesProbe(2);
+  const p16a3 = await pageNotesProbe(3);
+  await capturePage(win, "r16-1-page-badges.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  await clickEl(SEL.captureFabBtn);
+  await waitFor("框选层", `document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  const captureZ16a = await js(`(() => {
+    const layer = document.querySelector(${JSON.stringify(SEL.captureLayer)});
+    return layer ? getComputedStyle(layer).zIndex : null;
+  })()`);
+  const markerUnderCapture16a = await countOf(SEL.pageNotes);
+  await pressBodyEsc();
+  await waitFor("框选层退出", `!document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  record(
+    "r16-page-badge",
+    {
+      phase: "badges",
+      pages: { p1: p16a1, p2: p16a2, p3: p16a3 },
+      controls: p16a1.controls,
+      spans: { p1: p16a1.spans.count, p2: p16a2.spans.count, p3: p16a3.spans.count },
+      overlayIndex: p16a1.children.indexOf("pdf-overlay"),
+      zIndex: { p1: p16a1.zIndex, p2: p16a2.zIndex, capture: captureZ16a, markerUnderCapture: markerUnderCapture16a },
+    },
+    [
+      ...(p16a1.text === "本页 1 条" && p16a1.title === "本页 1 条笔记（摘录 1 · AI 结论 0）；点击定位到笔记面板"
+        ? []
+        : [`页 1 标记异常：${JSON.stringify({ text: p16a1.text, title: p16a1.title })}`]),
+      ...(p16a2.text === "本页 2 条" && p16a2.title === "本页 2 条笔记（摘录 1 · AI 结论 1）；点击定位到笔记面板"
+        ? []
+        : [`页 2 标记异常：${JSON.stringify({ text: p16a2.text, title: p16a2.title })}`]),
+      ...(p16a3.exists === false && p16a1.pageCount === 3
+        ? []
+        : [`页 3 必须零占位（页数防空 3）：${JSON.stringify({ exists: p16a3.exists, pageCount: p16a1.pageCount })}`]),
+      ...(JSON.stringify(p16a1.children) === JSON.stringify(["", "textLayer", "pdf-overlay", "page-notes"]) &&
+      JSON.stringify(p16a2.children) === JSON.stringify(["", "textLayer", "pdf-overlay", "page-notes"]) &&
+      JSON.stringify(p16a3.children) === JSON.stringify(["", "textLayer", "pdf-overlay"])
+        ? []
+        : [`子元素位次异常：${JSON.stringify({ p1: p16a1.children, p3: p16a3.children })}`]),
+      ...(p16a1.position === "absolute" && p16a1.zIndex === "3" && p16a2.zIndex === "3"
+        ? []
+        : [`标记定位/层级异常：${JSON.stringify({ position: p16a1.position, p1: p16a1.zIndex, p2: p16a2.zIndex })}`]),
+      ...(p16a1.pageBox.w === 595 && p16a1.pageBox.h === 842 && p16a2.pageBox.w === 595 && p16a2.pageBox.h === 842
+        ? []
+        : [`页盒几何漂移：${JSON.stringify({ p1: p16a1.pageBox, p2: p16a2.pageBox })}`]),
+      ...(p16a1.spans.count > 0 && p16a2.spans.count > 0 && p16a1.markerVsSpans === false && p16a2.markerVsSpans === false
+        ? []
+        : [`标记与正文相交（夹具相位内禁止）：${JSON.stringify({ p1: [p16a1.spans.count, p16a1.markerVsSpans], p2: [p16a2.spans.count, p16a2.markerVsSpans] })}`]),
+      ...(p16a1.markerVsControls.length === 0 && p16a2.markerVsControls.length === 0 && p16a1.controls[".pdf-search-panel"] === null
+        ? []
+        : [`标记与既有控件相交 / 搜索面板应不在场：${JSON.stringify({ p1: p16a1.markerVsControls, p2: p16a2.markerVsControls, panel: p16a1.controls[".pdf-search-panel"] })}`]),
+      ...(p16a1.spans.count === 6 && p16a1.canvas.styleWidth === "595px"
+        ? []
+        : [`文字层 / canvas 读数漂移：${JSON.stringify({ spans: p16a1.spans.count, canvas: p16a1.canvas })}`]),
+      ...(p16a1.children[2] === "pdf-overlay" ? [] : ["pdf-overlay 不再是第 3 个子元素"]),
+      ...(captureZ16a === "5" && markerUnderCapture16a === 2
+        ? []
+        : [`框选层应在标记之上且标记仍在：${JSON.stringify({ captureZ16a, markerUnderCapture16a })}`]),
+    ],
+  );
+
+  log("r16-1 页标记实时跟随：删除 / 撤销 / 过滤 / 滚动 / 缩放");
+  const rowsBefore16a = await countOf(SEL.noteRow);
+  await deleteRowByText("Table 2 repo");
+  await waitFor(
+    "页 2 标记变 1 条",
+    `(() => { const el = document.querySelector('.pdf-page[data-page="2"] .page-notes'); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === "本页 1 条"; })()`,
+  );
+  const afterDelete16a = await pageNotesProbe(2);
+  const rowsAfterDelete16a = await countOf(SEL.noteRow);
+  await clickUndo();
+  await waitFor(
+    "页 2 标记回 2 条",
+    `(() => { const el = document.querySelector('.pdf-page[data-page="2"] .page-notes'); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === "本页 2 条"; })()`,
+  );
+  const afterUndo16a = await pageNotesProbe(2);
+  const rowsAfterUndo16a = await countOf(SEL.noteRow);
+  const countBeforeFilter16a = await textOf(".notes-count");
+  const groupCountBeforeFilter16a = await textOf(".notes-group-head .group-count");
+  await setSearch("Reproducibility");
+  await waitFor("搜索过滤生效（1 行）", `document.querySelectorAll(".note-row").length === 1`);
+  const filterP16a1 = await pageNotesProbe(1);
+  const filterP16a2 = await pageNotesProbe(2);
+  const countUnderFilter16a = await textOf(".notes-count");
+  const groupCountUnderFilter16a = await textOf(".notes-group-head .group-count");
+  await setSearch("");
+  await waitFor("搜索清空（4 行）", `document.querySelectorAll(".note-row").length === 4`);
+  await clickNext();
+  await waitPage(2, 3);
+  await clickPrev();
+  await waitPage(1, 3);
+  const scrollStable16a = { p1: await pageNotesProbe(1), p2: await pageNotesProbe(2), label: await pageLabel() };
+  await clickEl(SEL.zoomInBtn);
+  await clickEl(SEL.zoomInBtn);
+  await waitFor("缩放 120%", `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "120%"`);
+  await waitFor(
+    "页 1 / 页 2 文字层重渲染",
+    `document.querySelector('.pdf-page[data-page="1"] .textLayer span') && document.querySelector('.pdf-page[data-page="2"] .textLayer span')`,
+  );
+  const zoomStable16a = { p1: await pageNotesProbe(1), p2: await pageNotesProbe(2), zoom: await zoomLabel() };
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await waitFor("缩放回 100%", `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "100%"`);
+  record(
+    "r16-page-badge",
+    {
+      phase: "live",
+      afterDelete: { text: afterDelete16a.text, title: afterDelete16a.title },
+      afterUndo: { text: afterUndo16a.text, title: afterUndo16a.title },
+      rows: [rowsBefore16a, rowsAfterDelete16a, rowsAfterUndo16a],
+      filtered: { countBefore: countBeforeFilter16a, countUnder: countUnderFilter16a, groupBefore: groupCountBeforeFilter16a, groupUnder: groupCountUnderFilter16a },
+      badgeUnderFilter: { p1: { text: filterP16a1.text, title: filterP16a1.title }, p2: { text: filterP16a2.text, title: filterP16a2.title } },
+      scrollStable: scrollStable16a,
+      zoomStable: zoomStable16a,
+      hashSame: notesHash() === hashR16a,
+    },
+    [
+      ...(afterDelete16a.text === "本页 1 条" && afterDelete16a.title === "本页 1 条笔记（摘录 0 · AI 结论 1）；点击定位到笔记面板"
+        ? []
+        : [`删除后页 2 标记异常：${JSON.stringify({ text: afterDelete16a.text, title: afterDelete16a.title })}`]),
+      ...(afterUndo16a.text === "本页 2 条" && afterUndo16a.title === "本页 2 条笔记（摘录 1 · AI 结论 1）；点击定位到笔记面板"
+        ? []
+        : [`撤销后页 2 标记异常：${JSON.stringify({ text: afterUndo16a.text, title: afterUndo16a.title })}`]),
+      ...(rowsBefore16a === 4 && rowsAfterDelete16a === 3 && rowsAfterUndo16a === 4
+        ? []
+        : [`列表行数未真的变化（防空）：${JSON.stringify([rowsBefore16a, rowsAfterDelete16a, rowsAfterUndo16a])}`]),
+      ...(filterP16a1.text === "本页 1 条" && filterP16a1.title === p16a1.title && filterP16a2.text === "本页 2 条" && filterP16a2.title === p16a2.title
+        ? []
+        : [`过滤态下标记不得跟随过滤：${JSON.stringify({ p1: filterP16a1.text, p2: filterP16a2.text })}`]),
+      ...(countUnderFilter16a !== countBeforeFilter16a && groupCountUnderFilter16a !== groupCountBeforeFilter16a
+        ? []
+        : [`过滤未生效（防空）：${JSON.stringify({ countBefore: countBeforeFilter16a, countUnder: countUnderFilter16a, groupBefore: groupCountBeforeFilter16a, groupUnder: groupCountUnderFilter16a })}`]),
+      ...(scrollStable16a.p1.text === "本页 1 条" && scrollStable16a.p2.text === "本页 2 条" && (scrollStable16a.label || "").includes("第 1 / 3 页")
+        ? []
+        : [`滚动不得改变标记读数：${JSON.stringify({ p1: scrollStable16a.p1.text, p2: scrollStable16a.p2.text, label: scrollStable16a.label })}`]),
+      ...(zoomStable16a.zoom === "120%" &&
+      zoomStable16a.p1.text === "本页 1 条" &&
+      zoomStable16a.p2.text === "本页 2 条" &&
+      zoomStable16a.p1.markerVsSpans === false &&
+      zoomStable16a.p2.markerVsSpans === false &&
+      zoomStable16a.p1.spans.count > 0 &&
+      zoomStable16a.p2.spans.count > 0 &&
+      zoomStable16a.p1.markerVsControls.length === 0 &&
+      zoomStable16a.p2.markerVsControls.length === 0
+        ? []
+        : [`120% 下标记读数 / 几何异常：${JSON.stringify({ zoom: zoomStable16a.zoom, p1: zoomStable16a.p1.text, p2: zoomStable16a.p2.text, vsSpans: [zoomStable16a.p1.markerVsSpans, zoomStable16a.p2.markerVsSpans], vsControls: [zoomStable16a.p1.markerVsControls, zoomStable16a.p2.markerVsControls] })}`]),
+      ...(notesHash() === hashR16a ? [] : ["页标记链路不得改写 notes.json"]),
+    ],
+  );
+
+  log("r16-1 跨文档与越界页：不串页、不钳制、回切可恢复");
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  // 页码 pill 先于页盒落 DOM（setPageCount → measurePages 之间），几何 / 标记判据必须先等页盒
+  await waitFor("older-paper 页盒 2 页", `document.querySelectorAll(".pdf-page").length === 2`);
+  const otherNotesCount16a = await countOf(SEL.pageNotes);
+  const otherPageCount16a = await countOf(".pdf-page");
+  const otherFileNotes16a = readNotes();
+  await capturePage(win, "r16-1b-page-badges-other-doc.png");
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitFor(
+    "回切后页 1 标记恢复",
+    `(() => { const el = document.querySelector('.pdf-page[data-page="1"] .page-notes'); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === "本页 1 条"; })()`,
+  );
+  const restored16a = await pageNotesProbe(1);
+  record(
+    "r16-page-badge",
+    {
+      phase: "other-doc",
+      notesCount: otherNotesCount16a,
+      pageCount: otherPageCount16a,
+      outOfRangePage: (otherFileNotes16a.find((note) => note.id === "n-other-1") || {}).page ?? null,
+      restored: restored16a.text,
+    },
+    [
+      ...(otherNotesCount16a === 0 && otherPageCount16a === 2
+        ? []
+        : [`older-paper.pdf 不得出现标记（页数防空 2）：${JSON.stringify({ notesCount: otherNotesCount16a, pageCount: otherPageCount16a })}`]),
+      ...(otherFileNotes16a.some((note) => note.id === "n-other-1" && note.page === 7)
+        ? []
+        : [`越界页号不得被钳制/改写：${JSON.stringify(otherFileNotes16a.find((note) => note.id === "n-other-1"))}`]),
+      ...(restored16a.text === "本页 1 条" ? [] : [`回切后标记未恢复：${restored16a.text}`]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // --- r16-2 页标记 → 笔记面板：定位 / 折叠 / 过滤退化（组 r16-page-anchor）-----------
+  log("r16-2 定位：面板打开时滚动到目标行 + 2s 瞬时高亮");
+  await enterNotesProbe(seedR16Focus(), 14);
+  // 页盒就绪防空：页标记 / 页盒读数都不允许在 measurePages 尚未完成时采集
+  await waitFor("sample-paper 页盒 3 页", `document.querySelectorAll(".pdf-page").length === 3`);
+  const hashR16b = notesHash();
+  const addBase16b = (await notesAddCalls()).count;
+  const reportBase16b = (await notesReportCalls()).count;
+  const before16b = await panelRowProbe(3);
+  await clickNext();
+  await clickNext();
+  await waitPage(3, 3);
+  await clickEl('.pdf-page[data-page="3"] .page-notes');
+  await waitFor(
+    "目标行完整可见",
+    `(() => {
+      const panel = document.querySelector(".notes-panel");
+      const header = document.querySelector(".notes-header");
+      const list = document.querySelector(".notes-list");
+      if (!panel || !header || !list) return false;
+      const group = Array.from(list.querySelectorAll(".notes-group")).find((el) => !!el.querySelector(".notes-group-head .v-chip"));
+      if (!group) return false;
+      const row = Array.from(group.querySelectorAll(".note-row")).find((el) => {
+        const badge = el.querySelector(".note-page-badge");
+        return !!badge && badge.textContent.replace(/\\s+/g, " ").trim() === "第 3 页";
+      });
+      if (!row) return false;
+      const box = row.getBoundingClientRect();
+      return box.top >= header.getBoundingClientRect().bottom - 1 && box.bottom <= panel.getBoundingClientRect().bottom + 1;
+    })()`,
+  );
+  const after16b = await panelRowProbe(3);
+  const anchoredCount16b = await countOf(SEL.noteRowAnchored);
+  const anchoredBadge16b = await js(`(() => {
+    const row = document.querySelector(${JSON.stringify(SEL.noteRowAnchored)});
+    const badge = row ? row.querySelector(${JSON.stringify(SEL.notePageBadge)}) : null;
+    return badge ? badge.textContent.replace(/\\s+/g, " ").trim() : null;
+  })()`);
+  const anchoredInCurrentGroup16b = await js(`(() => {
+    const row = document.querySelector(${JSON.stringify(SEL.noteRowAnchored)});
+    if (!row) return null;
+    const group = row.closest(".notes-group");
+    return !!group && !!group.querySelector(".notes-group-head .v-chip");
+  })()`);
+  const label16b = { page: await pageLabel(), zoom: await zoomLabel(), doc: await textOf(SEL.centerDocLabel) };
+  await capturePage(win, "r16-2-page-anchor.png", await rectOfSelector(SEL.layoutLeft, 2));
+  await sleep(2500);
+  const afterSleep16b = await panelRowProbe(3);
+  const anchoredAfterSleep16b = await countOf(SEL.noteRowAnchored);
+  const noticeAfterSleep16b = await notesNotice();
+  record(
+    "r16-page-anchor",
+    {
+      phase: "locate-panel-open",
+      before: before16b,
+      after: after16b,
+      anchored: { count: anchoredCount16b, badge: anchoredBadge16b, inCurrentGroup: anchoredInCurrentGroup16b },
+      view: { search: after16b.search, sort: after16b.sort, currentDocOnly: after16b.currentDocOnly, selectionBar: after16b.selectionBar, chapterFilterBefore: before16b.chapterFilter, chapterFilterAfter: after16b.chapterFilter },
+      label: label16b,
+      hashSame: notesHash() === hashR16b,
+      calls: { add: (await notesAddCalls()).count - addBase16b, report: (await notesReportCalls()).count - reportBase16b }, 
+      noticeAfter: noticeAfterSleep16b,
+      borderDuring: { color: after16b.target ? after16b.target.borderColor : null, background: after16b.target ? after16b.target.backgroundColor : null },
+      borderAfter: { color: afterSleep16b.target ? afterSleep16b.target.borderColor : null, background: afterSleep16b.target ? afterSleep16b.target.backgroundColor : null },
+      anchoredAfterSleep: anchoredAfterSleep16b,
+    },
+    [
+      ...(before16b && before16b.target && before16b.target.box.top > before16b.panel.bottom
+        ? []
+        : [`目标行初始应不可见（防空）：${JSON.stringify({ target: before16b && before16b.target ? before16b.target.box : null, panel: before16b ? before16b.panel : null })}`]),
+      ...(after16b && after16b.target && after16b.header && after16b.target.box.top >= after16b.header.bottom - 1 && after16b.target.box.bottom <= after16b.panel.bottom + 1
+        ? []
+        : [`目标行未被完整定位（不得被头部遮挡）：${JSON.stringify({ target: after16b && after16b.target ? after16b.target.box : null, header: after16b ? after16b.header : null, panel: after16b ? after16b.panel : null })}`]),
+      ...(anchoredCount16b === 1 && anchoredBadge16b === "第 3 页" && anchoredInCurrentGroup16b === true
+        ? []
+        : [`瞬时高亮应恰好命中当前文档组的第 3 页行：${JSON.stringify({ anchoredCount16b, anchoredBadge16b, anchoredInCurrentGroup16b })}`]),
+      ...(label16b.page === "第 3 / 3 页" && label16b.zoom === "100%" && label16b.doc === "sample-paper.pdf"
+        ? []
+        : [`阅读现场被改动（不得跳页 / 缩放 / 换文档）：${JSON.stringify(label16b)}`]),
+      ...(after16b.search === "" && after16b.sort === "排序：页码" && after16b.currentDocOnly === false && after16b.selectionBar === false && after16b.chapterFilter === false && before16b.chapterFilter === false
+        ? []
+        : [`四维视图状态变化：${JSON.stringify({ search: after16b.search, sort: after16b.sort, currentDocOnly: after16b.currentDocOnly, selectionBar: after16b.selectionBar, chapterFilter: after16b.chapterFilter })}`]),
+      ...(notesHash() === hashR16b && (await notesAddCalls()).count - addBase16b === 0 && (await notesReportCalls()).count - reportBase16b === 0
+        ? []
+        : ["定位不得写盘 / 发写 IPC"]),
+      ...(noticeAfterSleep16b === null ? [] : [`成功路径不得弹提示：${JSON.stringify(noticeAfterSleep16b)}`]),
+      ...(anchoredAfterSleep16b === 0 ? [] : [`瞬时高亮应在 2s 后移除：${anchoredAfterSleep16b}`]),
+      ...(after16b.target && afterSleep16b.target && after16b.target.borderColor !== afterSleep16b.target.borderColor && after16b.target.backgroundColor !== afterSleep16b.target.backgroundColor
+        ? []
+        : [`瞬时高亮的配色读数应变化：${JSON.stringify({ during: after16b.target, after: afterSleep16b.target })}`]),
+    ],
+  );
+
+  log("r16-2 定位：折叠 + 资料库标签下自动展开（穿过 loading 窗口）");
+  await backToLibraryTab();
+  await js(`(() => {
+    const btn = Array.from(document.querySelectorAll(".pill-icon-btn")).find((el) => el.getAttribute("title") === "折叠资料库");
+    if (!btn) throw new Error("collapse button not found");
+    btn.click();
+    return true;
+  })()`);
+  await waitFor("左栏折叠", `document.querySelector(${JSON.stringify(SEL.layoutLeft)}).offsetWidth === 0`);
+  const collapsed16b = await js(`document.querySelector(${JSON.stringify(SEL.layoutLeft)}).offsetWidth`);
+  const loadBase16b = await loadCalls();
+  await clickEl('.pdf-page[data-page="3"] .page-notes');
+  await waitNotesTab();
+  await waitFor("重新展开后目标行被定位", `document.querySelectorAll(${JSON.stringify(SEL.noteRowAnchored)}).length === 1`);
+  const tab16b = await js(`document.querySelector(".pill-tab.active").getAttribute("data-tab")`);
+  const expanded16b = await js(`document.querySelector(${JSON.stringify(SEL.layoutLeft)}).offsetWidth`);
+  const rowAfterLoading16b = await panelRowProbe(3);
+  const loadDelta16b = (await loadCalls()) - loadBase16b;
+  await capturePage(win, "r16-2b-page-anchor-tab-switch.png");
+  record(
+    "r16-page-anchor",
+    { phase: "locate-panel-closed", collapsedWidth: collapsed16b, tab: tab16b, expandedWidth: expanded16b, anchored: rowAfterLoading16b && rowAfterLoading16b.target ? rowAfterLoading16b.target.anchored : false, loadDelta: loadDelta16b, hashSame: notesHash() === hashR16b, rowAfterLoading: rowAfterLoading16b },
+    [
+      ...(collapsed16b === 0 ? [] : [`左栏应确实折叠（防空）：${collapsed16b}`]),
+      ...(tab16b === "notes" && expanded16b > 200 ? [] : [`应自动展开并停在笔记标签：${JSON.stringify({ tab16b, expanded16b })}`]),
+      ...(rowAfterLoading16b && rowAfterLoading16b.target && rowAfterLoading16b.target.anchored === true
+        ? []
+        : [`目标行未被定位（应发生在 loading 窗口之后）：${JSON.stringify(rowAfterLoading16b && rowAfterLoading16b.target)}`]),
+      ...(loadDelta16b <= 1 && notesHash() === hashR16b ? [] : [`读盘 / 写盘越界：${JSON.stringify({ loadDelta16b, hashSame: notesHash() === hashR16b })}`]),
+    ],
+  );
+
+  log("r16-2 定位：章节过滤被单向清除 / 搜索遮挡时退化 / 退化不粘滞");
+  await ensureMapOpen();
+  await waitFor("地图行就绪", `document.querySelectorAll(".map-row").length === 7`);
+  await clickMapBadge("2. Method Overview");
+  await waitChapterFilter("章节：2. Method Overview · 第 2 页", 11);
+  const filterBefore16b = await has(SEL.chapterFilter);
+  await clickEl('.pdf-page[data-page="1"] .page-notes');
+  await waitFor(
+    "章节过滤被清除且页 1 行被定位",
+    `!document.querySelector(${JSON.stringify(SEL.chapterFilter)}) && document.querySelectorAll(${JSON.stringify(SEL.noteRowAnchored)}).length === 1`,
+  );
+  const filterCleared16b = await has(SEL.chapterFilter);
+  const anchoredUnderFilter16b = await countOf(SEL.noteRowAnchored);
+  await setSearch("Reproducibility");
+  await waitFor("搜索遮挡（1 行）", `document.querySelectorAll(".note-row").length === 1`);
+  const rowCountUnderFilter16b = await countOf(SEL.noteRow);
+  const scrollBeforeDegrade16b = await js(`document.querySelector(".notes-panel").scrollTop`);
+  const degradeStart16b = Date.now();
+  await clickEl('.pdf-page[data-page="1"] .page-notes');
+  await waitFor("退化提示", `document.querySelector(".notes-notice.is-error")`);
+  const degradeMs16b = Date.now() - degradeStart16b;
+  await sleep(200);
+  const degradeProbe16b = await js(`(() => {
+    const el = document.querySelector(".notes-notice.is-error");
+    const text = el ? el.querySelector(".notice-text") : null;
+    return {
+      text: text ? text.textContent.replace(/\\s+/g, " ").trim() : null,
+      anchored: document.querySelectorAll(${JSON.stringify(SEL.noteRowAnchored)}).length,
+      scrollTop: document.querySelector(".notes-panel").scrollTop,
+    };
+  })()`);
+  await capturePage(win, "r16-2c-page-anchor-filter-degrade.png", await rectOfSelector(SEL.layoutLeft, 2));
+  await setSearch("");
+  await waitFor("搜索清空（14 行）", `document.querySelectorAll(".note-row").length === 14`);
+  await clickEl('.pdf-page[data-page="1"] .page-notes');
+  await waitFor("退化后重试成功", `document.querySelectorAll(${JSON.stringify(SEL.noteRowAnchored)}).length === 1`);
+  const anchoredAfterDegrade16b = await countOf(SEL.noteRowAnchored);
+  record(
+    "r16-page-anchor",
+    {
+      phase: "degrade-filters",
+      filterBefore: filterBefore16b,
+      filterCleared: filterCleared16b,
+      anchored: anchoredUnderFilter16b,
+      notice: degradeProbe16b,
+      degradeMs: degradeMs16b,
+      rowCountUnderFilter: rowCountUnderFilter16b,
+      scrollBefore: scrollBeforeDegrade16b,
+      anchoredAfter: anchoredAfterDegrade16b,
+    },
+    [
+      ...(filterBefore16b === true && filterCleared16b === false && anchoredUnderFilter16b === 1
+        ? []
+        : [`章节过滤应被单向清除且目标行被定位：${JSON.stringify({ filterBefore16b, filterCleared16b, anchoredUnderFilter16b })}`]),
+      ...(rowCountUnderFilter16b === 1 && degradeProbe16b.text === "本页笔记不在当前筛选结果中" && degradeProbe16b.anchored === 0
+        ? []
+        : [`退化提示 / 行态异常：${JSON.stringify({ rowCountUnderFilter16b, degradeProbe16b })}`]),
+      ...(degradeProbe16b.scrollTop === scrollBeforeDegrade16b ? [] : [`退化不得滚动面板：${JSON.stringify({ before: scrollBeforeDegrade16b, after: degradeProbe16b.scrollTop })}`]),
+      ...(degradeMs16b < 2500 ? [] : [`退化应在 ready 后立即发生（不等满 3s）：${degradeMs16b}ms`]),
+      ...(anchoredAfterDegrade16b === 1 ? [] : [`清空搜索后重试应成功（退化不粘滞）：${anchoredAfterDegrade16b}`]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // --- r16-3 原文锚点：命中 / 静默降级 / 缩放稳定（组 r16-note-highlight）-----------
+  log("r16-3 原文锚点：页 1 摘录跨片段命中，文字层零结构改动");
+  await enterNotesProbe();
+  // 文字层就绪防空：两次结构快照必须有真实片段可读
+  await waitFor("页 1 文字层 6 段", `document.querySelectorAll('.pdf-page[data-page="1"] .textLayer span').length === 6`);
+  const snapshotBefore16c = await textLayerSnapshot(1);
+  const spansBefore16c = await js(`document.querySelectorAll('.pdf-page[data-page="1"] .textLayer span').length`);
+  await waitFor("锚点高亮就绪", `CSS.highlights.has("pix-note-anchor")`);
+  const painted16c = await anchorProbe();
+  const snapshotAfter16c = await textLayerSnapshot(1);
+  const selection16c = await selectionOnPageOne();
+  const quickAsk16c = await has(SEL.quickAsk);
+  await js(`window.getSelection().removeAllRanges(), document.dispatchEvent(new Event("selectionchange")), true`);
+  await capturePage(win, "r16-3-note-anchor.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  record(
+    "r16-note-highlight",
+    {
+      phase: "anchor-painted",
+      anchor: painted16c.registry.anchor,
+      page: painted16c.anchorPage,
+      spans: spansBefore16c,
+      snapshotSame: JSON.stringify(snapshotBefore16c) === JSON.stringify(snapshotAfter16c),
+      scaleFactor: painted16c.scaleFactor,
+      canvasWidth: painted16c.canvasWidth,
+      search: { all: painted16c.registry.search, current: painted16c.registry.current },
+      selection: { text: selection16c, quickAsk: quickAsk16c },
+    },
+    [
+      ...(painted16c.registry.anchor && painted16c.registry.anchor.size === 1 && stripWs(painted16c.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT)
+        ? []
+        : [`锚点区间文本异常：${JSON.stringify(painted16c.registry.anchor)}`]),
+      ...(painted16c.anchorPage === "1" ? [] : [`区间应属于第 1 页：${painted16c.anchorPage}`]),
+      ...(spansBefore16c === 6 && painted16c.pageOneMarks === 0 && JSON.stringify(snapshotBefore16c) === JSON.stringify(snapshotAfter16c)
+        ? []
+        : [`文字层结构不得变化：${JSON.stringify({ spansBefore16c, marks: painted16c.pageOneMarks, same: JSON.stringify(snapshotBefore16c) === JSON.stringify(snapshotAfter16c) })}`]),
+      ...(painted16c.scaleFactor === "1" && painted16c.canvasWidth === "595px"
+        ? []
+        : [`几何读数漂移：${JSON.stringify({ scaleFactor: painted16c.scaleFactor, canvasWidth: painted16c.canvasWidth })}`]),
+      ...(painted16c.registry.search === null && painted16c.registry.current === null
+        ? []
+        : [`未开搜索时不得产生搜索注册表：${JSON.stringify(painted16c.registry)}`]),
+      ...(selection16c.length > 0 && quickAsk16c === true ? [] : [`选择链路被破坏：${JSON.stringify({ selection16c, quickAsk16c })}`]),
+    ],
+  );
+
+  log("r16-3 第 2 页：摘录比页文本长 ⇒ 静默无高亮，翻回即恢复");
+  const logsBefore16c = (await anchorProbe()).viewerLogs;
+  await clickNext();
+  await waitPage(2, 3);
+  await sleep(400);
+  const unmatched16c = await anchorProbe();
+  const unmatchedSpans16c = await js(`document.querySelectorAll('.pdf-page[data-page="2"] .textLayer span').length`);
+  const unmatchedLogs16c = unmatched16c.viewerLogs;
+  await capturePage(win, "r16-3b-note-anchor-unmatched.png", await rectOfSelector('.pdf-page[data-page="2"]', 8));
+  await clickPrev();
+  await waitPage(1, 3);
+  await waitFor("回页 1 锚点恢复", `CSS.highlights.has("pix-note-anchor")`);
+  const restored16c = await anchorProbe();
+  const turns16c = [];
+  for (let round = 0; round < 5; round += 1) {
+    const preNext16c = await pageLabelProbe();
+    const startNext16c = Date.now();
+    await clickNext();
+    await waitPage(2, 3);
+    turns16c.push({ ms: Date.now() - startNext16c, disabled: preNext16c.nextDisabled, label: preNext16c.label });
+    const prePrev16c = await pageLabelProbe();
+    const startPrev16c = Date.now();
+    await clickPrev();
+    await waitPage(1, 3);
+    turns16c.push({ ms: Date.now() - startPrev16c, disabled: prePrev16c.prevDisabled, label: prePrev16c.label });
+  }
+  const turnsTotal16c = turns16c.reduce((sum, item) => sum + item.ms, 0);
+  const turnsMax16c = Math.max(...turns16c.map((item) => item.ms));
+  await clickNext();
+  await clickPrev();
+  await clickNext();
+  await clickPrev();
+  let stableLabel16c = null;
+  let previousLabel16c = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const current = await pageLabel();
+    if (current === previousLabel16c) {
+      stableLabel16c = current;
+      break;
+    }
+    previousLabel16c = current;
+    await sleep(80);
+  }
+  await sleep(400);
+  const rapid16c = await anchorProbe();
+  const rapidPage16c = /第 (\d+) \//.exec(stableLabel16c || "");
+  record(
+    "r16-note-highlight",
+    {
+      phase: "unmatched-silent",
+      unmatchedRegistry: unmatched16c.registry.anchor,
+      unmatchedSpans: unmatchedSpans16c,
+      notice: unmatched16c.notice,
+      logDelta: unmatchedLogs16c - logsBefore16c,
+      restored: restored16c.registry.anchor,
+      turns: turns16c.length,
+      maxMs: turnsMax16c,
+      totalMs: turnsTotal16c,
+      revisitMs: turns16c.map((item) => item.ms),
+      rapid: { label: stableLabel16c, page: rapidPage16c ? rapidPage16c[1] : null, registry: rapid16c.registry.anchor, anchorPage: rapid16c.anchorPage },
+    },
+    [
+      ...(unmatched16c.registry.anchor === null ? [] : [`第 2 页摘录比页文本长 ⇒ 必须无高亮：${JSON.stringify(unmatched16c.registry.anchor)}`]),
+      ...(unmatched16c.notice === null && unmatchedLogs16c - logsBefore16c === 0
+        ? []
+        : [`降级必须静默（无提示、无 [pdf-viewer] 日志）：${JSON.stringify({ notice: unmatched16c.notice, logDelta: unmatchedLogs16c - logsBefore16c })}`]),
+      ...(restored16c.registry.anchor && restored16c.registry.anchor.size === 1 && stripWs(restored16c.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT)
+        ? []
+        : [`翻回第 1 页应恢复同一区间：${JSON.stringify(restored16c.registry.anchor)}`]),
+      ...(turns16c.length === 10 && turns16c.every((item) => item.disabled === false)
+        ? []
+        : [`交替序列的先决条件异常：${JSON.stringify(turns16c)}`]),
+      ...(turnsMax16c <= 1000 && turnsTotal16c <= 6000 ? [] : [`翻页耗时超限：${JSON.stringify({ turnsMax16c, turnsTotal16c })}`]),
+      ...(Math.max(...turns16c.map((item) => item.ms)) <= 300 ? [] : [`回访页耗时超限：${JSON.stringify(turns16c.map((item) => item.ms))}`]),
+      ...(rapid16c.registry.anchor === null || (rapidPage16c && rapid16c.anchorPage === rapidPage16c[1])
+        ? []
+        : [`快速连点后不得残留旧页区间：${JSON.stringify({ stableLabel16c, anchorPage: rapid16c.anchorPage })}`]),
+    ],
+  );
+
+  log("r16-3 缩放 80%：区间随页几何等比变化，注册表始终指向当前文字层");
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await waitFor(
+    "缩放 80% + 锚点非空",
+    `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "80%" && CSS.highlights.has("pix-note-anchor")`,
+  );
+  const zoomOut16c = await anchorProbe();
+  await capturePage(win, "r16-3c-note-anchor-after-zoom.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  await clickEl(SEL.zoomInBtn);
+  await clickEl(SEL.zoomInBtn);
+  await waitFor(
+    "缩放回 100% + 锚点非空",
+    `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "100%" && CSS.highlights.has("pix-note-anchor")`,
+  );
+  const restoredZoom16c = await anchorProbe();
+  record(
+    "r16-note-highlight",
+    {
+      phase: "scale-stable",
+      zoom: await zoomLabel(),
+      scaleFactor: zoomOut16c.scaleFactor,
+      canvasWidth: zoomOut16c.canvasWidth,
+      anchor: zoomOut16c.registry.anchor,
+      page: zoomOut16c.anchorPage,
+      restored: restoredZoom16c,
+    },
+    [
+      ...(zoomOut16c.scaleFactor === "0.8" && zoomOut16c.canvasWidth === "476px" && zoomOut16c.registry.anchor && zoomOut16c.registry.anchor.size === 1 && stripWs(zoomOut16c.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT) && zoomOut16c.anchorPage === "1"
+        ? []
+        : [`80% 下锚点读数异常：${JSON.stringify({ scaleFactor: zoomOut16c.scaleFactor, canvasWidth: zoomOut16c.canvasWidth, page: zoomOut16c.anchorPage, anchor: zoomOut16c.registry.anchor })}`]),
+      ...(restoredZoom16c.scaleFactor === "1" && restoredZoom16c.canvasWidth === "595px" && restoredZoom16c.registry.anchor && restoredZoom16c.registry.anchor.size === 1 && stripWs(restoredZoom16c.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT)
+        ? []
+        : [`回到 100% 后应逐字回基线：${JSON.stringify({ scaleFactor: restoredZoom16c.scaleFactor, canvasWidth: restoredZoom16c.canvasWidth, anchor: restoredZoom16c.registry.anchor })}`]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // --- r16-4 锚点与搜索高亮共存（组 r16-highlight-coexist）-------------------------
+  log("r16-4 同一页上锚点与搜索高亮并存，先就绪的锚点不被搜索破坏");
+  await enterNotesProbe();
+  await waitFor("锚点先就绪", `CSS.highlights.has("pix-note-anchor")`);
+  await clickEl(SEL.pdfSearchBtn);
+  await waitFor("PDF 搜索面板", `document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)})`);
+  await pdfSearchSet("retrieval");
+  await waitFor("搜索高亮就绪", `CSS.highlights.has("pix-search") && CSS.highlights.get("pix-search").size >= 1`);
+  const coexist16d = await anchorProbe();
+  const marker16d = await pageNotesProbe(1);
+  await pdfSearchNext();
+  await sleep(300);
+  const afterNext16d = await anchorProbe();
+  const spans16d = await js(`document.querySelectorAll('.pdf-page[data-page="1"] .textLayer span').length`);
+  await capturePage(win, "r16-4-anchor-with-search.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  record(
+    "r16-highlight-coexist",
+    {
+      phase: "coexist",
+      anchor: coexist16d.registry.anchor,
+      search: coexist16d.registry.search,
+      current: coexist16d.registry.current,
+      anchorAfterNext: afterNext16d.registry.anchor,
+      spans: spans16d,
+      markerPanel: { marker: marker16d.rect, panel: marker16d.controls[".pdf-search-panel"], overlap: marker16d.markerVsControls },
+      label: coexist16d.pageLabel,
+    },
+    [
+      ...(coexist16d.registry.anchor && coexist16d.registry.anchor.size === 1 && coexist16d.registry.search && coexist16d.registry.search.size >= 1
+        ? []
+        : [`锚点与搜索高亮应并存：${JSON.stringify({ anchor: coexist16d.registry.anchor, search: coexist16d.registry.search })}`]),
+      ...(JSON.stringify(coexist16d.registry.anchor.texts) !== JSON.stringify(coexist16d.registry.search.texts)
+        ? []
+        : ["锚点与搜索的区间文本集合不得相同"]),
+      ...(stripWs(coexist16d.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT) ? [] : [`锚点区间文本异常：${JSON.stringify(coexist16d.registry.anchor)}`]),
+      ...(afterNext16d.registry.anchor && afterNext16d.registry.anchor.size === coexist16d.registry.anchor.size && JSON.stringify(afterNext16d.registry.anchor.texts) === JSON.stringify(coexist16d.registry.anchor.texts)
+        ? []
+        : [`搜索「下一处」不得改动锚点：${JSON.stringify(afterNext16d.registry.anchor)}`]),
+      ...(spans16d === 6 ? [] : [`搜索与锚点都不得改结构：${spans16d}`]),
+      ...(marker16d.controls[".pdf-search-panel"] !== null && marker16d.markerVsControls.length === 0
+        ? []
+        : [`标记与搜索面板不得相交：${JSON.stringify({ panel: marker16d.controls[".pdf-search-panel"], overlap: marker16d.markerVsControls })}`]),
+    ],
+  );
+
+  log("r16-4 关闭搜索：搜索侧只清自己的名字，锚点仍在");
+  await pdfSearchSet("");
+  await pdfSearchClose();
+  await waitFor("搜索面板卸载", `!document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)})`);
+  const closed16d = await anchorProbe();
+  await capturePage(win, "r16-4b-anchor-after-search-closed.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  record(
+    "r16-highlight-coexist",
+    { phase: "search-closed", searchGone: { all: closed16d.registry.search, current: closed16d.registry.current }, anchorKept: closed16d.registry.anchor, notice: closed16d.notice },
+    [
+      ...(closed16d.registry.search === null && closed16d.registry.current === null ? [] : [`搜索侧注册表应被自己清空：${JSON.stringify({ all: closed16d.registry.search, current: closed16d.registry.current })}`]),
+      ...(closed16d.registry.anchor && closed16d.registry.anchor.size === 1 && stripWs(closed16d.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT)
+        ? []
+        : [`关闭搜索不得删除锚点：${JSON.stringify(closed16d.registry.anchor)}`]),
+      ...(closed16d.notice === null ? [] : [`不得弹提示：${JSON.stringify(closed16d.notice)}`]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // --- r16-5 降级：零标记 / 无文字层 / 外部刷新（组 r16-degrade）-------------------
+  log("r16-5 60 页零笔记文档：无标记、无高亮、无提示");
+  await enterNotesProbe();
+  await openRow("long-book.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 60);
+  // 页码 pill 先于页盒落 DOM（60 页的 measurePages 更长）⇒ 必须先等 60 个页盒
+  await waitFor("long-book 页盒 60 页", `document.querySelectorAll(".pdf-page").length === 60`);
+  const zeroNotes16e = await countOf(SEL.pageNotes);
+  const zeroPages16e = await countOf(".pdf-page");
+  const zeroProbe16e = await anchorProbe();
+  await clickNext();
+  await clickNext();
+  await waitPage(3, 60);
+  const zeroAfterTurn16e = { notesCount: await countOf(SEL.pageNotes), registry: (await anchorProbe()).registry.anchor };
+  await capturePage(win, "r16-5-zero-page-notes.png");
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitFor(
+    "回切后页 1 标记 + 锚点恢复",
+    `(() => { const el = document.querySelector('.pdf-page[data-page="1"] .page-notes'); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === "本页 1 条" && CSS.highlights.has("pix-note-anchor"); })()`,
+  );
+  record(
+    "r16-degrade",
+    {
+      phase: "zero-page",
+      notesCount: zeroNotes16e,
+      pageCount: zeroPages16e,
+      afterTurn: zeroAfterTurn16e,
+      registry: zeroProbe16e.registry.anchor,
+      notice: zeroProbe16e.notice,
+      restored: { marker: (await pageNotesProbe(1)).text, anchor: (await anchorProbe()).registry.anchor },
+    },
+    [
+      ...(zeroNotes16e === 0 && zeroPages16e === 60 ? [] : [`零笔记文档不得有标记（页数防空 60）：${JSON.stringify({ zeroNotes16e, zeroPages16e })}`]),
+      ...(zeroAfterTurn16e.notesCount === 0 && zeroAfterTurn16e.registry === null ? [] : [`翻页后仍应为零：${JSON.stringify(zeroAfterTurn16e)}`]),
+      ...(zeroProbe16e.notice === null ? [] : [`不得弹提示：${JSON.stringify(zeroProbe16e.notice)}`]),
+      ...((await anchorProbe()).registry.anchor ? [] : ["回切后锚点应恢复"]),
+    ],
+  );
+
+  log("r16-5 无文字层：等待 2s 后静默放弃，缩放重渲染后恢复");
+  await waitFor("锚点先就绪", `CSS.highlights.has("pix-note-anchor")`);
+  const logsBefore16e = (await anchorProbe()).viewerLogs;
+  await emptyTextLayer(1);
+  await clickNext();
+  await waitPage(2, 3);
+  await clickPrev();
+  await waitPage(1, 3);
+  await sleep(2300);
+  const timeout16e = await anchorProbe();
+  const notesCount16e = await countOf(SEL.pageNotes);
+  await capturePage(win, "r16-5b-no-text-layer.png", await rectOfSelector(SEL.pageBoxOne, 8));
+  await clickEl(SEL.zoomInBtn);
+  await clickEl(SEL.zoomInBtn);
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await clickEl('.pdf-toolbar button[title="缩小"]');
+  await waitFor("文字层重建后锚点恢复", `CSS.highlights.has("pix-note-anchor")`);
+  const rebuilt16e = await anchorProbe();
+  record(
+    "r16-degrade",
+    {
+      phase: "no-text-layer",
+      registryAfterTimeout: timeout16e.registry.anchor,
+      notice: timeout16e.notice,
+      logDelta: timeout16e.viewerLogs - logsBefore16e,
+      notesCount: notesCount16e,
+      restored: rebuilt16e.registry.anchor,
+    },
+    [
+      ...(timeout16e.registry.anchor === null ? [] : [`超时后应放弃本次绘画：${JSON.stringify(timeout16e.registry.anchor)}`]),
+      ...(timeout16e.notice === null && timeout16e.viewerLogs - logsBefore16e === 0
+        ? []
+        : [`降级必须静默：${JSON.stringify({ notice: timeout16e.notice, logDelta: timeout16e.viewerLogs - logsBefore16e })}`]),
+      ...(notesCount16e === 2 ? [] : [`标记不依赖文字层：${notesCount16e}`]),
+      ...(rebuilt16e.registry.anchor && rebuilt16e.registry.anchor.size === 1 && stripWs(rebuilt16e.registry.anchor.texts[0]) === stripWs(R16_ANCHOR_TEXT)
+        ? []
+        : [`文字层重建后锚点应恢复：${JSON.stringify(rebuilt16e.registry.anchor)}`]),
+    ],
+  );
+
+  log("r16-5 外部改动 + 面板刷新：标记与锚点按新列表重算");
+  writeNotesOutside(readNotes().map((note) => (note.id === "n-current-1" ? { ...note, page: 3 } : note)));
+  await triggerWindowFocus();
+  await waitFor("外部改动提示", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const refreshHash16e = notesHash();
+  const addBase16e = (await notesAddCalls()).count;
+  const reportBase16e = (await notesReportCalls()).count;
+  await clickEl(SEL.staleRefresh);
+  await waitFor("刷新后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  await waitFor("刷新后 4 行", `document.querySelectorAll(".note-row").length === 4`);
+  const refreshP16e1 = await pageNotesProbe(1);
+  const refreshP16e2 = await pageNotesProbe(2);
+  const refreshP16e3 = await pageNotesProbe(3);
+  const refreshRegistry16e = (await anchorProbe()).registry.anchor;
+  const refreshNotice16e = (await anchorProbe()).notice;
+  await capturePage(win, "r16-5c-after-external-refresh.png");
+  record(
+    "r16-degrade",
+    {
+      phase: "external-refresh",
+      rows: await countOf(SEL.noteRow),
+      fileRows: readNotes().length,
+      markerP1: refreshP16e1,
+      markerP2: refreshP16e2.text,
+      markerP3: refreshP16e3,
+      registry: refreshRegistry16e,
+      hashSame: notesHash() === refreshHash16e,
+      notice: refreshNotice16e,
+      writes: { add: (await notesAddCalls()).count - addBase16e, report: (await notesReportCalls()).count - reportBase16e },
+    },
+    [
+      ...((await countOf(SEL.noteRow)) === 4 && readNotes().length === 4 ? [] : [`刷新后行数异常：${JSON.stringify({ rows: await countOf(SEL.noteRow), file: readNotes().length })}`]),
+      ...(refreshP16e1.exists === false && refreshP16e3.text === "本页 1 条" && refreshP16e3.title === "本页 1 条笔记（摘录 1 · AI 结论 0）；点击定位到笔记面板" && refreshP16e2.text === "本页 2 条"
+        ? []
+        : [`刷新后标记未按新列表重算：${JSON.stringify({ p1: refreshP16e1.exists, p2: refreshP16e2.text, p3: refreshP16e3.text })}`]),
+      ...(refreshRegistry16e === null ? [] : [`当前页（第 1 页）摘录已移走 ⇒ 不应有高亮：${JSON.stringify(refreshRegistry16e)}`]),
+      ...(notesHash() === refreshHash16e && (await notesAddCalls()).count - addBase16e === 0 && (await notesReportCalls()).count - reportBase16e === 0
+        ? []
+        : ["刷新必须只读"]),
+      ...(refreshNotice16e === null ? [] : [`不得残留提示：${JSON.stringify(refreshNotice16e)}`]),
+    ],
+  );
+  await restoreStandardSeed();
 }
 
 // ---------------------------------------------------------------------------

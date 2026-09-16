@@ -93,11 +93,53 @@ const BADGE_CASE = [
   { id: "c-3", kind: "answer", docPath: "sample-paper.pdf\\", page: 3, text: "case 3", comment: "", createdAt: 7, updatedAt: 7 },
 ];
 
+// ── notes-by-page 夹具（R16；手写，期望值不由被测函数生成） ───────────────
+
+/** 页标记夹具：与 BADGE_SEED 同构（4 条），用于 notes-by-page 的计数口径。 */
+const PIN_SEED = [
+  { id: "p-1", kind: "excerpt", docPath: "sample-paper.pdf", page: 1, text: "pin 1", comment: "", createdAt: 1, updatedAt: 1 },
+  { id: "p-2", kind: "excerpt", docPath: "sample-paper.pdf", page: 2, text: "pin 2", comment: "", createdAt: 2, updatedAt: 2 },
+  { id: "p-3", kind: "answer", docPath: "sample-paper.pdf", page: 2, text: "pin 3", comment: "", createdAt: 3, updatedAt: 3 },
+  { id: "p-4", kind: "excerpt", docPath: "archive/older-paper.pdf", page: 7, text: "pin 4", comment: "", createdAt: 4, updatedAt: 4 },
+];
+/** 比较键归一：大小写不同 / 尾反斜杠三种写法必须合并为同一个页号键（与 BADGE_CASE 同口径）。 */
+const PIN_CASE = [
+  { id: "pc-1", kind: "excerpt", docPath: "Sample-Paper.PDF", page: 2, text: "pin case 1", comment: "", createdAt: 5, updatedAt: 5 },
+  { id: "pc-2", kind: "answer", docPath: "sample-paper.pdf\\", page: 2, text: "pin case 2", comment: "", createdAt: 6, updatedAt: 6 },
+  { id: "pc-3", kind: "excerpt", docPath: "sample-paper.pdf", page: 2, text: "pin case 3", comment: "", createdAt: 7, updatedAt: 7 },
+];
+/** 非法页号四条（0 / -2 / 1.5 / NaN）：不产生任何键。 */
+const PIN_BAD_PAGE = [
+  { id: "pb-1", kind: "excerpt", docPath: "sample-paper.pdf", page: 0, text: "pin bad page 0", comment: "", createdAt: 8, updatedAt: 8 },
+  { id: "pb-2", kind: "excerpt", docPath: "sample-paper.pdf", page: -2, text: "pin bad page -2", comment: "", createdAt: 9, updatedAt: 9 },
+  { id: "pb-3", kind: "excerpt", docPath: "sample-paper.pdf", page: 1.5, text: "pin bad page 1.5", comment: "", createdAt: 10, updatedAt: 10 },
+  { id: "pb-4", kind: "answer", docPath: "sample-paper.pdf", page: Number.NaN, text: "pin bad page NaN", comment: "", createdAt: 11, updatedAt: 11 },
+];
+
+// ── excerpt-match 夹具（R16；手写，期望值不由被测函数生成） ───────────────
+
+/** 跨片段夹具（页 1 的前两个文本项，逐字取自 ui-shot 的 SAMPLE_PAGES）。 */
+const ANCHOR_PARTS = [
+  "Abstract. We study retrieval over long documents where the",
+  "attention budget is the binding constraint. Our method keeps",
+];
+/** 手写期望串：片段边界折叠为恰一个空格 + 末尾小写（大写的 ANCHOR_NEEDLE 对 page.text 直接 indexOf 恒为 -1）。 */
+const ANCHOR_NEEDLE = "We study retrieval over long documents where the attention budget is the binding constraint.";
+const ANCHOR_NEEDLE_FOLDED = "we study retrieval over long documents where the attention budget is the binding constraint.";
+const ANCHOR_MISS = "Table 2 reports the ablation over the sparse mask budget. Removing the positional prior costs 2.4 points of recall, which confirms the mask is doing more than sparsification alone.";
+/** 中文夹具：两片段（片段边界同受折叠规则约束 ⇒ 折叠串在「，」后带恰一个空格，摘录须同样带该空格才命中）。 */
+const ANCHOR_CN_PAGE = ["稀疏注意力在三分之一的预算下保持召回，", "位置先验是关键。"];
+const ANCHOR_CN_NEEDLE = "稀疏注意力在三分之一的预算下保持召回， 位置先验是关键。";
+/** 超长夹具（边界含等于：400 参与匹配、401 跳过）。 */
+const LONG_400 = "x".repeat(400);
+const LONG_401 = "x".repeat(401);
+
 let passed = 0;
 let failed = 0;
 let outlineNotes = null;
 let readingContext = null;
 let notesPath = null;
+let pageAnchor = null;
 
 function group(name) {
   console.log(`== 组 ${name} ==`);
@@ -501,6 +543,223 @@ function runBadgeCounts() {
   );
 }
 
+/**
+ * 组 notes-by-page（R16）：页标记唯一派生 countNotesByPage 的计数口径。
+ * 每条的期望值均手写（不由被测函数生成）；入参夹具在第 6 条后复核逐字未变。
+ */
+function runNotesByPage() {
+  const G = "notes-by-page";
+  group(G);
+  /** 逐字段比对（不用 JSON.stringify：字段缺失时也能给出可读的失败信息）。 */
+  const sameCount = (value, total, excerpt, answer) =>
+    value !== undefined && value !== null && value.total === total && value.excerpt === excerpt && value.answer === answer;
+
+  const seedCounts = notesPath.countNotesByPage(PIN_SEED, "sample-paper.pdf");
+  check(
+    G,
+    1,
+    "标准页种子 ⇒ 2 个页键；第 1 页 {total:1, excerpt:1, answer:0}、第 2 页 {total:2, excerpt:1, answer:1}、第 3 页 undefined",
+    seedCounts.size === 2 && sameCount(seedCounts.get(1), 1, 1, 0) && sameCount(seedCounts.get(2), 2, 1, 1) && seedCounts.get(3) === undefined,
+    JSON.stringify({ size: seedCounts.size, p1: seedCounts.get(1), p2: seedCounts.get(2), p3: seedCounts.get(3) }),
+  );
+
+  const nullCounts = notesPath.countNotesByPage(PIN_SEED, null);
+  check(
+    G,
+    2,
+    "docKey === null ⇒ 空 Map（size === 0、不抛错；与 matchesChapterFilter 的空键守卫同口径）",
+    nullCounts.size === 0,
+    JSON.stringify({ size: nullCounts.size }),
+  );
+
+  const badCounts = notesPath.countNotesByPage(PIN_BAD_PAGE, "sample-paper.pdf");
+  check(
+    G,
+    3,
+    "非法页号（0 / -2 / 1.5 / NaN）四条 ⇒ 不产生任何键（size === 0）",
+    badCounts.size === 0,
+    JSON.stringify({ size: badCounts.size, keys: [...badCounts.keys()] }),
+  );
+
+  const caseCounts = notesPath.countNotesByPage(PIN_CASE, "sample-paper.pdf");
+  check(
+    G,
+    4,
+    "比较键归一：大小写 / 尾反斜杠三种写法同页合并 ⇒ size === 1、第 2 页 {total:3, excerpt:2, answer:1}；其它文档的 p7 不产生键",
+    caseCounts.size === 1 && sameCount(caseCounts.get(2), 3, 2, 1) && seedCounts.get(7) === undefined,
+    JSON.stringify({ size: caseCounts.size, p2: caseCounts.get(2), keys: [...caseCounts.keys()], seedP7: seedCounts.get(7) }),
+  );
+
+  const identity = seedCounts.get(2);
+  check(
+    G,
+    5,
+    "恒等式：同页 1 摘录 + 1 结论 ⇒ total === excerpt + answer === 2（逐值断言；kind 只有两态）",
+    identity !== undefined && identity.total === 2 && identity.excerpt === 1 && identity.answer === 1 && identity.total === identity.excerpt + identity.answer,
+    JSON.stringify(identity),
+  );
+
+  const inputBefore = JSON.stringify(PIN_SEED);
+  const first = notesPath.countNotesByPage(PIN_SEED, "sample-paper.pdf");
+  const second = notesPath.countNotesByPage(PIN_SEED, "sample-paper.pdf");
+  first.get(2).total = 99;
+  const inputAfter = JSON.stringify(PIN_SEED);
+  check(
+    G,
+    6,
+    "输入零改动 + 每次返回新 Map：入参 JSON 逐字不变、first !== second、改第一次结果不影响第二次",
+    inputBefore === inputAfter && first !== second && second.get(2).total === 2,
+    JSON.stringify({ inputSame: inputBefore === inputAfter, distinct: first !== second, secondTotal: second.get(2).total }),
+  );
+}
+
+/**
+ * 组 excerpt-match（R16）：折叠与匹配的口径（中英文 / 空白差异 / 跨行 / 重复 / 重叠 / 超长 / 空 / 纯性）。
+ * 期望值一律手写；page.text 已是折叠后的全小写串，故手写期望串按折叠规则预先给出。
+ */
+function runExcerptMatch() {
+  const G = "excerpt-match";
+  group(G);
+
+  const page = pageAnchor.foldText(ANCHOR_PARTS);
+  const first = pageAnchor.matchExcerpts(page, [{ key: "k1", text: ANCHOR_NEEDLE }]);
+  const needleFolded = pageAnchor.foldText([ANCHOR_NEEDLE]).text;
+  check(
+    G,
+    1,
+    "跨片段命中：恰 1 条区间 [10,102)、slice 逐字等于手写折叠串，且 indexOf(折叠串) === start",
+    needleFolded === ANCHOR_NEEDLE_FOLDED &&
+      first.length === 1 && first[0].key === "k1" && first[0].start === 10 && first[0].end === 102 &&
+      page.text.slice(first[0].start, first[0].end) === ANCHOR_NEEDLE_FOLDED &&
+      page.text.indexOf(ANCHOR_NEEDLE_FOLDED) === first[0].start,
+    JSON.stringify({ needleFolded, ranges: first, slice: first.length === 1 ? page.text.slice(first[0].start, first[0].end) : null }),
+  );
+
+  const cnPage = pageAnchor.foldText(ANCHOR_CN_PAGE);
+  const cnRanges = pageAnchor.matchExcerpts(cnPage, [{ key: "cn", text: ANCHOR_CN_NEEDLE }]);
+  const htmlLower = pageAnchor.matchExcerpts(pageAnchor.foldText(["HTML basics"]), [{ key: "u", text: "html" }]);
+  const htmlUpper = pageAnchor.matchExcerpts(pageAnchor.foldText(["html basics"]), [{ key: "u", text: "HTML" }]);
+  check(
+    G,
+    2,
+    "中文与大小写：中文页面（片段边界折叠为恰一个空格）⇒ 命中 [0,末)；HTML/html 双向命中 ⇒ [0,4)（大小写折叠对称）",
+    cnPage.text === ANCHOR_CN_NEEDLE &&
+      cnRanges.length === 1 && cnRanges[0].start === 0 && cnPage.text.slice(cnRanges[0].start, cnRanges[0].end) === ANCHOR_CN_NEEDLE &&
+      htmlLower.length === 1 && htmlLower[0].start === 0 && htmlLower[0].end === 4 &&
+      htmlUpper.length === 1 && htmlUpper[0].start === 0 && htmlUpper[0].end === 4,
+    JSON.stringify({ cnText: cnPage.text, cn: cnRanges, htmlLower, htmlUpper }),
+  );
+
+  const wsTab = pageAnchor.foldText(["a\tb", "c   d"]);
+  const wsNewline = pageAnchor.foldText(["a\nb\nc d"]);
+  const wsPlain = pageAnchor.foldText(["a b c d"]);
+  const wsNeedle = pageAnchor.matchExcerpts(pageAnchor.foldText(["a", "b"]), [{ key: "ws", text: "a  b" }]);
+  check(
+    G,
+    3,
+    "空白差异等价：制表 / 换行 / 多空格 / 片段边界四种写法折叠后逐字相等（恰一个空格、不丢字符）；含空白摘录命中短片段页 [0,3)",
+    wsTab.text === "a b c d" && wsNewline.text === "a b c d" && wsPlain.text === "a b c d" &&
+      wsNeedle.length === 1 && wsNeedle[0].start === 0 && wsNeedle[0].end === 3,
+    JSON.stringify({ tab: wsTab.text, newline: wsNewline.text, plain: wsPlain.text, wsNeedle }),
+  );
+
+  const joined = pageAnchor.foldText(["alpha", "beta"]);
+  const at = page.at;
+  const increasing = at.filter((value) => value !== -1).every((value, index, list) => index === 0 || value > list[index - 1]);
+  const trimmed = pageAnchor.matchExcerpts(page, [{ key: "trim", text: " \n " + ANCHOR_NEEDLE + "  " }]);
+  check(
+    G,
+    4,
+    "跨行与 trim：alpha/beta ⇒ \"alpha beta\"（边界恰一个空格）；at.length === text.length、非 -1 下标严格递增、片段边界记 -1（at[10] = 10 / at[58] = -1 / at[101] = 101）；摘录首尾带空白仍命中 [10,102)",
+    joined.text === "alpha beta" && joined.text.length === 10 && joined.at.length === joined.text.length &&
+      at.length === page.text.length && increasing &&
+      at[10] === 10 && at[58] === -1 && at[101] === 101 &&
+      trimmed.length === 1 && trimmed[0].start === 10 && trimmed[0].end === 102,
+    JSON.stringify({ joined: joined.text, atLen: at.length, textLen: page.text.length, at10: at[10], at58: at[58], at101: at[101], increasing, trimmed }),
+  );
+
+  const missRanges = pageAnchor.matchExcerpts(pageAnchor.foldText(["short page"]), [{ key: "k", text: ANCHOR_MISS }]);
+  check(
+    G,
+    5,
+    "不可匹配：摘录比页面文本更长 / 页面缺少该子串 ⇒ 返回 []（不抛错、不返回近似区间）",
+    missRanges.length === 0,
+    JSON.stringify(missRanges),
+  );
+
+  const dupPage = pageAnchor.foldText(["alpha beta", "alpha beta"]);
+  const dupRanges = pageAnchor.matchExcerpts(dupPage, [{ key: "dup", text: "alpha beta" }]);
+  check(
+    G,
+    6,
+    "重复文本：同一子串出现两次（0 / 11）⇒ 恰 1 条区间且 start 指向第一次出现（[0,10)）",
+    dupPage.text === "alpha beta alpha beta" && dupPage.text.indexOf("alpha beta") === 0 && dupPage.text.lastIndexOf("alpha beta") === 11 &&
+      dupRanges.length === 1 && dupRanges[0].start === 0 && dupRanges[0].end === 10 && dupRanges[0].start === dupPage.text.indexOf("alpha beta"),
+    JSON.stringify({ text: dupPage.text, first: dupPage.text.indexOf("alpha beta"), last: dupPage.text.lastIndexOf("alpha beta"), ranges: dupRanges }),
+  );
+
+  const overlapPage = pageAnchor.foldText(["the quick brown fox"]);
+  const bigFirst = pageAnchor.matchExcerpts(overlapPage, [{ key: "B", text: "the quick brown fox" }, { key: "A", text: "quick brown" }]);
+  const smallFirst = pageAnchor.matchExcerpts(overlapPage, [{ key: "A", text: "quick brown" }, { key: "B", text: "the quick brown fox" }]);
+  check(
+    G,
+    7,
+    "多段重叠：A ⊂ B 时先到者获胜（B 先 ⇒ 只留 B[0,19)；A 先 ⇒ 只留 A[4,15)），后来者整体丢弃不截断",
+    bigFirst.length === 1 && bigFirst[0].key === "B" && bigFirst[0].start === 0 && bigFirst[0].end === 19 &&
+      smallFirst.length === 1 && smallFirst[0].key === "A" && smallFirst[0].start === 4 && smallFirst[0].end === 15,
+    JSON.stringify({ bigFirst, smallFirst }),
+  );
+
+  const overLong = pageAnchor.matchExcerpts(pageAnchor.foldText([LONG_401 + " tail"]), [{ key: "k", text: LONG_401 }]);
+  const atLimit = pageAnchor.matchExcerpts(pageAnchor.foldText([LONG_400]), [{ key: "k", text: LONG_400 }]);
+  check(
+    G,
+    8,
+    "超长边界：折叠后 401 字符 ⇒ 跳过（[]）；恰 400 字符 ⇒ 参与匹配（[0,400)）",
+    overLong.length === 0 && atLimit.length === 1 && atLimit[0].start === 0 && atLimit[0].end === 400,
+    JSON.stringify({ overLong, atLimit }),
+  );
+
+  const detPage = pageAnchor.foldText(["alpha beta gamma"]);
+  const emptyNeedle = pageAnchor.matchExcerpts(detPage, [{ key: "e", text: "" }]);
+  const blankNeedle = pageAnchor.matchExcerpts(detPage, [{ key: "w", text: "  \t\n  " }]);
+  const detRanges = pageAnchor.matchExcerpts(detPage, [
+    { key: "k1", text: "alpha" },
+    { key: "k2", text: "zeta" },
+    { key: "k3", text: "gamma" },
+  ]);
+  check(
+    G,
+    9,
+    "空 / 全空白摘录 ⇒ []；三条摘录第 2 条不可匹配 ⇒ 返回顺序 === 被接受输入的子序（k1[0,5) / k3[11,16)）",
+    emptyNeedle.length === 0 && blankNeedle.length === 0 &&
+      detRanges.length === 2 && detRanges[0].key === "k1" && detRanges[0].start === 0 && detRanges[0].end === 5 &&
+      detRanges[1].key === "k3" && detRanges[1].start === 11 && detRanges[1].end === 16,
+    JSON.stringify({ emptyNeedle, blankNeedle, detRanges }),
+  );
+
+  const purePage = pageAnchor.foldText(ANCHOR_PARTS);
+  const pureExcerpts = [{ key: "p1", text: ANCHOR_NEEDLE }];
+  const purePageBefore = JSON.stringify(purePage);
+  const pureExcerptsBefore = JSON.stringify(pureExcerpts);
+  const runA = pageAnchor.matchExcerpts(purePage, pureExcerpts);
+  const runB = pageAnchor.matchExcerpts(purePage, pureExcerpts);
+  const purePageAfter = JSON.stringify(purePage);
+  const pureExcerptsAfter = JSON.stringify(pureExcerpts);
+  const emptyFold = pageAnchor.foldText([]);
+  const blankFold = pageAnchor.foldText(["   "]);
+  check(
+    G,
+    10,
+    "纯性 + 新对象：入参逐字不变；两次调用 JSON 相等但对象不同；foldText([]) ⇒ { text: \"\", at: [] }（全空白同理）",
+    purePageBefore === purePageAfter && pureExcerptsBefore === pureExcerptsAfter &&
+      runA !== runB && JSON.stringify(runA) === JSON.stringify(runB) &&
+      emptyFold.text === "" && emptyFold.at.length === 0 &&
+      blankFold.text === "" && blankFold.at.length === 0,
+    JSON.stringify({ pageSame: purePageBefore === purePageAfter, excerptsSame: pureExcerptsBefore === pureExcerptsAfter, distinct: runA !== runB, equal: JSON.stringify(runA) === JSON.stringify(runB), emptyFold, blankFold }),
+  );
+}
+
 /** 编译仓库内三个源文件到 %TEMP%（不复制源码），校验产物集合后加载。 */
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
@@ -522,6 +781,7 @@ function compileAndLoad() {
       join(REPO_DIR, "pix", "src", "renderer", "utils", "outline-notes.ts"),
       join(REPO_DIR, "pix", "src", "renderer", "utils", "notes-path.ts"),
       join(REPO_DIR, "pix", "src", "renderer", "utils", "reading-context.ts"),
+      join(REPO_DIR, "pix", "src", "renderer", "utils", "page-anchor.ts"),
       WINDOW_SHIM,
     ],
   };
@@ -536,7 +796,7 @@ function compileAndLoad() {
     return false;
   }
 
-  const required = ["renderer/utils/outline-notes.js", "renderer/utils/notes-path.js", "renderer/utils/reading-context.js"];
+  const required = ["renderer/utils/outline-notes.js", "renderer/utils/notes-path.js", "renderer/utils/reading-context.js", "renderer/utils/page-anchor.js"];
   const allowed = new Set([...required, "shared/types.js"]);
   let emitted = [];
   try {
@@ -558,6 +818,7 @@ function compileAndLoad() {
   outlineNotes = require(join(OUT_DIR, "renderer", "utils", "outline-notes.js"));
   readingContext = require(join(OUT_DIR, "renderer", "utils", "reading-context.js"));
   notesPath = require(join(OUT_DIR, "renderer", "utils", "notes-path.js"));
+  pageAnchor = require(join(OUT_DIR, "renderer", "utils", "page-anchor.js"));
   return true;
 }
 
@@ -571,6 +832,8 @@ function main() {
       runSectionNav();
       runSectionFormat();
       runBadgeCounts();
+      runNotesByPage();
+      runExcerptMatch();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;

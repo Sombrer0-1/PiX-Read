@@ -13,10 +13,15 @@ import { GlobalWorkerOptions, TextLayer, getDocument } from "pdfjs-dist";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import PdfJsWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker&inline";
 import { emitRegionCapture } from "../../composables/useRegionCapture";
+import { useNotesStore } from "../../stores/notes-store";
 import { useProjectStore } from "../../stores/project-store";
 import { DEFAULT_SCALE, useReaderStore } from "../../stores/reader-store";
 import { useReaderStateStore } from "../../stores/reader-state-store";
 import { canvasToPngBase64 } from "../../utils/image-capture";
+import { countNotesByPage, docPathKey, sortNotesForContext } from "../../utils/notes-path";
+import type { PageNoteCount } from "../../utils/notes-path";
+import { foldText, matchExcerpts } from "../../utils/page-anchor";
+import type { AnchorExcerpt, AnchorRange, FoldedText } from "../../utils/page-anchor";
 import {
   LibraryReadError,
   failureFromLibraryResult,
@@ -47,6 +52,24 @@ const props = defineProps<{
 const readerStore = useReaderStore();
 const readerStateStore = useReaderStateStore();
 const projectStore = useProjectStore();
+const notesStore = useNotesStore();
+
+/** 原文锚点高亮的注册表名（与搜索高亮各自独立：只删自己的名字）。 */
+const HIGHLIGHT_NOTE_ANCHOR = "pix-note-anchor";
+/** 锚点绘画等待文字层的上限：超时静默放弃本次绘画（不报错、不弹提示、不重试）。 */
+const ANCHOR_LAYER_WAIT_MS = 2000;
+
+/** CSS.highlights 的写接口（lib.dom 只声明了读面；与 PdfSearchPanel.vue 同名同形，刻意重复不抽共享模块）。 */
+type HighlightRegistryWriter = HighlightRegistry & {
+  set(name: string, highlight: Highlight): HighlightRegistry;
+  delete(name: string): boolean;
+};
+
+/** 折叠域 → DOM Range 重建的片段：node = 该页非空文本节点，start = 首字符在「连接后未折叠串」中的下标。 */
+interface AnchorSegment {
+  node: Text;
+  start: number;
+}
 
 const scrollEl = ref<HTMLDivElement | null>(null);
 const isLoading = ref(false);
@@ -77,6 +100,13 @@ const currentChapter = computed(() => {
   return hit ? { range: hit, text: formatChapterHeading(hit) } : null;
 });
 const chapterNav = computed(() => resolveChapterNav(chapterRanges.value, readerStore.page, readerStore.pageCount));
+
+/** 页标记计数（唯一派生调用点）：当前文档 × 每页；模板不做 Map 读取。 */
+const pageNotes = computed(() => countNotesByPage(notesStore.notes, notesStore.currentDocKey));
+/** 模板取数列表：pageSizes × pageNotes 一次 map，每页恰 1 次 Map.get（聚合不在这里做）。 */
+const pageNotesForRender = computed<(PageNoteCount | null)[]>(() =>
+  pageSizes.value.map((_, index) => pageNotes.value.get(index + 1) ?? null),
+);
 
 /** Matches the kernel's resizeImage cap so captures never bloat the request. */
 const CAPTURE_MAX_EDGE = 2000;
@@ -245,6 +275,9 @@ async function renderPage(pageNumber: number, generation: number): Promise<void>
   } finally {
     textLayers.delete(pageNumber);
   }
+  // 文字层渲染完成：流式 chunk 的片段完整性在此收敛；先作废可能不完整的折叠缓存再重画
+  anchorTextCache.delete(pageNumber);
+  scheduleNoteAnchor();
 }
 
 function releasePage(pageNumber: number): void {
@@ -261,6 +294,8 @@ function releasePage(pageNumber: number): void {
   renderedPages.delete(pageNumber);
   const pageEl = pageElement(pageNumber);
   if (pageEl) clearPageLayers(pageEl);
+  // 页面被 release：指向旧节点的区间必须立即失效
+  clearNoteAnchor();
 }
 
 function observePages(): void {
@@ -649,6 +684,9 @@ async function loadPdf(filePath: string): Promise<void> {
   failure.value = null;
   failureDetail.value = "";
   pageSizes.value = [];
+  // 文档切换：清注册表与折叠缓存（新文档的文字层与旧文本无关）
+  clearNoteAnchor();
+  anchorTextCache.clear();
   readerStore.setPageCount(0);
   readerStore.setOutline([]);
   readerStore.setSelectedText("");
@@ -770,6 +808,146 @@ function zoomBy(delta: number): void {
   readerStore.setScale(readerStore.scale + delta);
 }
 
+function onPageNotesClick(pageNumber: number): void {
+  notesStore.focusPageNotes(pageNumber);
+}
+
+// --- 原文锚点：把当前页可匹配的摘录画进第三个 CSS.highlights 注册表 ---
+
+/** 折叠结果按页缓存（缩放不失效：折叠只依赖文本内容）；文档切换与文字层重渲染时作废。 */
+const anchorTextCache = new Map<number, FoldedText>();
+/** 一次性令牌：每次「重画当前页」自增；等待轮询先核对令牌，旧等待自然作废。 */
+let anchorToken = 0;
+let anchorWaitId: number | null = null;
+
+function anchorRegistry(): HighlightRegistryWriter {
+  return CSS.highlights as HighlightRegistryWriter;
+}
+
+/** 删除注册表（「无高亮」的唯一表现）：只删自己的名字，忽略返回值。 */
+function clearNoteAnchor(): void {
+  anchorRegistry().delete(HIGHLIGHT_NOTE_ANCHOR);
+}
+
+/** 当前文档 × 该页的可匹配摘录（顺序 = 注入顺序）；不跨页参与匹配。 */
+function anchorExcerpts(pageNumber: number): AnchorExcerpt[] {
+  const docKey = notesStore.currentDocKey;
+  if (docKey === null) return [];
+  return sortNotesForContext(
+    notesStore.notes.filter(
+      (note) => note.kind === "excerpt" && docPathKey(note.docPath) === docKey && note.page === pageNumber,
+    ),
+  ).map((note) => ({ key: note.id, text: note.text }));
+}
+
+/** 片段表：该页文字层内按 DOM 顺序的全部非空文本节点（不缓存节点引用：每次重画重取）。 */
+function anchorSegments(layer: HTMLElement): AnchorSegment[] {
+  const segments: AnchorSegment[] = [];
+  let offset = 0;
+  const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    if (node instanceof Text) {
+      const value = node.nodeValue ?? "";
+      if (value) {
+        segments.push({ node, start: offset });
+        // 片段间假分隔符在「连接后未折叠串」里占 1 位
+        offset += value.length + 1;
+      }
+    }
+    node = walker.nextNode();
+  }
+  return segments;
+}
+
+/** 从后向前找最后一个 start ≤ index 的片段（片段按 DOM 顺序、start 严格递增）。 */
+function locate(segments: AnchorSegment[], index: number): { node: Text; offset: number } | null {
+  for (let position = segments.length - 1; position >= 0; position -= 1) {
+    const segment = segments[position];
+    if (index >= segment.start) return { node: segment.node, offset: index - segment.start };
+  }
+  return null;
+}
+
+/** 折叠区间 → DOM Range（端点用 at 回溯到真实字符；命中假分隔符或节点不可达 ⇒ null）。 */
+function anchorRangeFor(segments: AnchorSegment[], page: FoldedText, range: AnchorRange): Range | null {
+  const startIndex = page.at[range.start];
+  const lastIndex = page.at[range.end - 1];
+  if (startIndex === undefined || lastIndex === undefined || startIndex < 0 || lastIndex < 0) return null;
+  const from = locate(segments, startIndex);
+  const to = locate(segments, lastIndex);
+  if (!from || !to) return null;
+  const result = document.createRange();
+  result.setStart(from.node, from.offset);
+  result.setEnd(to.node, to.offset + 1);
+  return result;
+}
+
+/** 折叠文本（按页缓存）：片段表每次重取，折叠结果可跨缩放复用。 */
+function anchorFoldedText(pageNumber: number, segments: AnchorSegment[]): FoldedText {
+  const cached = anchorTextCache.get(pageNumber);
+  if (cached) return cached;
+  const folded = foldText(segments.map((segment) => segment.node.nodeValue ?? ""));
+  anchorTextCache.set(pageNumber, folded);
+  return folded;
+}
+
+/** 等待目标页文字层出现首个 span（按帧轮询；等待期间不做任何 DOM 写入，超时静默放弃）。 */
+function waitForAnchorLayer(layer: HTMLElement, token: number): Promise<boolean> {
+  const deadline = performance.now() + ANCHOR_LAYER_WAIT_MS;
+  return new Promise((resolve) => {
+    const poll = () => {
+      anchorWaitId = null;
+      if (token !== anchorToken) {
+        resolve(false);
+        return;
+      }
+      if (layer.querySelector("span")) {
+        resolve(true);
+        return;
+      }
+      if (performance.now() >= deadline) {
+        resolve(false);
+        return;
+      }
+      anchorWaitId = requestAnimationFrame(poll);
+    };
+    poll();
+  });
+}
+
+/** 重画入口（当前页变化 / 笔记变化 / 缩放后重渲染 / 文字层渲染完成）。 */
+function scheduleNoteAnchor(): void {
+  paintNoteAnchor();
+}
+
+/** 本次绘画：先删后画（幂等）；无摘录 / 不可匹配 / 超时 / 区间全丢 ⇒ 注册表保持不存在。 */
+function paintNoteAnchor(): void {
+  const token = ++anchorToken;
+  if (anchorWaitId !== null) {
+    cancelAnimationFrame(anchorWaitId);
+    anchorWaitId = null;
+  }
+  clearNoteAnchor();
+  const pageNumber = readerStore.page;
+  const layer = pageElement(pageNumber)?.querySelector<HTMLElement>(".textLayer") ?? null;
+  if (!layer) return;
+  void waitForAnchorLayer(layer, token).then((ready) => {
+    if (!ready || token !== anchorToken) return;
+    if (readerStore.page !== pageNumber) return;
+    const segments = anchorSegments(layer);
+    if (segments.length === 0) return;
+    const folded = anchorFoldedText(pageNumber, segments);
+    const domRanges: Range[] = [];
+    for (const range of matchExcerpts(folded, anchorExcerpts(pageNumber))) {
+      const domRange = anchorRangeFor(segments, folded, range);
+      if (domRange) domRanges.push(domRange);
+    }
+    if (domRanges.length === 0) return;
+    anchorRegistry().set(HIGHLIGHT_NOTE_ANCHOR, new Highlight(...domRanges));
+  });
+}
+
 // Wheel ticks arrive every ~30ms; each scale change re-renders the visible
 // pages, so apply the leading step and coalesce the burst into one trailing
 // step instead of re-rendering per tick.
@@ -821,10 +999,24 @@ watch(
     for (const pageNumber of [...renderedPages]) {
       releasePage(pageNumber);
     }
+    // 页面重渲染前清掉指向旧节点的区间（匹配结果与缩放无关，重渲染完成后重画）
+    clearNoteAnchor();
     await nextTick();
     observePages();
     scrollToPage(readerStore.page);
   },
+);
+
+// 当前页变化 ⇒ 重画（第一行即删除旧页区间；新页文字层未就绪时按帧等待）
+watch(
+  () => readerStore.page,
+  () => scheduleNoteAnchor(),
+);
+
+// 笔记列表变化（面板内增删改 / 撤销 / 外部刷新）⇒ 按新列表重算
+watch(
+  () => notesStore.notes,
+  () => scheduleNoteAnchor(),
 );
 
 // 阅读现场的第二个（也是最后一个）观察点：落点之后的位置/缩放变化。
@@ -872,6 +1064,11 @@ onBeforeUnmount(() => {
     zoomFlushTimer = null;
   }
   loadGeneration += 1;
+  if (anchorWaitId !== null) {
+    cancelAnimationFrame(anchorWaitId);
+    anchorWaitId = null;
+  }
+  clearNoteAnchor();
   void destroyDocument();
 });
 
@@ -930,6 +1127,13 @@ defineExpose({ gotoPage });
         <div class="pdf-overlay">
           <slot name="overlay" :page="index + 1" />
         </div>
+        <button
+          v-if="pageNotesForRender[index]"
+          type="button"
+          class="page-notes"
+          :title="`本页 ${pageNotesForRender[index]?.total} 条笔记（摘录 ${pageNotesForRender[index]?.excerpt} · AI 结论 ${pageNotesForRender[index]?.answer}）；点击定位到笔记面板`"
+          @click="onPageNotesClick(index + 1)"
+        >本页 {{ pageNotesForRender[index]?.total }} 条</button>
       </div>
     </div>
 
@@ -1096,6 +1300,30 @@ defineExpose({ gotoPage });
   background: rgba(49, 66, 79, 0.28);
   /* 显式保持透明：文字层只贡献选区几何，可见字形由 canvas 提供 */
   color: transparent;
+}
+
+/* 页面笔记标记：绝对定位在页面右下角，不参与流布局 ⇒ 页盒与文字层几何零变化 */
+.page-notes {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  z-index: 3;
+  padding: 1px 6px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 999px;
+  background: var(--pix-bg-elevated, #ffffff);
+  box-shadow: var(--pix-shadow-xs);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.page-notes:hover {
+  border-color: var(--pix-border, #d5dfe8);
+  color: var(--pix-text-primary);
 }
 
 .pdf-overlay {
@@ -1307,5 +1535,14 @@ defineExpose({ gotoPage });
 ::highlight(pix-search-current) {
   background-color: #31424f;
   color: #ffffff;
+}
+
+::highlight(pix-note-anchor) {
+  color: transparent;
+  background-color: rgba(49, 66, 79, 0.07);
+  text-decoration-line: underline;
+  text-decoration-style: solid;
+  text-decoration-thickness: 2px;
+  text-decoration-color: rgba(49, 66, 79, 0.75);
 }
 </style>

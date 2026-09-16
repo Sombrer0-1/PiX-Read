@@ -83,6 +83,28 @@ export function countNotesByDocument(notes: ReaderNote[]): Map<string, NotesBadg
   return counts;
 }
 
+export interface PageNoteCount {
+  total: number;
+  excerpt: number;
+  answer: number;
+}
+
+/** 按页聚合的笔记计数（R16 页标记唯一派生）：单次遍历、键 = 页号、非法页号跳过、只产出 total > 0 的页、每次返回新 Map。 */
+export function countNotesByPage(notes: ReaderNote[], docKey: string | null): Map<number, PageNoteCount> {
+  const counts = new Map<number, PageNoteCount>();
+  if (docKey === null) return counts;
+  for (const note of notes) {
+    if (docPathKey(note.docPath) !== docKey) continue;
+    if (!Number.isInteger(note.page) || note.page < 1) continue;
+    const current = counts.get(note.page) ?? { total: 0, excerpt: 0, answer: 0 };
+    current.total += 1;
+    if (note.kind === "answer") current.answer += 1;
+    else current.excerpt += 1;
+    counts.set(note.page, current);
+  }
+  return counts;
+}
+
 /** 分组顺序：当前文档组置顶 → 其余按 key 升序；组内 page 升序 → 同页 createdAt 升序。 */
 export function groupNotesByDocument(
   notes: ReaderNote[],

@@ -221,6 +221,17 @@ watch(
   },
 );
 
+// 页标记 → 笔记面板：与章节聚焦逐字同构的守卫；不读任何过滤状态，也不发额外 IPC
+// （打开面板的读盘来自既有 selectLeftTab("notes")）。
+watch(
+  () => notesStore.pageFocusToken,
+  (token, previous) => {
+    if (token <= 0 || token <= previous) return;
+    leftCollapsed.value = false;
+    selectLeftTab("notes");
+  },
+);
+
 function onOpenNote(note: ReaderNote): void {
   const target = absoluteDocPath(rootDir.value, note.docPath);
   readerStore.requestJump(target, note.page);
