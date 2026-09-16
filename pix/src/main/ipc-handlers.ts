@@ -18,7 +18,7 @@ import { resolvePixSessionDir, type SessionBridge } from "./session-bridge.js";
 import { getPixStoragePaths, pixAgentDir, pixSessionsRootDir } from "./pix-paths.js";
 import type { SettingsStore } from "./settings-store.js";
 import { clearLibraryRoot, getLibraryRoot, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
-import { addNote, deleteNote, exportNotesMarkdown, loadNotes, resetCorruptNotes, restoreNote, updateNoteComment } from "./notes-store.js";
+import { addNote, deleteNote, exportDocumentReport, exportNotesMarkdown, loadNotes, resetCorruptNotes, restoreNote, updateNoteComment } from "./notes-store.js";
 import { loadReaderState, saveReaderState } from "./reader-state-store.js";
 import type {
   GuiSettings,
@@ -27,6 +27,9 @@ import type {
   ProjectInfo,
   ReaderNoteDraft,
   ReaderNotesMutationResult,
+  ReaderNotesReportChapter,
+  ReaderNotesReportInput,
+  ReaderNotesReportResult,
   ReaderStateSaveDraft,
   ReaderStateSaveResult,
   RpcCommand,
@@ -251,6 +254,48 @@ function isNoteComment(value: unknown): value is string {
 /** 守卫只做形状；路径归属、归一化、限额与去重都在 notes-store 内完成。 */
 function invalidNotesInput(): ReaderNotesMutationResult {
   return { success: false, notes: [], code: "invalid-input", error: "笔记数据不合法" };
+}
+
+function isReportChapter(value: unknown): value is ReaderNotesReportChapter {
+  if (!value || typeof value !== "object") return false;
+  const chapter = value as Record<string, unknown>;
+  return (
+    typeof chapter.title === "string" &&
+    typeof chapter.label === "string" &&
+    chapter.label.length > 0 &&
+    typeof chapter.start === "number" &&
+    Number.isInteger(chapter.start) &&
+    chapter.start >= 1 &&
+    typeof chapter.end === "number" &&
+    Number.isInteger(chapter.end) &&
+    chapter.end >= 1
+  );
+}
+
+/** 守卫只做形状：路径归属、空库判定、渲染与写盘都在 notes-store 内完成。 */
+function isReaderNotesReportInput(value: unknown): value is ReaderNotesReportInput {
+  if (!value || typeof value !== "object") return false;
+  const input = value as Record<string, unknown>;
+  if (typeof input.docFilePath !== "string" || input.docFilePath.length === 0) return false;
+  if (!Array.isArray(input.chapters) || !input.chapters.every(isReportChapter)) return false;
+  const progress = input.progress;
+  if (progress === null) return true;
+  if (!progress || typeof progress !== "object") return false;
+  const pair = progress as Record<string, unknown>;
+  return (
+    typeof pair.page === "number" &&
+    Number.isInteger(pair.page) &&
+    typeof pair.pageCount === "number" &&
+    Number.isInteger(pair.pageCount) &&
+    pair.page >= 1 &&
+    pair.page <= pair.pageCount
+  );
+}
+
+const REPORT_INVALID_MESSAGE = "报告参数不合法";
+
+function invalidReportInput(): ReaderNotesReportResult {
+  return { success: false, code: "invalid-input", error: REPORT_INVALID_MESSAGE };
 }
 
 function isReaderStateDraft(value: unknown): value is ReaderStateSaveDraft {
@@ -480,6 +525,10 @@ export function registerIpcHandlers(
   ipcMain.handle("notes-export", () => exportNotesMarkdown());
 
   ipcMain.handle("notes-reset", () => resetCorruptNotes());
+
+  ipcMain.handle("notes-export-report", (_event, input: unknown) =>
+    isReaderNotesReportInput(input) ? exportDocumentReport(input) : invalidReportInput()
+  );
 
   // =========================================================================
   // Reader state (workspace .pix-read/reader-state.json)

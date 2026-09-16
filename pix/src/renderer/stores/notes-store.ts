@@ -9,11 +9,24 @@
 
 import { computed, ref, watch } from "vue";
 import { defineStore } from "pinia";
-import type { ReaderNote, ReaderNoteDraft, ReaderNotesErrorCode, ReaderNotesMutationResult } from "@shared/types";
+import type {
+  ReaderNote,
+  ReaderNoteDraft,
+  ReaderNotesErrorCode,
+  ReaderNotesMutationResult,
+  ReaderNotesReportChapter,
+} from "@shared/types";
 import type { PixApi } from "../../main/preload";
 import { useReaderStore } from "./reader-store";
 import { useProjectStore } from "./project-store";
-import { currentDocKey as toDocKey, groupNotesByDocument, type NoteGroup, type PageRange } from "../utils/notes-path";
+import { buildChapterRanges } from "../utils/outline-notes";
+import {
+  currentDocKey as toDocKey,
+  docDisplayName,
+  groupNotesByDocument,
+  type NoteGroup,
+  type PageRange,
+} from "../utils/notes-path";
 import {
   applyViewToGroups,
   isUndoExpired,
@@ -28,6 +41,16 @@ export type ExportNotesResult = { ok: true; filePath: string; count: number } | 
 
 /** 撤销三态：stale = 响应所属的撤销目标已被替换或已复位，调用方必须零副作用。 */
 export type UndoDeleteResult = { ok: true } | { ok: false; message: string } | { ok: false; stale: true };
+
+/**
+ * 报告导出四态：stale = 归属守卫丢弃（零副作用）；empty = 当前文档 0 条（未发 IPC）；
+ * 失败只带主进程 error 原文（面板补前缀）。
+ */
+export type ExportDocReportResult =
+  | { ok: true; filePath: string; displayPath: string; count: number }
+  | { ok: false; stale: true }
+  | { ok: false; empty: true }
+  | { ok: false; message: string };
 
 export interface PendingUndo {
   id: string;
@@ -75,6 +98,8 @@ export const useNotesStore = defineStore("notes", () => {
   const errorDetail = ref("");
   const notesFilePath = ref("");
   const lastExport = ref<{ filePath: string; count: number; at: number } | null>(null);
+  /** 最近一次成功的单文档报告：displayName 取发起瞬间的保大小写显示名（不承载任何存储路径）。 */
+  const lastReport = ref<{ filePath: string; displayPath: string; displayName: string; count: number } | null>(null);
   const currentDocOnly = ref(false);
 
   /** 搜索输入原串（不 trim/不归一化存值）；是否生效只看派生 searchActive。 */
@@ -102,6 +127,8 @@ export const useNotesStore = defineStore("notes", () => {
   let writeSeq = 0;
   /** 撤销作用域令牌：resetNotes() 递增，跨工作区的在途响应一律丢弃（守卫②）。 */
   let undoScope = 0;
+  /** 报告作用域令牌：与 undoScope 同处同语义（跨工作区/跨文档的在途报告一律丢弃）。 */
+  let reportScope = 0;
 
   const totalCount = computed(() => notes.value.length);
   const hasNotes = computed(() => notes.value.length > 0);
@@ -121,10 +148,22 @@ export const useNotesStore = defineStore("notes", () => {
   );
   /** V：列表实际渲染行数之和（计数与空态判别的唯一定点，面板不再自行求和）。 */
   const visibleCount = computed(() => groups.value.reduce((sum, group) => sum + group.notes.length, 0));
+  /**
+   * 当前文档的笔记条数：与视图维度（搜索/排序/章节过滤/仅看当前文档）无关
+   * —— 报告导出的空库判据只认这个数，不写第二处文档归属比较。
+   */
+  const currentDocNoteCount = computed(() => {
+    const key = currentDocKey.value;
+    if (key === null) return 0;
+    const groups = groupNotesByDocument(notes.value, key, true);
+    return groups.length > 0 ? groups[0].notes.length : 0;
+  });
 
   // 文档作用域：切文档/关文档即清除章节过滤（token 不变 ⇒ 不触发标签切换，也不发 notesLoad）
   watch(currentDocKey, () => {
     chapterFilter.value = null;
+    // 文档作用域切换即清除报告行：上一份报告不属于当前文档
+    lastReport.value = null;
   });
   const errorMessage = computed(() => (errorCode.value ? ERROR_TITLES[errorCode.value] : "") || errorDetail.value);
   const selectedNotes = computed<ReaderNote[]>(() => notes.value.filter((n) => selectedNoteIds.value.has(n.id)));
@@ -253,6 +292,50 @@ export const useNotesStore = defineStore("notes", () => {
     }
   }
 
+  /**
+   * 单文档报告导出：章节范围与阅读进度只取既有派生，路径一律由主进程回传（本文件不拼存储路径）。
+   * 守卫顺序 = 判据：归属缺失 → 空库（不发 IPC）→ 发起快照 → 在途归属守卫（成功与失败同一处理）。
+   */
+  async function exportCurrentDocReport(): Promise<ExportDocReportResult> {
+    const docKey = currentDocKey.value;
+    const filePath = readerStore.filePath;
+    // ① 归属缺失（无当前文档 / 库外文件）：按钮已禁用；动作级防御与在途归属守卫同语义（丢弃、零副作用）
+    if (docKey === null || !filePath) return { ok: false, stale: true };
+    // ② 当前文档 0 条 ⇒ 不发 IPC、不写任何文件（文案由面板渲染，store 不持有字面）
+    if (currentDocNoteCount.value === 0) return { ok: false, empty: true };
+    // ③ 发起瞬间快照：归属令牌 + 显示名（保原大小写）
+    const scope = reportScope;
+    const displayName = docDisplayName(filePath);
+    const pageCount = readerStore.pageCount;
+    // ④ 章节只取自既有唯一派生（顺序 = Map 插入序）；pageCount === 0 时不派生，避免 Infinity 外泄
+    const chapters =
+      pageCount > 0
+        ? [...buildChapterRanges(readerStore.outline, pageCount).values()].map(
+            (range): ReaderNotesReportChapter => ({
+              title: range.title,
+              start: range.start,
+              end: range.end,
+              label: range.label,
+            }),
+          )
+        : [];
+    const progress = pageCount > 0 ? { page: readerStore.page, pageCount } : null;
+    try {
+      const result = await bridge().notesExportReport({ docFilePath: filePath, chapters: chapters, progress: progress });
+      // ⑤ 在途归属守卫：文档已切换或 store 已复位 ⇒ 丢弃结果（成功与失败同一处理）
+      if (scope !== reportScope || currentDocKey.value !== docKey) return { ok: false, stale: true };
+      if (!result.success || !result.filePath || !result.displayPath) {
+        return { ok: false, message: result.error ?? "生成报告失败" };
+      }
+      const count = result.count ?? 0;
+      lastReport.value = { filePath: result.filePath, displayPath: result.displayPath, displayName, count };
+      return { ok: true, filePath: result.filePath, displayPath: result.displayPath, count };
+    } catch (err) {
+      if (scope !== reportScope || currentDocKey.value !== docKey) return { ok: false, stale: true };
+      return { ok: false, message: rejectMessage(err) };
+    }
+  }
+
   async function recoverCorruptNotes(): Promise<NotesActionResult> {
     try {
       const result = await bridge().notesReset();
@@ -272,12 +355,14 @@ export const useNotesStore = defineStore("notes", () => {
   function resetNotes(): void {
     loadSeq += 1;
     undoScope += 1;
+    reportScope += 1;
     notes.value = [];
     status.value = "idle";
     errorCode.value = null;
     errorDetail.value = "";
     notesFilePath.value = "";
     lastExport.value = null;
+    lastReport.value = null;
     currentDocOnly.value = false;
     chapterFilter.value = null;
     chapterFocusToken.value = 0;
@@ -354,6 +439,7 @@ export const useNotesStore = defineStore("notes", () => {
     errorDetail,
     notesFilePath,
     lastExport,
+    lastReport,
     currentDocOnly,
     searchQuery,
     activeQuery,
@@ -370,6 +456,7 @@ export const useNotesStore = defineStore("notes", () => {
     hasNotes,
     currentDocKey,
     chapterRange,
+    currentDocNoteCount,
     groups,
     errorMessage,
     loadNotes,
@@ -377,6 +464,7 @@ export const useNotesStore = defineStore("notes", () => {
     updateNoteComment,
     removeNote,
     exportMarkdown,
+    exportCurrentDocReport,
     recoverCorruptNotes,
     resetNotes,
     setCurrentDocOnly,

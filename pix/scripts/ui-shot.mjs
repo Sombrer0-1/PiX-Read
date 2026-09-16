@@ -98,6 +98,11 @@ const SEL = {
   pageInput: ".page-input",
   readerMain: ".reader-main",
   composerInput: ".input-area",
+  // R13 新增 4 项（设计档 §5.2.1）
+  reportBtn: ".notes-report-btn",
+  reportRow: ".notes-report-row",
+  reportText: ".notes-report-row .report-text",
+  reportReveal: ".notes-report-row .report-reveal",
 };
 
 // ---------------------------------------------------------------------------
@@ -370,6 +375,8 @@ function seedNotes() {
 function writeFixtures() {
   mkdirSync(join(LIBRARY_DIR, "archive"), { recursive: true });
   mkdirSync(join(LIBRARY_DIR, ".pix-read"), { recursive: true });
+  // R13：每次运行从「无报告目录」开始（r13-1 的「报告不存在」与 r13-5 的「删目录后自愈」才可复现）
+  rmSync(join(LIBRARY_DIR, ".pix-read", "reports"), { recursive: true, force: true });
   mkdirSync(join(LIBRARY_B_DIR, ".pix-read"), { recursive: true });
   mkdirSync(SHOTS_DIR, { recursive: true });
   // A/B 两个工作区的 sample-paper.pdf 同字节；B 不预置 reader-state.json（首启 missing）
@@ -435,6 +442,16 @@ let notesRestoreFailure = null;
 // 还原响应延迟：作用于「读-改-写之后、返回之前」（落盘顺序 = 请求到达顺序）
 let notesRestoreDelayMs = 0;
 const notesRestoreCalls = [];
+// R13 报告：根与写入都在真实夹具根内（CONFIG.root = 工作区 A，与 NOTES_FILE / relativeDocPath 同根）
+const notesReportCalls = [];
+let notesReportFailure = null;
+// 延迟只推迟响应：落盘、计数与 payload 记录在调用时完成（与 notesRestore 的 resolvedAt 同范式）
+let notesReportDelayMs = 0;
+// 报告专有文案（与 src/main/notes-store.ts 逐字一致；独立映射，不复用 NOTES_ERRORS 的 write-failed）
+const REPORT_ERRORS = {
+  "write-failed": "报告写入失败",
+  empty: "当前文档暂无笔记，未生成报告",
+};
 // 还原专有文案（与 src/main/notes-store.ts 逐字一致）
 const RESTORE_EMPTY_MESSAGE = "没有可撤销的删除";
 const RESTORE_EXISTS_MESSAGE = "该笔记已重新存在，无法撤销";
@@ -443,6 +460,8 @@ const RESTORE_DUPLICATE_MESSAGE = "该笔记内容已重新存在，无法撤销
 let notesLoadCalls = 0;
 // 发送类命令（prompt/steer）的记录：notes-context / notes-chip 断言的事实源（N50 验收 1）
 const sendCalls = [];
+// 「在文件夹中显示」的参数记录（r13-5 相位 reveal-and-clear 的唯一判据；行为与返回值不变）
+const libraryShowPaths = [];
 let sendFailure = null;
 let agentEventHandlers = [];
 // onUserInputRequest 的保留回调（与 onAgentEvent 同形）：emitUserInputRequest 逐个投递
@@ -503,6 +522,75 @@ const NOTES_ERRORS = {
 };
 
 const ANSWER_TOO_LONG_MESSAGE = "回答过长（超过 4000 字），无法存为笔记";
+
+// --- 报告：主进程 renderDocumentReport 的逐字镜像（同一份手写期望串在烟测侧钉住两侧） -----
+
+/** 条目：与 renderMarkdownEntry 同款（「### 第 N 页」标题 + AI 结论后缀 + 「> 」逐行 + 可选备注）。 */
+function renderReportEntry(note) {
+  const title = note.kind === "answer" ? "### 第 " + note.page + " 页 · AI 结论" : "### 第 " + note.page + " 页";
+  const lines = [title, ""].concat(
+    String(note.text).split("\\n").map(function (line) { return "> " + line; }),
+  );
+  if (note.comment) lines.push("", "备注：" + note.comment);
+  return lines.join("\\n");
+}
+
+/** 生成时间（formatStampHuman 同款：本地时间、无 locale）。 */
+function formatReportStamp(ms) {
+  const pad = function (value) { return String(value).padStart(2, "0"); };
+  const date = new Date(ms);
+  return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) +
+    " " + pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
+}
+
+/** 文档显示名（workspaceName 同款：按分隔符取末段，保原大小写）。 */
+function reportDisplayName(docPath) {
+  const segments = String(docPath).replace(/\\\\/g, "/").split("/").filter(Boolean);
+  return segments[segments.length - 1] || String(docPath);
+}
+
+/** 完整报告串（分组规则、排序三键、分隔符与尾换行与主进程逐字一致）。 */
+function renderDocumentReport(entries, docPath, name, chapters, progress, now) {
+  const ordered = entries.slice().sort(function (a, b) {
+    return a.page - b.page || a.createdAt - b.createdAt || String(a.id).localeCompare(String(b.id));
+  });
+  const excerpts = ordered.filter(function (note) { return note.kind === "excerpt"; }).length;
+  const progressPart = progress ? "阅读进度：第 " + progress.page + " / " + progress.pageCount + " 页；" : "";
+  const meta = "> 由 PiX-Read 生成，每次导出都会覆盖。资料库：" + name + "；文档：" + docPath +
+    "；生成时间：" + formatReportStamp(now) + "；" + progressPart + "共 " + ordered.length +
+    " 条（摘录 " + excerpts + " · AI 结论 " + (ordered.length - excerpts) + "）。";
+  const heading = function (title, list) { return "## " + title + "（" + list.length + " 条）"; };
+  const block = function (title, list) {
+    return heading(title, list) + "\\n\\n" + list.map(renderReportEntry).join("\\n\\n---\\n\\n");
+  };
+  const blocks = [];
+  if (!chapters.length) {
+    // 退化：按页分组（ordered 已按 page 升序 ⇒ Map 插入序即页升序）
+    const byPage = new Map();
+    ordered.forEach(function (note) {
+      const bucket = byPage.get(note.page);
+      if (bucket) bucket.push(note);
+      else byPage.set(note.page, [note]);
+    });
+    byPage.forEach(function (list, page) { blocks.push(block("第 " + page + " 页", list)); });
+  } else {
+    const buckets = chapters.map(function () { return []; });
+    const fallback = [];
+    ordered.forEach(function (note) {
+      // 闭区间、含两端；第一条命中获胜
+      const index = chapters.findIndex(function (chapter) { return chapter.start <= note.page && note.page <= chapter.end; });
+      if (index >= 0) buckets[index].push(note);
+      else fallback.push(note);
+    });
+    chapters.forEach(function (chapter, index) {
+      const list = buckets[index];
+      if (!list.length) return;
+      blocks.push(block((normalizeNoteText(chapter.title) || "未命名") + " · 第 " + chapter.label + " 页", list));
+    });
+    if (fallback.length) blocks.push(block("未归入章节", fallback));
+  }
+  return ["# 阅读报告 · " + reportDisplayName(docPath), meta].concat(blocks).join("\\n\\n") + "\\n";
+}
 
 const MODELS = [
   { provider: "anthropic", id: "claude-sonnet-4-20250514", contextWindow: 200000, reasoning: true, thinkingLevels: ["off", "low", "medium", "high"], input: ["text", "image"] },
@@ -764,7 +852,10 @@ const api = {
 
   libraryList: async function (dir) { return libraryList(dir); },
   libraryOpenPath: async function () { return { success: true }; },
-  libraryShowInFolder: async function () { return { success: true }; },
+  libraryShowInFolder: async function (targetPath) {
+    libraryShowPaths.push(String(targetPath === null || targetPath === undefined ? "" : targetPath));
+    return { success: true };
+  },
   libraryReadText: async function (target) { return readText(target); },
   libraryReadFile: async function (target) {
     if (libraryReadDelayMs) await sleep(libraryReadDelayMs);
@@ -917,6 +1008,45 @@ const api = {
     // 与 notesLoad 同源（文件），避免「内存数组 vs 文件」两套事实源；stub 不生成 notes.md 内容
     return { success: true, filePath: path.join(CONFIG.root, ".pix-read", "notes.md"), count: readNotesFile().length };
   },
+  /** 报告导出：真写 .pix-read/reports/<rel>.md；调用进入即计数与记账（延迟只推迟响应）。 */
+  notesExportReport: async function (input) {
+    const payload = {
+      docFilePath: input ? input.docFilePath : null,
+      chapters: input ? input.chapters : null,
+      progress: input ? input.progress : null,
+    };
+    const call = {
+      docFilePath: payload.docFilePath,
+      chapters: payload.chapters,
+      progress: payload.progress,
+      resolvedAt: null,
+    };
+    notesReportCalls.push(call);
+    if (notesReportFailure) {
+      call.resolvedAt = Date.now();
+      return { success: false, code: notesReportFailure, error: REPORT_ERRORS[notesReportFailure] || notesReportFailure };
+    }
+    const rel = relativeDocPath(payload.docFilePath);
+    const file = path.join(CONFIG.root, ".pix-read", "reports", rel + ".md");
+    const entries = readNotesFile().filter(function (note) { return docPathKey(note.docPath) === docPathKey(rel); });
+    if (!entries.length) {
+      call.resolvedAt = Date.now();
+      return { success: false, code: "empty", error: REPORT_ERRORS.empty };
+    }
+    const content = renderDocumentReport(
+      entries,
+      rel,
+      path.basename(CONFIG.root),
+      payload.chapters || [],
+      payload.progress || null,
+      Date.now(),
+    );
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content, "utf8");
+    if (notesReportDelayMs) await sleep(notesReportDelayMs);
+    call.resolvedAt = Date.now();
+    return { success: true, filePath: file, displayPath: ".pix-read/reports/" + rel + ".md", count: entries.length };
+  },
   notesReset: async function () {
     writeNotesFile([]);
     // 重建 = 从空库开始：重建前删除的条目不得被悄悄写回
@@ -999,6 +1129,14 @@ contextBridge.exposeInMainWorld("__pixStub", {
     });
   },
   setNotesAddDelay: function (ms) { notesAddDelayMs = ms || 0; },
+  notesReportCalls: function () {
+    return { count: notesReportCalls.length, payloads: notesReportCalls.slice(-8) };
+  },
+  setNotesReportFailure: function (code) { notesReportFailure = code || null; },
+  setNotesReportDelay: function (ms) { notesReportDelayMs = ms || 0; },
+  libraryShowCalls: function () {
+    return { count: libraryShowPaths.length, paths: libraryShowPaths.slice(-8) };
+  },
   setMessages: function (list) {
     stubMessages = Array.isArray(list) ? list.map(function (message) { return Object.assign({}, message); }) : [];
   },
@@ -7260,6 +7398,618 @@ async function runReaderStateScenarios(win, log) {
       ...(countOccurrences(prompt13.message, "reader_notes:") === 0 ? [] : ["无选择集时不得输出 reader_notes:"]),
     ],
   );
+  // =========================================================================
+  // R13 阅读报告（N82–N86）：helper 块 + 场景 r13-1 … r13-5
+  //
+  // 就绪纪律：有书签文档沿用 waitSectionReady()（页码 pill 可见严格早于章节派生），无书签文档
+  //   沿用 settleEmptyOutline()；r13-1 / r13-5 按设计档定稿修订 §R13-4 不断言章节入参，不加该门。
+  // 报告根：stub 的 CONFIG.root（工作区 A），与 NOTES_FILE / relativeDocPath 同根。
+  // 插值纪律：进入页面上下文的字符串一律 JSON.stringify 插值，Node 侧常量名不得进页面。
+  // =========================================================================
+
+  const REPORT_DIR = join(LIBRARY_DIR, ".pix-read", "reports");
+  const REPORT_SAMPLE = join(REPORT_DIR, "sample-paper.pdf.md");
+  const NOTES_MD_FILE = join(LIBRARY_DIR, ".pix-read", "notes.md");
+  /** 唯一非确定性字段的归一化（与烟测 STAMP_RE 逐字同一条表达式）。 */
+  const REPORT_STAMP_RE = /生成时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/;
+  const normalizeStamp = (text) => text.replace(REPORT_STAMP_RE, "生成时间：<STAMP>");
+  /** 报告绝对路径（元素缺失即抛错，不静默返回空串）。 */
+  const reportPath = (relPath) => join(REPORT_DIR, ...relPath.split("/"));
+  const readReport = (relPath) => readFileSync(reportPath(relPath), "utf8");
+  /** 存在性：readFileSync 成功即存在（本脚本不新增 fs import，语义与 existsSync 等价）。 */
+  const reportExists = (relPath) => {
+    try {
+      readFileSync(reportPath(relPath));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const notesReportCalls = () => js("window.__pixStub.notesReportCalls()");
+  const libraryShowCalls = () => js("window.__pixStub.libraryShowCalls()");
+  const setNotesReportFailure = (code) => js(`window.__pixStub.setNotesReportFailure(${JSON.stringify(code)}), true`);
+  const setNotesReportDelay = (ms) => js(`window.__pixStub.setNotesReportDelay(${ms}), true`);
+  const pixReadEntries = () => readdirSync(join(LIBRARY_DIR, ".pix-read")).sort();
+  /** 组标题行 / 元信息行（逐字比对用；两条都是文本行的唯一取法）。 */
+  const reportGroups = (text) => text.split("\n").filter((line) => line.startsWith("## "));
+  const reportMetaLine = (text) => text.split("\n").find((line) => line.startsWith("> 由 PiX-Read 生成")) ?? null;
+  const lastReportPayload = async () => (await notesReportCalls()).payloads.slice(-1)[0] ?? null;
+  /** 报告响应落地：计数到达目标值且最后一条 payload 已 resolve（延迟注入下不靠 sleep 空转）。 */
+  const waitReportSettled = (count) =>
+    waitFor(`报告调用落地（count=${count}）`, `(() => {
+      const calls = window.__pixStub.notesReportCalls();
+      return calls.count === ${count} && calls.payloads[calls.payloads.length - 1].resolvedAt !== null;
+    })()`);
+
+  /** 入口与状态行现场：一次 js 读完（字段集合封闭；文本空白归一化，rect 与 rectOfSelector 同口径）。 */
+  const reportProbe = () => js(`(() => {
+    const rect = (el) => {
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const btn = document.querySelector(${JSON.stringify(SEL.reportBtn)});
+    const search = document.querySelector(".notes-search");
+    const headerTop = document.querySelector(".notes-header-top");
+    const row = document.querySelector(${JSON.stringify(SEL.reportRow)});
+    return {
+      btnInDom: !!btn,
+      btnText: text(btn),
+      btnTitle: btn ? btn.getAttribute("title") : null,
+      btnDisabled: btn ? btn.disabled : null,
+      btnRect: btn ? rect(btn) : null,
+      searchRect: search ? rect(search) : null,
+      headerTopRect: headerTop ? rect(headerTop) : null,
+      rowInDom: !!row,
+      rowText: text(document.querySelector(${JSON.stringify(SEL.reportText)})),
+      revealText: text(document.querySelector(${JSON.stringify(SEL.reportReveal)})),
+      countText: text(document.querySelector(".notes-count")),
+      exportLabel: text(document.querySelector(".notes-export-btn")),
+    };
+  })()`);
+  /** 行宽判据（评审 S-6）：block 属性 ⇒ 与同受 .notes-header 内边距约束的 .notes-search 同宽（±1px）。 */
+  const entryWidthOk = (probe) =>
+    !!probe.btnRect && !!probe.searchRect && Math.abs(probe.btnRect.width - probe.searchRect.width) <= 1;
+  /** 入口行在头部首行之下（不压 .notes-count 文本）。 */
+  const entryBelowHeader = (probe) =>
+    !!probe.btnRect &&
+    !!probe.headerTopRect &&
+    probe.btnRect.y >= probe.headerTopRect.y + probe.headerTopRect.height - 1;
+
+  /** 越界页夹具（r13-3）：该条不命中任何章节 ⇒ 归入兜底组。 */
+  const outOfRangeNote = () => {
+    const stamp = Date.now() - 3 * MINUTE;
+    return {
+      id: "n-out-of-range",
+      kind: "excerpt",
+      docPath: "sample-paper.pdf",
+      page: 9,
+      text: "Out-of-range excerpt: this page is beyond the document page count.",
+      comment: "",
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+  };
+
+  /** 文本文档夹具（r13-4）：无 outline + 无进度 ⇒ 退化按页分组。 */
+  const textDocNote = () => {
+    const stamp = Date.now() - 5 * MINUTE;
+    return {
+      id: "n-text-doc",
+      kind: "excerpt",
+      docPath: "reading-notes.md",
+      page: 1,
+      text: "阅读清单：sample-paper.pdf 已完成，archive/older-paper.pdf 待读。",
+      comment: "",
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+  };
+
+  /** sample-paper.pdf（标准种子）的章节入参期望值（手写；顺序 = 预序；与地图徽标同源）。 */
+  const EXPECT_CHAPTERS_13 = [
+    { title: "1. Abstract", start: 1, end: 1, label: "1" },
+    { title: "2. Method Overview", start: 2, end: 2, label: "2" },
+    { title: "2.1 Sparse mask budget", start: 2, end: 2, label: "2" },
+    { title: "2.2 Positional prior", start: 3, end: 3, label: "3" },
+    { title: "3. Ablation Study", start: 3, end: 3, label: "3" },
+    { title: "Appendix A.1", start: 3, end: 3, label: "3" },
+    { title: "Appendix B", start: 2, end: 3, label: "2-3" },
+  ];
+
+  // --- r13-1：入口行三分叉（组 r13-report-entry，3 条 record，2 张截图） -------------------
+  log("r13-1 报告入口：无文档禁用 / 打开文档可用 / 当前文档 0 条不发 IPC");
+  await enterCleanWorkspace(seedNotes());
+  await openNotesPanel(4);
+  const probe13a = await reportProbe();
+  const leftWidth13a = await js(`document.querySelector(${JSON.stringify(SEL.layoutLeft)}).offsetWidth`);
+  await capturePage(win, "r13-1-report-disabled.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-entry",
+    {
+      phase: "disabled-no-doc",
+      probe: probe13a,
+      entryWidthOk: entryWidthOk(probe13a),
+      entryBelowHeader: entryBelowHeader(probe13a),
+      leftWidth: leftWidth13a,
+    },
+    [
+      ...(probe13a.btnInDom ? [] : [`无当前文档时入口应在 DOM：${JSON.stringify(probe13a)}`]),
+      ...(probe13a.btnText === "导出当前文档报告" ? [] : [`按钮文本异常：${probe13a.btnText}`]),
+      ...(probe13a.btnTitle === "导出当前文档的阅读报告（Markdown）" ? [] : [`按钮 title 异常：${probe13a.btnTitle}`]),
+      ...(probe13a.btnDisabled === true ? [] : [`无当前文档时应禁用：${JSON.stringify(probe13a)}`]),
+      ...(entryWidthOk(probe13a)
+        ? []
+        : [`入口按钮未占满行宽：${JSON.stringify({ btn: probe13a.btnRect, search: probe13a.searchRect })}`]),
+      ...(entryBelowHeader(probe13a)
+        ? []
+        : [`入口行压住头部首行：${JSON.stringify({ btn: probe13a.btnRect, header: probe13a.headerTopRect })}`]),
+      ...(probe13a.rowInDom === false ? [] : [`未导出前不得有状态行：${probe13a.rowText}`]),
+    ],
+  );
+
+  await backToLibraryTab();
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  const probe13b = await reportProbe();
+  record(
+    "r13-report-entry",
+    { phase: "enabled-with-doc", probe: probe13b, countText: probe13b.countText, exportLabel: probe13b.exportLabel },
+    [
+      ...(probe13b.btnDisabled === false ? [] : [`有当前文档时应可点：${JSON.stringify(probe13b)}`]),
+      ...(probe13b.btnText === "导出当前文档报告" && probe13b.btnTitle === "导出当前文档的阅读报告（Markdown）"
+        ? []
+        : [`打开文档不应改变按钮文本/title：${JSON.stringify({ text: probe13b.btnText, title: probe13b.btnTitle })}`]),
+      ...(probe13b.countText === "共 4 条" ? [] : [`头部计数被挤动：${probe13b.countText}`]),
+      ...(probe13b.exportLabel === "导出 Markdown" ? [] : [`既有导出按钮被挤动：${probe13b.exportLabel}`]),
+    ],
+  );
+
+  await backToLibraryTab();
+  await openRow("reading-notes.md");
+  await waitFor("Markdown 预览", `document.querySelector(".reader-body")`);
+  await openNotesPanel(4);
+  const notesMdHash13c = fileHash(NOTES_MD_FILE);
+  const callsBase13c = (await notesReportCalls()).count;
+  const exists13c = reportExists("reading-notes.md.md");
+  await clickEl(SEL.reportBtn);
+  await waitFor("无笔记提示", `document.querySelector(".notes-notice.is-error")`);
+  const notice13c = await notesNotice();
+  const callsAfter13c = (await notesReportCalls()).count;
+  const probe13c = await reportProbe();
+  await capturePage(win, "r13-1b-report-no-notes-notice.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-entry",
+    {
+      phase: "no-notes-notice",
+      notice: notice13c,
+      callsDelta: callsAfter13c - callsBase13c,
+      reportExists: reportExists("reading-notes.md.md"),
+      rowInDom: probe13c.rowInDom,
+      notesMdHashSame: fileHash(NOTES_MD_FILE) === notesMdHash13c,
+    },
+    [
+      ...(notice13c && notice13c.isError && notice13c.text === "当前文档暂无笔记，未生成报告"
+        ? []
+        : [`空库提示异常：${JSON.stringify(notice13c)}`]),
+      ...(callsAfter13c - callsBase13c === 0 ? [] : [`空库不得发 IPC：${callsAfter13c - callsBase13c}`]),
+      ...(exists13c === false && reportExists("reading-notes.md.md") === false
+        ? []
+        : [`空库不得写报告文件：${JSON.stringify({ before: exists13c, after: reportExists("reading-notes.md.md") })}`]),
+      ...(probe13c.rowInDom === false ? [] : [`空库不得产生状态行：${probe13c.rowText}`]),
+      ...(fileHash(NOTES_MD_FILE) === notesMdHash13c ? [] : ["空库导出不得改写 notes.md"]),
+    ],
+  );
+
+  // --- r13-2：状态行 / 入参 / 正文逐字节（组 r13-report-content，3 条 record，2 张截图） -------
+  log("r13-2 报告内容：状态行文本 / 章节入参逐字段 / 正文逐字节与零副作用");
+  await enterNotesProbe();
+  await waitSectionReady();
+  const seed13d = seedNotes();
+  const expectedReport13d = [
+    "# 阅读报告 · sample-paper.pdf",
+    "",
+    "> 由 PiX-Read 生成，每次导出都会覆盖。资料库：library；文档：sample-paper.pdf；生成时间：<STAMP>；阅读进度：第 1 / 3 页；共 3 条（摘录 2 · AI 结论 1）。",
+    "",
+    "## 1. Abstract · 第 1 页（1 条）",
+    "",
+    "### 第 1 页",
+    "",
+    `> ${seed13d[0].text}`,
+    "",
+    `备注：${seed13d[0].comment}`,
+    "",
+    "## 2. Method Overview · 第 2 页（2 条）",
+    "",
+    "### 第 2 页",
+    "",
+    `> ${seed13d[1].text}`,
+    "",
+    "---",
+    "",
+    "### 第 2 页 · AI 结论",
+    "",
+    `> ${seed13d[3].text}`,
+    "",
+    `备注：${seed13d[3].comment}`,
+  ].join("\n") + "\n";
+  const notesHash13d = notesHash();
+  const notesMdHash13d = fileHash(NOTES_MD_FILE);
+  const callsBase13d = (await notesReportCalls()).count;
+  // 现场稳定：等阅读现场的去抖落盘（DEBOUNCE_MS=600）结束，否则 reader-state.json 会落在两次快照之间
+  for (let attempt = 0; attempt < 30 && fileHash(STATE_FILE_A) === null; attempt += 1) await sleep(100);
+  const pixReadBefore13d = pixReadEntries();
+  await clickEl(SEL.reportBtn);
+  await waitFor("报告状态行", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const probe13d = await reportProbe();
+  await capturePage(win, "r13-2-report-row.png");
+  await capturePage(win, "r13-2b-report-row-left-pane.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-content",
+    {
+      phase: "export-success",
+      rowText: probe13d.rowText,
+      revealText: probe13d.revealText,
+      notice: await notesNotice(),
+      fileExists: reportExists("sample-paper.pdf.md"),
+      pixReadBefore: pixReadBefore13d,
+    },
+    [
+      ...(probe13d.rowText === "报告：sample-paper.pdf（3 条）→ .pix-read/reports/sample-paper.pdf.md"
+        ? []
+        : [`状态行文本异常：${probe13d.rowText}`]),
+      ...(probe13d.revealText === "在文件夹中显示" ? [] : [`行按钮文本异常：${probe13d.revealText}`]),
+      ...((await notesNotice()) === null ? [] : ["成功只应给状态行一处反馈（不得弹提示）"]),
+      ...(reportExists("sample-paper.pdf.md") ? [] : ["导出成功后报告文件应存在"]),
+    ],
+  );
+
+  const payload13d = await lastReportPayload();
+  const callsAfter13d = (await notesReportCalls()).count;
+  record(
+    "r13-report-content",
+    {
+      phase: "payload",
+      callsDelta: callsAfter13d - callsBase13d,
+      docFilePath: payload13d ? payload13d.docFilePath : null,
+      chapters: payload13d ? payload13d.chapters : null,
+      progress: payload13d ? payload13d.progress : null,
+    },
+    [
+      ...(payload13d && payload13d.docFilePath === join(LIBRARY_DIR, "sample-paper.pdf")
+        ? []
+        : [`入参文档路径异常：${JSON.stringify(payload13d ? payload13d.docFilePath : null)}`]),
+      ...(payload13d && JSON.stringify(payload13d.chapters) === JSON.stringify(EXPECT_CHAPTERS_13)
+        ? []
+        : [`章节入参逐字段不符：${JSON.stringify(payload13d ? payload13d.chapters : null)}`]),
+      ...(payload13d && payload13d.progress && payload13d.progress.page === 1 && payload13d.progress.pageCount === 3
+        ? []
+        : [`阅读进度入参异常：${JSON.stringify(payload13d ? payload13d.progress : null)}`]),
+      ...(callsAfter13d - callsBase13d === 1 ? [] : [`一次点击只应发 1 次调用：${callsAfter13d - callsBase13d}`]),
+    ],
+  );
+
+  const rawReport13d = readReport("sample-paper.pdf.md");
+  const normalized13d = normalizeStamp(rawReport13d);
+  const stampHits13d = rawReport13d.match(new RegExp(REPORT_STAMP_RE.source, "g")) ?? [];
+  const stampValue13d = (stampHits13d[0] ?? "").replace("生成时间：", "");
+  const pixReadAdded13d = [
+    ...pixReadEntries().filter((name) => !pixReadBefore13d.includes(name)),
+  ];
+  const pixReadRemoved13d = pixReadBefore13d.filter((name) => !pixReadEntries().includes(name));
+  record(
+    "r13-report-content",
+    {
+      phase: "content-verbatim",
+      reportText: normalized13d,
+      stampOk: stampHits13d.length === 1 && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(stampValue13d),
+      notesHashSame: notesHash() === notesHash13d,
+      notesMdHashSame: fileHash(NOTES_MD_FILE) === notesMdHash13d,
+      pixReadAdded: pixReadAdded13d,
+      pixReadRemoved: pixReadRemoved13d,
+    },
+    [
+      ...(normalized13d === expectedReport13d
+        ? []
+        : [`报告正文与手写期望串不等：${JSON.stringify({ actual: normalized13d, expected: expectedReport13d })}`]),
+      ...(stampHits13d.length === 1 && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(stampValue13d)
+        ? []
+        : [`生成时间字段异常：${JSON.stringify({ hits: stampHits13d.length, value: stampValue13d })}`]),
+      ...(notesHash() === notesHash13d ? [] : ["报告导出不得改写 notes.json"]),
+      ...(fileHash(NOTES_MD_FILE) === notesMdHash13d ? [] : ["报告导出不得改写 notes.md"]),
+      ...(pixReadAdded13d.length === 1 && pixReadAdded13d[0] === "reports" && pixReadRemoved13d.length === 0
+        ? []
+        : [`在 .pix-read 下应只新增 reports：${JSON.stringify({ added: pixReadAdded13d, removed: pixReadRemoved13d })}`]),
+    ],
+  );
+
+  // --- r13-3：兜底组与幂等（组 r13-report-fallback，2 条 record，1 张截图） -----------------
+  log("r13-3 兜底组：越界页恒最后 + 搜索生效时报告仍 4 条 + 二次导出幂等（不重置现场）");
+  await enterNotesProbe([...seedNotes(), outOfRangeNote()], 5);
+  await waitSectionReady();
+  await clickEl(".notes-export-btn");
+  await waitFor("既有导出行", `document.querySelector(".notes-export-row .export-text")`);
+  await setSearch("Table 2");
+  await waitFor("搜索生效（1 行）", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 1`);
+  const callsBase13e = (await notesReportCalls()).count;
+  await clickEl(SEL.reportBtn);
+  await waitFor("报告状态行", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const report13e = readReport("sample-paper.pdf.md");
+  const groups13e = reportGroups(report13e);
+  const meta13e = reportMetaLine(report13e);
+  const searchState13e = await searchProbe();
+  const exportText13e = await textOf(".notes-export-row .export-text");
+  const probe13e = await reportProbe();
+  const outOfRangeText13e = outOfRangeNote().text;
+  await capturePage(win, "r13-3-report-fallback-row.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-fallback",
+    {
+      phase: "fallback",
+      groups: groups13e,
+      outOfRangeCount: report13e.split(outOfRangeText13e).length - 1,
+      stats: meta13e,
+      searchValue: searchState13e.value,
+      visibleRows: searchState13e.rows,
+      exportText: exportText13e,
+      bothRows: probe13e.rowInDom && exportText13e !== null,
+      reportText: normalizeStamp(report13e),
+    },
+    [
+      ...(JSON.stringify(groups13e) ===
+      JSON.stringify(["## 1. Abstract · 第 1 页（1 条）", "## 2. Method Overview · 第 2 页（2 条）", "## 未归入章节（1 条）"])
+        ? []
+        : [`组标题集合异常：${JSON.stringify(groups13e)}`]),
+      ...(report13e.split(outOfRangeText13e).length - 1 === 1 ? [] : ["越界条正文应恰好出现一次"]),
+      ...(report13e.indexOf(seedNotes()[1].text) < report13e.indexOf(seedNotes()[3].text)
+        ? []
+        : ["第 2 页组内应先摘录后 AI 结论"]),
+      ...(meta13e && meta13e.includes("共 4 条（摘录 3 · AI 结论 1）") ? [] : [`统计段异常：${meta13e}`]),
+      ...(searchState13e.value === "Table 2" && searchState13e.rows === 1
+        ? []
+        : [`搜索应生效（1 行）：${JSON.stringify(searchState13e)}`]),
+      ...(exportText13e === "已导出 5 条 → .pix-read/notes.md" ? [] : [`既有导出行文本异常：${exportText13e}`]),
+      ...(probe13e.rowInDom ? [] : ["报告状态行应在 DOM（与既有导出行共存）"]),
+      ...(probe13e.rowText === "报告：sample-paper.pdf（4 条）→ .pix-read/reports/sample-paper.pdf.md"
+        ? []
+        : [`状态行文本异常（搜索生效时条数不得变）：${probe13e.rowText}`]),
+    ],
+  );
+
+  const callsBefore13e = (await notesReportCalls()).count;
+  writeFileSync(REPORT_SAMPLE, "STALE-CONTENT\n");
+  await clickEl(SEL.reportBtn);
+  await waitReportSettled(callsBefore13e + 1);
+  await waitFor("报告状态行仍在", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const afterIdem13e = normalizeStamp(readReport("sample-paper.pdf.md"));
+  const probe13e2 = await reportProbe();
+  const callsAfter13e = (await notesReportCalls()).count;
+  record(
+    "r13-report-fallback",
+    {
+      phase: "idempotent",
+      sameAsFirst: afterIdem13e === normalizeStamp(report13e),
+      staleGone: !afterIdem13e.includes("STALE-CONTENT"),
+      callsDelta: callsAfter13e - callsBase13e,
+      rowText: probe13e2.rowText,
+    },
+    [
+      ...(afterIdem13e === normalizeStamp(report13e)
+        ? []
+        : [`二次导出应与首次逐字节相同：${JSON.stringify({ second: afterIdem13e, first: normalizeStamp(report13e) })}`]),
+      ...(afterIdem13e.includes("STALE-CONTENT") ? ["整文件覆盖：不得残留旧内容"] : []),
+      ...(callsAfter13e - callsBase13e === 2 ? [] : [`同一文档两次导出应恰 2 次调用：${callsAfter13e - callsBase13e}`]),
+      ...(probe13e2.rowText === "报告：sample-paper.pdf（4 条）→ .pix-read/reports/sample-paper.pdf.md"
+        ? []
+        : [`二次导出的状态行文本异常：${probe13e2.rowText}`]),
+    ],
+  );
+
+  // --- r13-4：退化与子目录（组 r13-report-degrade，2 条 record，2 张截图） --------------------
+  log("r13-4 退化：无 outline 按页分组 + 子目录报告路径 + 文本文档无进度");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await settleEmptyOutline();
+  await openNotesPanel(4);
+  await clickEl(SEL.reportBtn);
+  await waitFor("报告状态行", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const probe13f = await reportProbe();
+  const report13f = readReport("archive/older-paper.pdf.md");
+  const groups13f = reportGroups(report13f);
+  const meta13f = reportMetaLine(report13f);
+  const payload13f = await lastReportPayload();
+  await capturePage(win, "r13-4-report-degrade-subdir.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-degrade",
+    {
+      phase: "no-chapter-subdir",
+      rowText: probe13f.rowText,
+      groups: groups13f,
+      meta: meta13f,
+      chapters: payload13f ? payload13f.chapters : null,
+    },
+    [
+      ...(probe13f.rowText === "报告：older-paper.pdf（1 条）→ .pix-read/reports/archive/older-paper.pdf.md"
+        ? []
+        : [`状态行文本异常：${probe13f.rowText}`]),
+      ...(JSON.stringify(groups13f) === JSON.stringify(["## 第 7 页（1 条）"])
+        ? []
+        : [`无章节退化分组异常：${JSON.stringify(groups13f)}`]),
+      ...(report13f.includes(" · 第 ") ? ["无章节文档不得产出章节标题"] : []),
+      ...(report13f.includes("未归入章节") ? ["chapters === [] 时不得出现兜底组"] : []),
+      ...(meta13f && meta13f.includes("文档：archive/older-paper.pdf") && meta13f.includes("阅读进度：第 1 / 2 页")
+        ? []
+        : [`元信息行异常：${meta13f}`]),
+      ...(payload13f && Array.isArray(payload13f.chapters) && payload13f.chapters.length === 0
+        ? []
+        : [`无 outline 时章节入参应为空数组：${JSON.stringify(payload13f ? payload13f.chapters : null)}`]),
+    ],
+  );
+
+  await js(`window.__pixStub.seedNotes(${JSON.stringify([...seedNotes(), textDocNote()])}), true`);
+  await backToLibraryTab();
+  await openRow("reading-notes.md");
+  await waitFor("Markdown 预览", `document.querySelector(".reader-body")`);
+  const rowCleared13f = !(await has(SEL.reportRow));
+  await openNotesPanel(5);
+  await clickEl(SEL.reportBtn);
+  await waitFor("报告状态行", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const probe13f2 = await reportProbe();
+  const report13f2 = readReport("reading-notes.md.md");
+  const payload13f2 = await lastReportPayload();
+  await capturePage(win, "r13-4b-report-degrade-text-doc.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r13-report-degrade",
+    {
+      phase: "text-doc",
+      groups: reportGroups(report13f2),
+      meta: reportMetaLine(report13f2),
+      payload: payload13f2
+        ? { chapters: payload13f2.chapters, progress: payload13f2.progress, docFilePath: payload13f2.docFilePath }
+        : null,
+      rowText: probe13f2.rowText,
+      rowCleared: rowCleared13f,
+    },
+    [
+      ...(JSON.stringify(reportGroups(report13f2)) === JSON.stringify(["## 第 1 页（1 条）"])
+        ? []
+        : [`文本文档退化分组异常：${JSON.stringify(reportGroups(report13f2))}`]),
+      ...(reportMetaLine(report13f2) && !reportMetaLine(report13f2).includes("阅读进度：")
+        ? []
+        : [`无进度时不得输出阅读进度段：${reportMetaLine(report13f2)}`]),
+      ...(reportMetaLine(report13f2) && reportMetaLine(report13f2).includes("文档：reading-notes.md")
+        ? []
+        : [`元信息行文档段异常：${reportMetaLine(report13f2)}`]),
+      ...(payload13f2 && Array.isArray(payload13f2.chapters) && payload13f2.chapters.length === 0 && payload13f2.progress === null
+        ? []
+        : [`文本文档入参应为（chapters [] + progress null）：${JSON.stringify(payload13f2)}`]),
+      ...(probe13f2.rowText === "报告：reading-notes.md（1 条）→ .pix-read/reports/reading-notes.md.md"
+        ? []
+        : [`状态行文本异常：${probe13f2.rowText}`]),
+      ...(rowCleared13f ? [] : ["切文档后上一份报告行不得残留"]),
+    ],
+  );
+
+  // --- r13-5：失败 / 显示 / 在途（组 r13-report-failure，3 条 record，1 张截图） -------------
+  log("r13-5 失败路径：写失败与重试 / 在文件夹中显示 / 在途切文档丢弃");
+  rmSync(REPORT_DIR, { recursive: true, force: true });
+  await enterNotesProbe();
+  const callsBase13g = (await notesReportCalls()).count;
+  await setNotesReportFailure("write-failed");
+  await clickEl(SEL.reportBtn);
+  await waitFor("写失败提示", `document.querySelector(".notes-notice.is-error")`);
+  const notice13g = await notesNotice();
+  const probe13g = await reportProbe();
+  const failFile13g = reportExists("sample-paper.pdf.md");
+  const failCalls13g = (await notesReportCalls()).count;
+  await capturePage(win, "r13-5-report-failure-notice.png", await rectOfSelector(SEL.layoutLeft));
+  await setNotesReportFailure(null);
+  await clickEl(SEL.reportBtn);
+  await waitFor("重试后报告状态行", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const probe13g2 = await reportProbe();
+  const retryFile13g = reportExists("sample-paper.pdf.md");
+  const retryCalls13g = (await notesReportCalls()).count;
+  record(
+    "r13-report-failure",
+    {
+      phase: "write-failed-retry",
+      notice: notice13g,
+      rowInDom: probe13g.rowInDom,
+      fileExists: failFile13g,
+      failCallsDelta: failCalls13g - callsBase13g,
+      callsDelta: retryCalls13g - callsBase13g,
+      retryRow: probe13g2.rowText,
+      retryFile: retryFile13g,
+    },
+    [
+      ...(notice13g && notice13g.isError && notice13g.text === "生成报告失败：报告写入失败"
+        ? []
+        : [`写失败提示异常：${JSON.stringify(notice13g)}`]),
+      ...(probe13g.rowInDom === false ? [] : [`写失败不得产生状态行：${probe13g.rowText}`]),
+      ...(failFile13g === false ? [] : ["写失败不得留下报告文件"]),
+      ...(failCalls13g - callsBase13g === 1 ? [] : [`写失败前应恰有 1 次真实调用：${failCalls13g - callsBase13g}`]),
+      ...(probe13g2.rowText === "报告：sample-paper.pdf（3 条）→ .pix-read/reports/sample-paper.pdf.md"
+        ? []
+        : [`重试后状态行异常：${probe13g2.rowText}`]),
+      ...(retryFile13g ? [] : ["重试后报告文件应存在（目录被重建）"]),
+      ...(retryCalls13g - callsBase13g === 2 ? [] : [`重试后应恰 2 次调用：${retryCalls13g - callsBase13g}`]),
+    ],
+  );
+
+  const hashBeforeReveal13g = fileHash(REPORT_SAMPLE);
+  const showBase13g = (await libraryShowCalls()).count;
+  await clickEl(SEL.reportReveal);
+  await waitFor("显示调用落地", `window.__pixStub.libraryShowCalls().count === ${showBase13g + 1}`);
+  const showCalls13g = await libraryShowCalls();
+  const hashAfterReveal13g = fileHash(REPORT_SAMPLE);
+  await backToLibraryTab();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  const rowAfterSwitch13g = await has(SEL.reportRow);
+  await openRow("sample-paper.pdf");
+  await waitPage(1, 3);
+  await openNotesPanel(4);
+  await clickEl(SEL.reportBtn);
+  await waitFor("报告状态行回来", `document.querySelector(${JSON.stringify(SEL.reportRow)})`);
+  const probe13g3 = await reportProbe();
+  record(
+    "r13-report-failure",
+    {
+      phase: "reveal-and-clear",
+      showPaths: showCalls13g.paths,
+      hashSame: hashAfterReveal13g === hashBeforeReveal13g,
+      rowAfterSwitch: rowAfterSwitch13g,
+      rowText: probe13g3.rowText,
+    },
+    [
+      ...(showCalls13g.paths.slice(-1)[0] === REPORT_SAMPLE
+        ? []
+        : [`「在文件夹中显示」路径异常：${JSON.stringify(showCalls13g.paths)}`]),
+      ...(hashAfterReveal13g === hashBeforeReveal13g ? [] : ["显示动作不得改写报告文件"]),
+      ...(rowAfterSwitch13g === false ? [] : ["切文档后报告行应清除"]),
+      ...(probe13g3.rowText === "报告：sample-paper.pdf（3 条）→ .pix-read/reports/sample-paper.pdf.md"
+        ? []
+        : [`切回后重新导出的状态行异常：${probe13g3.rowText}`]),
+    ],
+  );
+
+  await enterNotesProbe();
+  const callsBase13h = (await notesReportCalls()).count;
+  await setNotesReportDelay(1200);
+  await clickEl(SEL.reportBtn);
+  await clickEl(SEL.reportBtn);
+  const callsAfterDouble13h = (await notesReportCalls()).count;
+  await backToLibraryTab();
+  await openRow("older-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  await openNotesPanel(4);
+  await waitReportSettled(callsBase13h + 1);
+  const probe13h = await reportProbe();
+  const notice13h = await notesNotice();
+  await setNotesReportDelay(0);
+  record(
+    "r13-report-failure",
+    {
+      phase: "inflight-guard",
+      callsDelta: callsAfterDouble13h - callsBase13h,
+      rowInDom: probe13h.rowInDom,
+      notice: notice13h,
+    },
+    [
+      ...(callsAfterDouble13h - callsBase13h === 1
+        ? []
+        : [`在途重复点击不得发第二次 IPC：${callsAfterDouble13h - callsBase13h}`]),
+      ...(probe13h.rowInDom === false ? [] : [`在途切文档后迟到的响应应被丢弃：${probe13h.rowText}`]),
+      ...(notice13h === null ? [] : [`在途结果丢弃后不得弹提示：${JSON.stringify(notice13h)}`]),
+    ],
+  );
+
   await restoreStandardSeed();
 }
 

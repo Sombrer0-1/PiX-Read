@@ -63,6 +63,7 @@ const editingCommentId = ref<string | null>(null);
 const commentDraft = ref("");
 const savingComment = ref(false);
 const exporting = ref(false);
+const exportingReport = ref(false);
 const recovering = ref(false);
 /** 撤销在途守卫：只在 finally 复位，stale 分支不得让按钮永久禁用。 */
 const restoring = ref(false);
@@ -365,6 +366,26 @@ async function onExport(): Promise<void> {
   if (!result.ok) setNotice("error", `导出失败：${result.message}`);
 }
 
+/**
+ * 报告导出：stale 零副作用（不弹提示、不动行）；成功只由状态行反馈，失败与空库各一处提示。
+ * 在途标志只在 try/finally 内翻转 ⇒ 任何分支都不会把按钮留在 loading。
+ */
+async function onExportReport(): Promise<void> {
+  if (exportingReport.value) return;
+  exportingReport.value = true;
+  try {
+    const result = await notesStore.exportCurrentDocReport();
+    if ("stale" in result) return;
+    if ("empty" in result) {
+      setNotice("error", "当前文档暂无笔记，未生成报告");
+      return;
+    }
+    if (!result.ok) setNotice("error", `生成报告失败：${result.message}`);
+  } finally {
+    exportingReport.value = false;
+  }
+}
+
 async function onRecover(): Promise<void> {
   if (recovering.value) return;
   recovering.value = true;
@@ -424,6 +445,21 @@ onBeforeUnmount(() => {
           @click="onExport"
         >
           {{ exportLabel }}
+        </v-btn>
+      </div>
+      <div v-if="notesStore.status === 'ready'" class="notes-report-actions">
+        <v-btn
+          class="notes-report-btn"
+          size="small"
+          variant="tonal"
+          prepend-icon="mdi-file-document-outline"
+          block
+          title="导出当前文档的阅读报告（Markdown）"
+          :disabled="!notesStore.currentDocKey || exportingReport"
+          :loading="exportingReport"
+          @click="onExportReport"
+        >
+          导出当前文档报告
         </v-btn>
       </div>
       <div v-if="notesStore.status === 'ready' && notesStore.hasNotes" class="notes-search">
@@ -518,6 +554,19 @@ onBeforeUnmount(() => {
         variant="text"
         prepend-icon="mdi-open-in-new"
         @click="revealPath(notesStore.lastExport.filePath)"
+      >
+        在文件夹中显示
+      </v-btn>
+    </div>
+
+    <div v-if="notesStore.lastReport" class="notes-report-row">
+      <span class="report-text">报告：{{ notesStore.lastReport.displayName }}（{{ notesStore.lastReport.count }} 条）→ {{ notesStore.lastReport.displayPath }}</span>
+      <v-btn
+        class="report-reveal"
+        size="x-small"
+        variant="text"
+        prepend-icon="mdi-open-in-new"
+        @click="revealPath(notesStore.lastReport.filePath)"
       >
         在文件夹中显示
       </v-btn>
@@ -712,6 +761,16 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+/* 报告入口行：位于头部首行之后、搜索行之前；未就绪时整行不进 DOM */
+.notes-report-actions {
+  display: flex;
+  align-items: center;
+}
+
+.notes-report-btn {
+  font-size: 11px;
 }
 
 /* 搜索行：位于头部首行之后、排序行之前；未就绪/无笔记时整行不进 DOM */
@@ -981,6 +1040,28 @@ onBeforeUnmount(() => {
 }
 
 .export-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
+  word-break: break-word;
+}
+
+/* 报告状态行：盒模型逐字对齐既有导出行；未导出时整行不进 DOM */
+.notes-report-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 10px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-elevated, #ffffff);
+}
+
+.report-text {
   flex: 1;
   min-width: 0;
   font-size: 11px;

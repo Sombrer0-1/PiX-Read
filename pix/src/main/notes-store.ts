@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { getLibraryRoot, isLibraryFilePath } from "./library-root.js";
+import { getLibraryRoot, isLibraryFilePath, isPathInsideDirectory } from "./library-root.js";
 import type {
   ReaderNote,
   ReaderNoteDraft,
@@ -20,12 +20,19 @@ import type {
   ReaderNotesFile,
   ReaderNotesLoadResult,
   ReaderNotesMutationResult,
+  ReaderNotesReportChapter,
+  ReaderNotesReportInput,
+  ReaderNotesReportResult,
   ReaderNotesResetResult,
 } from "../shared/types.js";
 
 const NOTES_DIR_NAME = ".pix-read";
 const NOTES_FILE_NAME = "notes.json";
 const NOTES_MARKDOWN_NAME = "notes.md";
+const REPORTS_DIR_NAME = "reports";
+/** 空库与写失败专有文案（错误码复用既有码表，文案按调用点写死）。 */
+const REPORT_EMPTY_MESSAGE = "当前文档暂无笔记，未生成报告";
+const REPORT_WRITE_FAILED_MESSAGE = "报告写入失败";
 const SCHEMA_VERSION = 1;
 /** 单条原文上限（N18 验收 7）：超限拒绝保存，不静默截断。 */
 const MAX_NOTE_TEXT_LENGTH = 4000;
@@ -61,6 +68,7 @@ let undoSlot: { root: string; note: ReaderNote; index: number } | null = null;
 interface NotesPaths {
   file: string;
   markdown: string;
+  reports: string;
 }
 
 type NotesRead = { ok: true; file: ReaderNotesFile } | { ok: false; code: ReaderNotesErrorCode; error: string };
@@ -71,7 +79,11 @@ function notesPaths(): NotesPaths | null {
   const root = getLibraryRoot();
   if (!root) return null;
   const dir = join(root, NOTES_DIR_NAME);
-  return { file: join(dir, NOTES_FILE_NAME), markdown: join(dir, NOTES_MARKDOWN_NAME) };
+  return {
+    file: join(dir, NOTES_FILE_NAME),
+    markdown: join(dir, NOTES_MARKDOWN_NAME),
+    reports: join(join(root, NOTES_DIR_NAME), REPORTS_DIR_NAME),
+  };
 }
 
 function emptyNotesFile(): ReaderNotesFile {
@@ -283,6 +295,71 @@ function renderNotesMarkdown(file: ReaderNotesFile, name: string, now: number): 
   return `${sections.join("\n\n")}\n`;
 }
 
+/** 报告组内排序三键：page 升序 → createdAt 升序 → id 升序（不依赖 sort 稳定性）。 */
+function sortReportEntries(entries: ReaderNote[]): ReaderNote[] {
+  return [...entries].sort((a, b) => a.page - b.page || a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+/** 章节标题：复用写入前的唯一空白折叠（不写第二份）；折叠后为空 ⇒ 逐字「未命名」。 */
+function reportChapterTitle(title: string): string {
+  return normalizeNoteText(title) || "未命名";
+}
+
+/**
+ * 报告正文分组：章节组按入参顺序、第一条命中获胜、空组不渲染、兜底组恒最后；
+ * 章节数组为空时退化为按页分组（页升序），不伪造章节标题。
+ */
+function reportBlocks(entries: ReaderNote[], chapters: ReaderNotesReportChapter[]): string[] {
+  const heading = (title: string, list: ReaderNote[]) => `## ${title}（${list.length} 条）`;
+  const block = (title: string, list: ReaderNote[]) =>
+    `${heading(title, list)}\n\n${list.map(renderMarkdownEntry).join("\n\n---\n\n")}`;
+  const blocks: string[] = [];
+  if (chapters.length === 0) {
+    // 退化：按页分组（entries 已按 page 升序 ⇒ Map 插入序即页升序，不写第二份区间比较）
+    const byPage = new Map<number, ReaderNote[]>();
+    for (const note of entries) {
+      const bucket = byPage.get(note.page);
+      if (bucket) bucket.push(note);
+      else byPage.set(note.page, [note]);
+    }
+    for (const [page, list] of byPage) blocks.push(block(`第 ${page} 页`, list));
+    return blocks;
+  }
+  const buckets = chapters.map(() => [] as ReaderNote[]);
+  const fallback: ReaderNote[] = [];
+  for (const note of entries) {
+    // 归组谓词：闭区间、含两端；findIndex 返回最早命中者 ⇒「第一条命中获胜」
+    const index = chapters.findIndex((chapter) => chapter.start <= note.page && note.page <= chapter.end);
+    if (index >= 0) buckets[index].push(note);
+    else fallback.push(note);
+  }
+  chapters.forEach((chapter, index) => {
+    const list = buckets[index];
+    if (list.length === 0) return; // 空组不渲染
+    blocks.push(block(`${reportChapterTitle(chapter.title)} · 第 ${chapter.label} 页`, list));
+  });
+  if (fallback.length > 0) blocks.push(block("未归入章节", fallback));
+  return blocks;
+}
+
+/** 报告正文渲染（纯函数；唯一非确定性输入 = now）。 */
+function renderDocumentReport(
+  entries: ReaderNote[],
+  docPath: string,
+  name: string,
+  chapters: ReaderNotesReportChapter[],
+  progress: { page: number; pageCount: number } | null,
+  now: number,
+): string {
+  const ordered = sortReportEntries(entries);
+  const excerpt = ordered.filter((note) => note.kind === "excerpt").length;
+  const progressPart = progress ? `阅读进度：第 ${progress.page} / ${progress.pageCount} 页；` : "";
+  const meta =
+    `> 由 PiX-Read 生成，每次导出都会覆盖。资料库：${name}；文档：${docPath}；` +
+    `生成时间：${formatStampHuman(now)}；${progressPart}共 ${ordered.length} 条（摘录 ${excerpt} · AI 结论 ${ordered.length - excerpt}）。`;
+  return [`# 阅读报告 · ${workspaceName(docPath)}`, meta, ...reportBlocks(ordered, chapters)].join("\n\n") + "\n";
+}
+
 export function loadNotes(): ReaderNotesLoadResult {
   const paths = notesPaths();
   if (!paths) return { success: false, notes: [], filePath: "", code: "no-root", error: ERROR_MESSAGES["no-root"] };
@@ -412,6 +489,38 @@ export function exportNotesMarkdown(): ReaderNotesExportResult {
   const write = writeFileAtomic(paths.markdown, markdown);
   if (!write.ok) return { success: false, code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
   return { success: true, filePath: paths.markdown, count: read.file.notes.length };
+}
+
+/**
+ * 单文档阅读报告导出（R13）：只写一个报告文件，不碰 notes.json / notes.md。
+ * 判定顺序：no-root → outside（相对化）→ outside（目标路径复核）→ 读取失败码 → empty → 渲染 → write-failed。
+ */
+export function exportDocumentReport(input: ReaderNotesReportInput): ReaderNotesReportResult {
+  const paths = notesPaths();
+  if (!paths) return { success: false, code: "no-root", error: ERROR_MESSAGES["no-root"] };
+  const root = getLibraryRoot();
+  const docPath = toRelativeDocPath(input.docFilePath, root);
+  if (!docPath) return { success: false, code: "outside", error: ERROR_MESSAGES.outside };
+  const target = join(paths.reports, ...docPath.split("/")) + ".md";
+  // 双重防护：toRelativeDocPath 已保证在库内，这里再对「报告根」复核一次
+  if (!isPathInsideDirectory(target, paths.reports)) {
+    return { success: false, code: "outside", error: ERROR_MESSAGES.outside };
+  }
+  const read = readNotesFile(paths.file);
+  if (!read.ok) return { success: false, code: read.code, error: read.error };
+  const key = docPathKey(docPath);
+  const entries = read.file.notes.filter((note) => docPathKey(note.docPath) === key);
+  if (entries.length === 0) return { success: false, code: "empty", error: REPORT_EMPTY_MESSAGE };
+
+  const markdown = renderDocumentReport(entries, docPath, workspaceName(root), input.chapters, input.progress, Date.now());
+  const write = writeFileAtomic(target, markdown);
+  if (!write.ok) return { success: false, code: "write-failed", error: REPORT_WRITE_FAILED_MESSAGE };
+  return {
+    success: true,
+    filePath: target,
+    displayPath: `${NOTES_DIR_NAME}/${REPORTS_DIR_NAME}/${docPath}.md`,
+    count: entries.length,
+  };
 }
 
 /** 损坏逃生口（N25）：仅用户显式触发；版本不支持与内容损坏同等对待。 */

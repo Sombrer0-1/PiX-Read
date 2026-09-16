@@ -36,6 +36,26 @@ const DOC_A = join(WS_A, "sample-paper.pdf");
 const TEXT_A1 = "We study retrieval over long documents where the attention budget is the binding constraint.";
 const TEXT_A2 = "结论：稀疏注意力在三分之一的预算下保持召回。";
 const TEXT_A3 = "Section 4. Reproducibility: all runs use three seeds and report the median.";
+const DOC_ARCHIVE = join(WS_A, "archive", "older-paper.pdf");
+const REPORTS_A = join(PIX_READ_A, "reports");
+const REPORTS_ARCHIVE_A = join(REPORTS_A, "archive");
+const REPORT_A = join(REPORTS_A, "sample-paper.pdf.md");
+const REPORT_ARCHIVE_A = join(REPORTS_ARCHIVE_A, "older-paper.pdf.md");
+const REPORT_COMMENT = "与第 3 节消融实验对照";
+const ARCHIVE_TEXT = "Archive excerpt for the subdirectory report.";
+const OUT_OF_RANGE_TEXT = "Out-of-range excerpt: this page is beyond the document page count.";
+/** 唯一非确定性字段的归一化（与离屏脚本逐字同一条表达式）。 */
+const STAMP_RE = /生成时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/;
+const normalizeStamp = (text) => text.replace(STAMP_RE, "生成时间：<STAMP>");
+/** 报告入参的章节夹具（3 项；顺序即分组顺序；手写，不由 buildChapterRanges 生成）。 */
+const SAMPLE_CHAPTERS = [
+  { title: "1. Abstract", start: 1, end: 1, label: "1" },
+  { title: "2. Method Overview", start: 2, end: 2, label: "2" },
+  { title: "2.2 Positional prior", start: 3, end: 3, label: "3" },
+];
+const PROGRESS_3 = { page: 1, pageCount: 3 };
+/** 夹具时间戳步长：同页两条的 `createdAt` 显式相隔 1 分钟（不依赖 addNote 的毫秒级时钟）。 */
+const REPORT_STAMP_STEP_MS = 60_000;
 
 let passed = 0;
 let failed = 0;
@@ -83,6 +103,73 @@ function relayMatchesFile(result) {
 
 function draft(docFilePath, page, text, kind = "excerpt") {
   return { kind, docFilePath, page, text };
+}
+
+/**
+ * 3 条报告夹具（p1 摘录带备注 / p2 摘录 / p2 AI 结论），返回时保证文件与目录为「无报告」初态。
+ * 落盘后按文件序把 `createdAt` / `updatedAt` 显式钉住（步长 `REPORT_STAMP_STEP_MS`）：
+ * 报告组内次序只依赖 `page` → `createdAt`，不得托付给 addNote 的毫秒级 `Date.now()`。
+ */
+function seedReportNotes(docPath) {
+  rmSync(NOTES_A, { force: true });
+  rmSync(REPORTS_A, { recursive: true, force: true });
+  const n1 = notesStore.addNote(draft(docPath, 1, TEXT_A1));
+  notesStore.updateNoteComment(n1.note.id, REPORT_COMMENT);
+  notesStore.addNote(draft(docPath, 2, TEXT_A3));
+  notesStore.addNote(draft(docPath, 2, TEXT_A2, "answer"));
+  const base = Date.now();
+  writeNotesFile(
+    readFileNotes().map((note, index) => ({
+      ...note,
+      createdAt: base + index * REPORT_STAMP_STEP_MS,
+      updatedAt: base + index * REPORT_STAMP_STEP_MS,
+    })),
+  );
+  return n1.note.id;
+}
+
+/** 手写期望串（三章入参 + 进度；逐字面量，不由被测函数生成）。 */
+function expectedRenderA() {
+  return [
+    "# 阅读报告 · sample-paper.pdf",
+    "",
+    `> 由 PiX-Read 生成，每次导出都会覆盖。资料库：ws-a；文档：sample-paper.pdf；生成时间：<STAMP>；阅读进度：第 1 / 3 页；共 3 条（摘录 2 · AI 结论 1）。`,
+    "",
+    "## 1. Abstract · 第 1 页（1 条）",
+    "",
+    "### 第 1 页",
+    "",
+    `> ${TEXT_A1}`,
+    "",
+    `备注：${REPORT_COMMENT}`,
+    "",
+    "## 2. Method Overview · 第 2 页（2 条）",
+    "",
+    "### 第 2 页",
+    "",
+    `> ${TEXT_A3}`,
+    "",
+    "---",
+    "",
+    "### 第 2 页 · AI 结论",
+    "",
+    `> ${TEXT_A2}`,
+  ].join("\n") + "\n";
+}
+
+/** 子目录 + 无章节 + 无进度的手写期望串。 */
+function expectedArchiveA() {
+  return [
+    "# 阅读报告 · older-paper.pdf",
+    "",
+    `> 由 PiX-Read 生成，每次导出都会覆盖。资料库：ws-a；文档：archive/older-paper.pdf；生成时间：<STAMP>；共 1 条（摘录 1 · AI 结论 0）。`,
+    "",
+    "## 第 7 页（1 条）",
+    "",
+    "### 第 7 页",
+    "",
+    `> ${ARCHIVE_TEXT}`,
+  ].join("\n") + "\n";
 }
 
 function runUndoRoundtrip() {
@@ -470,6 +557,364 @@ function runExportAndEmpty() {
   );
 }
 
+function runReportRender() {
+  const G = "report-render";
+  group(G);
+  libraryRoot.setLibraryRoot(WS_A);
+  seedReportNotes(DOC_A);
+
+  const first = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const raw1 = existsSync(REPORT_A) ? readFileSync(REPORT_A, "utf8") : "";
+  const text1 = normalizeStamp(raw1);
+  const stampHits = raw1.match(new RegExp(STAMP_RE.source, "g")) || [];
+  const stampValue = stampHits.length === 1 ? stampHits[0].replace("生成时间：", "") : "";
+  check(
+    G,
+    1,
+    "3 条 + 三章入参 + 进度 ⇒ 成功且全文（时间戳归一化）逐字节等于手写期望串；生成时间段恰 1 次且形如 YYYY-MM-DD HH:mm:ss",
+    first.success === true &&
+      text1 === expectedRenderA() &&
+      stampHits.length === 1 &&
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(stampValue),
+    JSON.stringify({ result: first, stampHits: stampHits.length, stampValue, text: text1 }),
+  );
+
+  const lines1 = text1.split("\n");
+  const meta1 = lines1[2] || "";
+  check(
+    G,
+    2,
+    "头部逐字段：第 1 行逐字；元信息行含 资料库：ws-a / 文档：sample-paper.pdf / 阅读进度：第 1 / 3 页 / 共 3 条（摘录 2 · AI 结论 1）",
+    lines1[0] === "# 阅读报告 · sample-paper.pdf" &&
+      meta1.includes("资料库：ws-a") &&
+      meta1.includes("文档：sample-paper.pdf") &&
+      meta1.includes("阅读进度：第 1 / 3 页") &&
+      meta1.includes("共 3 条（摘录 2 · AI 结论 1）"),
+    JSON.stringify({ line1: lines1[0], meta: meta1 }),
+  );
+
+  const heads1 = lines1.filter((line) => line.startsWith("## "));
+  check(
+    G,
+    3,
+    "空组不渲染：无 2.2 Positional prior；^## 行恰 2 条且逐字为两个章节组标题",
+    text1.includes("## 2.2 Positional prior") === false &&
+      JSON.stringify(heads1) ===
+        JSON.stringify(["## 1. Abstract · 第 1 页（1 条）", "## 2. Method Overview · 第 2 页（2 条）"]),
+    JSON.stringify({ heads: heads1 }),
+  );
+
+  notesStore.addNote(draft(DOC_A, 9, OUT_OF_RANGE_TEXT));
+  const withRange = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const text4 = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  const lines4 = text4.split("\n");
+  const heads4 = lines4.filter((line) => line.startsWith("## "));
+  const meta4 = lines4[2] || "";
+  check(
+    G,
+    4,
+    "兜底组：p9 笔记 ⇒ ^## 最后一条逐字「未归入章节（1 条）」；正文出现恰 1 次；统计 共 4 条（摘录 3 · AI 结论 1）；既有两个组不变",
+    withRange.success === true &&
+      heads4.length === 3 &&
+      heads4[heads4.length - 1] === "## 未归入章节（1 条）" &&
+      text4.split(OUT_OF_RANGE_TEXT).length - 1 === 1 &&
+      meta4.includes("共 4 条（摘录 3 · AI 结论 1）") &&
+      JSON.stringify(heads4.slice(0, 2)) ===
+        JSON.stringify(["## 1. Abstract · 第 1 页（1 条）", "## 2. Method Overview · 第 2 页（2 条）"]),
+    JSON.stringify({ result: withRange, heads: heads4, outOfRangeHits: text4.split(OUT_OF_RANGE_TEXT).length - 1, meta: meta4 }),
+  );
+
+  seedReportNotes(DOC_A);
+  const noChapters = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: [], progress: PROGRESS_3 });
+  const text5 = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  const lines5 = text5.split("\n");
+  const heads5 = lines5.filter((line) => line.startsWith("## "));
+  check(
+    G,
+    5,
+    "chapters: [] ⇒ ^## 行集合逐字为两个按页组（页升序）；全文不含「未归入章节」、不含「 · 第 」",
+    noChapters.success === true &&
+      JSON.stringify(heads5) === JSON.stringify(["## 第 1 页（1 条）", "## 第 2 页（2 条）"]) &&
+      text5.includes("未归入章节") === false &&
+      text5.includes(" · 第 ") === false,
+    JSON.stringify({ result: noChapters, heads: heads5 }),
+  );
+
+  const seps = text5.split("\n\n---\n\n").length - 1;
+  check(
+    G,
+    6,
+    "条目与分隔：同页先摘录后结论；`### 第 2 页` / `### 第 2 页 · AI 结论` 各 1 次；恰 1 处空行分隔线；末尾恰一个换行；无行尾空格",
+    text5.indexOf(TEXT_A3) >= 0 &&
+      text5.indexOf(TEXT_A3) < text5.indexOf(TEXT_A2) &&
+      lines5.filter((line) => line === "### 第 2 页").length === 1 &&
+      lines5.filter((line) => line === "### 第 2 页 · AI 结论").length === 1 &&
+      seps === 1 &&
+      text5.endsWith("\n") &&
+      !text5.endsWith("\n\n") &&
+      lines5.every((line) => !/ $/.test(line)),
+    JSON.stringify({
+      idxExcerpt: text5.indexOf(TEXT_A3),
+      idxAnswer: text5.indexOf(TEXT_A2),
+      seps,
+      tail: JSON.stringify(text5.slice(-4)),
+      trailingSpaces: lines5.filter((line) => / $/.test(line)).length,
+    }),
+  );
+
+  const reversed = notesStore.exportDocumentReport({
+    docFilePath: DOC_A,
+    chapters: [...SAMPLE_CHAPTERS, { title: "Beyond", start: 5, end: 3, label: "5" }],
+    progress: PROGRESS_3,
+  });
+  const text7 = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  const heads7 = text7.split("\n").filter((line) => line.startsWith("## "));
+  check(
+    G,
+    7,
+    "倒序范围不拒绝：追加 {start:5,end:3} ⇒ success（不是 invalid-input）、无「## Beyond」、^## 行与 #3 逐字相同",
+    reversed.success === true &&
+      reversed.code === undefined &&
+      text7.includes("## Beyond") === false &&
+      JSON.stringify(heads7) ===
+        JSON.stringify(["## 1. Abstract · 第 1 页（1 条）", "## 2. Method Overview · 第 2 页（2 条）"]),
+    JSON.stringify({ result: reversed, heads: heads7 }),
+  );
+}
+
+function runReportFiles() {
+  const G = "report-files";
+  group(G);
+  libraryRoot.setLibraryRoot(WS_A);
+  seedReportNotes(DOC_A);
+
+  const first = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const text1 = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  check(
+    G,
+    1,
+    "返回面：filePath 逐字等于 REPORT_A（relative 为 sample-paper.pdf.md）+ displayPath 逐字 + count === 3",
+    first.success === true &&
+      first.filePath === REPORT_A &&
+      relative(REPORTS_A, first.filePath) === "sample-paper.pdf.md" &&
+      first.displayPath === ".pix-read/reports/sample-paper.pdf.md" &&
+      first.count === 3,
+    JSON.stringify(first),
+  );
+
+  const addArchive = notesStore.addNote(draft(DOC_ARCHIVE, 7, ARCHIVE_TEXT));
+  const sub = notesStore.exportDocumentReport({ docFilePath: DOC_ARCHIVE, chapters: [], progress: null });
+  const text2 = normalizeStamp(existsSync(REPORT_ARCHIVE_A) ? readFileSync(REPORT_ARCHIVE_A, "utf8") : "");
+  check(
+    G,
+    2,
+    "子目录 + 无章节 + 无进度：displayPath 逐字、reports/archive 被创建、全文逐字节、元信息行不含阅读进度",
+    addArchive.success === true &&
+      sub.success === true &&
+      sub.displayPath === ".pix-read/reports/archive/older-paper.pdf.md" &&
+      existsSync(REPORTS_ARCHIVE_A) === true &&
+      text2 === expectedArchiveA() &&
+      text2.includes("阅读进度：") === false,
+    JSON.stringify({ sub, text: text2 }),
+  );
+
+  writeFileSync(REPORT_A, "STALE-CONTENT\n", "utf8");
+  const again1 = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const text3a = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  const again2 = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const text3b = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  check(
+    G,
+    3,
+    "幂等覆盖：预置垃圾内容 ⇒ 两次导出都成功、内容逐字节等于期望、不含 STALE-CONTENT、两次归一化内容互等",
+    again1.success === true &&
+      again2.success === true &&
+      text3a === expectedRenderA() &&
+      text3b === text3a &&
+      text3a.includes("STALE-CONTENT") === false,
+    JSON.stringify({ first: again1.success, second: again2.success, same: text3b === text3a, text: text3a }),
+  );
+
+  rmSync(REPORTS_A, { recursive: true, force: true });
+  const notesBefore = sha256(readFileSync(NOTES_A));
+  const mdBefore = existsSync(NOTES_MD_A) ? sha256(readFileSync(NOTES_MD_A)) : null;
+  const entriesBefore = readdirSync(PIX_READ_A).sort();
+  const sideEffectFree = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const notesAfter = sha256(readFileSync(NOTES_A));
+  const mdAfter = existsSync(NOTES_MD_A) ? sha256(readFileSync(NOTES_MD_A)) : null;
+  const entriesAfter = readdirSync(PIX_READ_A).sort();
+  const addedEntries = entriesAfter.filter((name) => !entriesBefore.includes(name));
+  const removedEntries = entriesBefore.filter((name) => !entriesAfter.includes(name));
+  check(
+    G,
+    4,
+    "零副作用：notes.json / notes.md 哈希不变；.pix-read 顶级条目差恰为新增 [reports]",
+    sideEffectFree.success === true &&
+      notesAfter === notesBefore &&
+      mdAfter === mdBefore &&
+      JSON.stringify(addedEntries) === JSON.stringify(["reports"]) &&
+      removedEntries.length === 0,
+    JSON.stringify({
+      result: sideEffectFree,
+      notesSame: notesAfter === notesBefore,
+      mdSame: mdAfter === mdBefore,
+      addedEntries,
+      removedEntries,
+    }),
+  );
+
+  rmSync(REPORTS_A, { recursive: true, force: true });
+  const load5 = notesStore.loadNotes();
+  const add5 = notesStore.addNote(draft(DOC_ARCHIVE, 3, "post-delete add"));
+  const export5 = notesStore.exportNotesMarkdown();
+  const rebuilt = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const text5 = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+  check(
+    G,
+    5,
+    "目录可删：删 reports 后 loadNotes / addNote（另一文档）/ exportNotesMarkdown / 报告导出全部成功，重建内容与 #1 首次逐字节相同",
+    load5.success === true &&
+      add5.success === true &&
+      export5.success === true &&
+      rebuilt.success === true &&
+      text5 === text1,
+    JSON.stringify({
+      load: load5.success,
+      add: add5.success,
+      export: export5.success,
+      report: rebuilt.success,
+      sameAsFirst: text5 === text1,
+    }),
+  );
+}
+
+function runReportFailures() {
+  const G = "report-failures";
+  group(G);
+  libraryRoot.setLibraryRoot(WS_A);
+  rmSync(REPORTS_A, { recursive: true, force: true });
+  seedReportNotes(DOC_A);
+
+  libraryRoot.clearLibraryRoot();
+  const noRoot = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: [], progress: null });
+  const noRootReportsExist = existsSync(REPORTS_A);
+  libraryRoot.setLibraryRoot(WS_A);
+  check(
+    G,
+    1,
+    "无工作区根 ⇒ no-root + 逐字「尚未选择资料库根目录」+ 零写盘（reports 不存在）",
+    noRoot.success === false &&
+      noRoot.code === "no-root" &&
+      noRoot.error === "尚未选择资料库根目录" &&
+      noRootReportsExist === false,
+    JSON.stringify({ result: noRoot, reportsExist: noRootReportsExist }),
+  );
+
+  const outside = notesStore.exportDocumentReport({ docFilePath: join(TMP, "outside", "x.pdf"), chapters: [], progress: null });
+  check(
+    G,
+    2,
+    "库外绝对路径 ⇒ outside + 逐字「该文档不在当前资料库内」+ reports 未新增条目",
+    outside.success === false &&
+      outside.code === "outside" &&
+      outside.error === "该文档不在当前资料库内" &&
+      existsSync(REPORTS_A) === false,
+    JSON.stringify({ result: outside, reportsExist: existsSync(REPORTS_A) }),
+  );
+
+  const emptyDoc = notesStore.exportDocumentReport({ docFilePath: join(WS_A, "empty-doc.pdf"), chapters: [], progress: null });
+  check(
+    G,
+    3,
+    "该文档 0 条 ⇒ empty + 逐字「当前文档暂无笔记，未生成报告」+ 目录未被创建",
+    emptyDoc.success === false &&
+      emptyDoc.code === "empty" &&
+      emptyDoc.error === "当前文档暂无笔记，未生成报告" &&
+      existsSync(REPORTS_A) === false,
+    JSON.stringify({ result: emptyDoc, reportsExist: existsSync(REPORTS_A) }),
+  );
+
+  const baseline = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const reportHashBefore = sha256(readFileSync(REPORT_A));
+  mkdirSync(REPORT_A + ".tmp", { recursive: true });
+  const tmpBlocked = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const reportHashDuring = sha256(readFileSync(REPORT_A));
+  rmSync(REPORT_A + ".tmp", { recursive: true, force: true });
+  const tmpRetry = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const tmpRetryText = normalizeStamp(readFileSync(REPORT_A, "utf8"));
+
+  const addArchive = notesStore.addNote(draft(DOC_ARCHIVE, 7, ARCHIVE_TEXT));
+  rmSync(REPORTS_ARCHIVE_A, { recursive: true, force: true });
+  writeFileSync(REPORTS_ARCHIVE_A, "x", "utf8");
+  const dirBlocked = notesStore.exportDocumentReport({ docFilePath: DOC_ARCHIVE, chapters: [], progress: null });
+  rmSync(REPORTS_ARCHIVE_A, { force: true });
+  const dirRetry = notesStore.exportDocumentReport({ docFilePath: DOC_ARCHIVE, chapters: [], progress: null });
+  const dirRetryText = normalizeStamp(readFileSync(REPORT_ARCHIVE_A, "utf8"));
+  check(
+    G,
+    4,
+    "写失败两条注入：<报告>.tmp 预置为目录 / 目标父级预置为同名文件 ⇒ 均 write-failed + 逐字「报告写入失败」；既有报告字节不变；清理后重试成功且内容正确",
+    baseline.success === true &&
+      tmpBlocked.success === false &&
+      tmpBlocked.code === "write-failed" &&
+      tmpBlocked.error === "报告写入失败" &&
+      reportHashDuring === reportHashBefore &&
+      tmpRetry.success === true &&
+      tmpRetryText === expectedRenderA() &&
+      addArchive.success === true &&
+      dirBlocked.success === false &&
+      dirBlocked.code === "write-failed" &&
+      dirBlocked.error === "报告写入失败" &&
+      dirRetry.success === true &&
+      dirRetryText === expectedArchiveA(),
+    JSON.stringify({
+      baseline: baseline.success,
+      tmpBlocked,
+      reportBytesSame: reportHashDuring === reportHashBefore,
+      tmpRetry: { success: tmpRetry.success, contentOk: tmpRetryText === expectedRenderA() },
+      dirBlocked,
+      dirRetry: { success: dirRetry.success, contentOk: dirRetryText === expectedArchiveA() },
+    }),
+  );
+
+  const reportsEntries5 = readdirSync(REPORTS_A).sort();
+  const reportHash5 = sha256(readFileSync(REPORT_A));
+  const bytesBefore5 = readFileSync(NOTES_A);
+  writeFileSync(NOTES_A, "not json", "utf8");
+  const brokenHash5 = sha256(readFileSync(NOTES_A));
+  const corrupt = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  const reportsEntries5After = readdirSync(REPORTS_A).sort();
+  check(
+    G,
+    5,
+    "损坏库 ⇒ corrupt + 逐字「笔记文件无法读取（文件已损坏，未被修改）」+ notes.json 字节不变 + 既有报告与目录条目集合均不变",
+    corrupt.success === false &&
+      corrupt.code === "corrupt" &&
+      corrupt.error === "笔记文件无法读取（文件已损坏，未被修改）" &&
+      sha256(readFileSync(NOTES_A)) === brokenHash5 &&
+      sha256(readFileSync(REPORT_A)) === reportHash5 &&
+      JSON.stringify(reportsEntries5After) === JSON.stringify(reportsEntries5),
+    JSON.stringify({ result: corrupt, entries: reportsEntries5After, expectedEntries: reportsEntries5 }),
+  );
+  writeFileSync(NOTES_A, bytesBefore5);
+
+  const reportsEntries6 = readdirSync(REPORTS_A).sort();
+  writeFileSync(NOTES_A, '{"version": 2, "notes": []}', "utf8");
+  const versionHash6 = sha256(readFileSync(NOTES_A));
+  const versionUnsupported = notesStore.exportDocumentReport({ docFilePath: DOC_A, chapters: SAMPLE_CHAPTERS, progress: PROGRESS_3 });
+  check(
+    G,
+    6,
+    "版本不支持 ⇒ version-unsupported + 逐字「笔记文件版本不支持」+ notes.json 字节不变 + 零写盘",
+    versionUnsupported.success === false &&
+      versionUnsupported.code === "version-unsupported" &&
+      versionUnsupported.error === "笔记文件版本不支持" &&
+      sha256(readFileSync(NOTES_A)) === versionHash6 &&
+      JSON.stringify(readdirSync(REPORTS_A).sort()) === JSON.stringify(reportsEntries6),
+    JSON.stringify({ result: versionUnsupported, entries: readdirSync(REPORTS_A).sort() }),
+  );
+}
+
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
   mkdirSync(WS_A, { recursive: true });
@@ -537,6 +982,9 @@ function main() {
       runUndoFailures();
       runUndoSlotLifecycle();
       runExportAndEmpty();
+      runReportRender();
+      runReportFiles();
+      runReportFailures();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;

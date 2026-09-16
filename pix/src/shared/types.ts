@@ -406,6 +406,31 @@ export interface ReaderNotesExportResult {
   error?: string;
 }
 
+/** 单个章节范围：只带渲染所需事实（不传 key；顺序即分组顺序）。 */
+export interface ReaderNotesReportChapter {
+  title: string;
+  start: number;
+  end: number;
+  label: string;
+}
+
+/** 单文档阅读报告入参：文档绝对路径 + 已算好的章节范围 + 阅读进度（不可得为 null）。 */
+export interface ReaderNotesReportInput {
+  docFilePath: string;
+  chapters: ReaderNotesReportChapter[];
+  progress: { page: number; pageCount: number } | null;
+}
+
+/** 报告导出结果：成功时 filePath 为绝对路径、displayPath 为 `.pix-read/reports/<docPath>.md`（工作区相对）。 */
+export interface ReaderNotesReportResult {
+  success: boolean;
+  filePath?: string;
+  displayPath?: string;
+  count?: number;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
 /** Explicit rebuild of a damaged file: `corrupt` and `version-unsupported` may both be reset. */
 export interface ReaderNotesResetResult {
   success: boolean;
