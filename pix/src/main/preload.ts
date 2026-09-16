@@ -105,7 +105,7 @@ export interface PixApi {
     error?: string;
   }>;
   downloadUpdate: () => Promise<{ success: boolean; error?: string }>;
-  installUpdate: () => void;
+  installUpdate: () => Promise<{ success: boolean; error?: string }>;
 }
 
 const api: PixApi = {

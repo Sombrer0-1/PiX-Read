@@ -17,7 +17,7 @@ import { selectChatFiles, selectProjectDirectory } from "./file-dialogs.js";
 import { resolvePixSessionDir, type SessionBridge } from "./session-bridge.js";
 import { getPixStoragePaths, pixAgentDir, pixSessionsRootDir } from "./pix-paths.js";
 import type { SettingsStore } from "./settings-store.js";
-import { clearLibraryRoot, getLibraryRoot, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
+import { clearLibraryRoot, getLibraryRoot, isLibraryDirAllowed, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
 import { addNote, deleteNote, exportDocumentReport, exportNotesMarkdown, loadNotes, resetCorruptNotes, restoreNote, statNotesFile, updateNoteComment } from "./notes-store.js";
 import { loadReaderState, saveReaderState } from "./reader-state-store.js";
 import type {
@@ -362,7 +362,8 @@ export function registerIpcHandlers(
       setLibraryRoot(projectDir);
       return { success: true };
     } catch (err: unknown) {
-      clearLibraryRoot();
+      // 仍在运行的会话不得因后续 session-start 失败而丢掉库根（串行门可能让失败在其后到达）
+      if (!sessionBridge.isRunning()) clearLibraryRoot();
       return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   });
@@ -421,29 +422,42 @@ export function registerIpcHandlers(
   // =========================================================================
 
   ipcMain.handle("library-list", async (_event, dir: string, depth?: number) => {
+    if (typeof dir !== "string" || !dir) return { success: false, code: "not-found", nodes: [] };
+    if (!getLibraryRoot()) return { success: false, code: "no-root", nodes: [] };
     const root = resolve(dir);
+    // 根外目录一律拒绝；库根自身必须放行（LibraryPanel 传的就是 rootDir），子目录走严格包含
+    if (!isLibraryDirAllowed(root)) return { success: false, code: "outside", nodes: [] };
+    let exists = false;
     let isDirectory = false;
     try {
-      isDirectory = existsSync(root) && statSync(root).isDirectory();
+      const stat = statSync(root);
+      exists = true;
+      isDirectory = stat.isDirectory();
     } catch {
-      isDirectory = false;
+      // 不存在或不可访问：按 not-found 回报
+    }
+    if (!exists) {
+      return { success: false, code: "not-found", error: `目录不存在：${root}`, nodes: [] };
     }
     if (!isDirectory) {
-      return { success: false, error: `目录不存在：${root}`, nodes: [] };
+      return { success: false, code: "not-a-directory", error: `不是目录：${root}`, nodes: [] };
     }
     const effectiveDepth = Math.min(Math.max(depth ?? 2, 1), 4);
     return { success: true, nodes: listLibraryChildren(root, effectiveDepth) };
   });
 
   ipcMain.handle("library-open-path", async (_event, targetPath: string) => {
-    const resolved = resolve(targetPath);
-    if (!existsSync(resolved)) {
-      return { success: false, error: `路径不存在：${resolved}` };
+    // 根外一律拒绝（严格根内，根自身拒绝）；两个调用方（PdfViewer / ReaderPanel）都传库内文档路径
+    const guard = guardLibraryPath(targetPath);
+    if (!("path" in guard)) return { success: false, error: guard.error };
+    if (!existsSync(guard.path)) {
+      return { success: false, error: `路径不存在：${guard.path}` };
     }
-    const result = await shell.openPath(resolved);
+    const result = await shell.openPath(guard.path);
     return result ? { success: false, error: result } : { success: true };
   });
 
+  // 保持现状：设置页/在文件夹中显示需要根外能力（日志、设置文件等），不做库内校验。
   ipcMain.handle("library-show-in-folder", async (_event, targetPath: string) => {
     shell.showItemInFolder(resolve(targetPath));
     return { success: true };

@@ -60,7 +60,8 @@ export interface PendingUndo {
   deletedAt: number;
 }
 
-type NotesActionResult = { ok: true } | { ok: false; message: string };
+/** backupPath 只在逃生口两类结果上出现：成功 = 新建空库前的备份，失败 = 写失败时仍在的备份。 */
+type NotesActionResult = { ok: true; backupPath?: string } | { ok: false; message: string; backupPath?: string };
 
 /** 错误态标题；正文仍以主进程 error 原文（errorDetail）为准。 */
 const ERROR_TITLES: Record<ReaderNotesErrorCode, string> = {
@@ -250,7 +251,8 @@ export const useNotesStore = defineStore("notes", () => {
       errorCode.value = result.code ?? null;
       errorDetail.value = result.error ?? "";
     } catch (err) {
-      if (seq !== loadSeq) return;
+      // 与成功分支同一守卫：已完成的写（writeSeq 递增）之后到达的 load reject 不得把面板推入 error 态
+      if (seq !== loadSeq || startWriteSeq !== writeSeq) return;
       status.value = "error";
       errorCode.value = null;
       errorDetail.value = rejectMessage(err);
@@ -382,7 +384,7 @@ export const useNotesStore = defineStore("notes", () => {
   async function recoverCorruptNotes(): Promise<NotesActionResult> {
     try {
       const result = await bridge().notesReset();
-      if (!result.success) return { ok: false, message: result.error ?? "重建失败" };
+      if (!result.success) return { ok: false, message: result.error ?? "重建失败", backupPath: result.backupPath };
       notes.value = result.notes;
       writeSeq += 1;
       status.value = "ready";
@@ -390,7 +392,7 @@ export const useNotesStore = defineStore("notes", () => {
       errorDetail.value = "";
       externalChange.value = false;
       void syncNotesFile("capture");
-      return { ok: true };
+      return { ok: true, backupPath: result.backupPath };
     } catch (err) {
       return { ok: false, message: rejectMessage(err) };
     }

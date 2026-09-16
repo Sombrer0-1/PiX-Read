@@ -22,6 +22,8 @@ const rpc = useRpc();
 const feedbackOpen = ref(false);
 const feedbackText = ref("");
 const feedbackColor = ref<"error" | "info" | "success">("error");
+/** 在途守卫：双击最近打开不得并发走两次 startSession（第二次由主进程串行门幂等吸收，但前端不发）。 */
+const opening = ref(false);
 
 function showFeedback(text: string, color: "error" | "info" | "success" = "error"): void {
   feedbackText.value = text;
@@ -41,22 +43,28 @@ onMounted(async () => {
 const recentProjects = computed(() => projectStore.recentProjects);
 
 async function openWorkspace(dirPath: string): Promise<void> {
-  if (await rpc.startSession(dirPath)) {
-    await projectStore.openProject(dirPath);
-    const result = await rpc.newSession();
-    if (!result || result.cancelled) {
-      showFeedback(`无法创建新会话：${rpc.lastError.value || "未知错误"}`);
-      return;
+  if (opening.value) return;
+  opening.value = true;
+  try {
+    if (await rpc.startSession(dirPath)) {
+      await projectStore.openProject(dirPath);
+      const result = await rpc.newSession();
+      if (!result || result.cancelled) {
+        showFeedback(`无法创建新会话：${rpc.lastError.value || "未知错误"}`);
+        return;
+      }
+      sessionStore.clearSession();
+      await projectStore.listSessions();
+      projectStore.syncCurrentSession(
+        rpc.sessionState.value?.sessionFile,
+        rpc.sessionState.value?.sessionId,
+      );
+      router.push("/workspace");
+    } else {
+      showFeedback(rpc.lastError.value || "启动失败");
     }
-    sessionStore.clearSession();
-    await projectStore.listSessions();
-    projectStore.syncCurrentSession(
-      rpc.sessionState.value?.sessionFile,
-      rpc.sessionState.value?.sessionId,
-    );
-    router.push("/workspace");
-  } else {
-    showFeedback(rpc.lastError.value || "启动失败");
+  } finally {
+    opening.value = false;
   }
 }
 
@@ -122,6 +130,7 @@ function formatDate(timestamp: number): string {
                 :key="project.path"
                 :title="project.name"
                 :subtitle="formatDate(project.lastOpened)"
+                :disabled="opening"
                 class="project-list-item"
                 @click="openRecentProject(project)"
               >

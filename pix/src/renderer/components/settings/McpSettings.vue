@@ -18,6 +18,9 @@ const error = ref("");
 /** PiX-Read 唯一的 MCP 配置文件；路径由主进程的 pix-paths 提供。 */
 const mcpConfigPath = computed(() => settingsStore.storagePaths?.mcpJsonFile ?? "");
 
+/** 面板级只读边界说明：与 session-bridge 的 tools 白名单保持同一口径。 */
+const TOOLS_NOT_SHARED_NOTE = "服务器工具不会提供给模型（PiX 只开放只读工具）";
+
 const statusColor: Record<string, string> = {
   connected: "success",
   connecting: "warning",
@@ -94,6 +97,15 @@ onMounted(async () => {
         刷新
       </v-btn>
     </div>
+
+    <v-alert
+      type="info"
+      variant="tonal"
+      density="compact"
+      class="mb-4 mcp-tools-note"
+    >
+      {{ TOOLS_NOT_SHARED_NOTE }}
+    </v-alert>
 
     <v-alert
       v-if="error"

@@ -1,11 +1,13 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "fs";
-import { isAbsolute, relative, resolve } from "path";
+import { existsSync, statSync } from "fs";
+import { readFile } from "fs/promises";
+import { isAbsolute, resolve } from "path";
 import { defineTool, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Type } from "typebox";
-import { isLibraryFilePath } from "./library-root.js";
+import { isLibraryFilePath, isPathInsideDirectoryResolved } from "./library-root.js";
+import { MAX_PDF_BYTES } from "../shared/limits.js";
 
 const MAX_PAGES_PER_CALL = 20;
 
@@ -15,32 +17,9 @@ interface PdfOutlineNode {
 	items: PdfOutlineNode[];
 }
 
-function normalizeFsPath(targetPath: string): string {
-	const resolved = resolve(targetPath);
-	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function isInsideRoot(candidatePath: string, rootPath: string): boolean {
-	const resolved = normalizeFsPath(candidatePath);
-	const root = normalizeFsPath(rootPath);
-	const relativePath = relative(root, resolved);
-	if (relativePath === "" || relativePath.startsWith("..") || isAbsolute(relativePath)) {
-		return false;
-	}
-	try {
-		const real = normalizeFsPath(realpathSync(candidatePath));
-		if (real !== resolved) {
-			const realRel = relative(root, real);
-			if (realRel === "" || realRel.startsWith("..") || isAbsolute(realRel)) return false;
-		}
-	} catch {
-		// Missing files fail later; only in-root resolved paths are allowed.
-	}
-	return true;
-}
-
+/** cwd 放行 = 会话目录里的文件（与库内文件同等对待，不得删除）。 */
 function isAllowedPdfPath(candidatePath: string, cwd: string): boolean {
-	return isLibraryFilePath(candidatePath) || isInsideRoot(candidatePath, cwd);
+	return isLibraryFilePath(candidatePath) || isPathInsideDirectoryResolved(candidatePath, cwd);
 }
 
 function resolveGuardedPdfPath(filePath: string, cwd: string): { path: string } | { error: string } {
@@ -50,6 +29,11 @@ function resolveGuardedPdfPath(filePath: string, cwd: string): { path: string } 
 	}
 	if (!existsSync(resolved) || !statSync(resolved).isFile()) {
 		return { error: `File not found: ${resolved}` };
+	}
+	// 整读前先按体积拒绝：否则 pdf.js 会把超大文件整个读进内存
+	const stat = statSync(resolved);
+	if (stat.size > MAX_PDF_BYTES) {
+		return { error: `PDF too large: ${Math.round(stat.size / 1048576)} MB > 256 MB` };
 	}
 	return { path: resolved };
 }
@@ -94,9 +78,12 @@ async function convertOutline(doc: PDFDocumentProxy, nodes: unknown[]): Promise<
 }
 
 async function withPdfDocument<T>(filePath: string, fn: (doc: PDFDocumentProxy) => Promise<T>): Promise<T> {
-	const file = readFileSync(filePath);
-	const data = new Uint8Array(file.byteLength);
-	data.set(file);
+	// 异步整读（不再同步读盘阻塞主进程）。
+	// pdf.js 的 getDataProp 在 Node 下明确拒绝 Buffer 实例（而非只认 Uint8Array），所以不能直接把 Buffer 递进去；
+	// 这里用同底层视图包装：不复制字节（文件大于 Buffer 池时 pdf.js 也走零拷贝分支）。
+	// pdf.js 在本仓的 in-process fake worker 下不 transfer/detach 入参，共享内存安全；若将来改成真实 worker 需还原拷贝。
+	const file = await readFile(filePath);
+	const data = new Uint8Array(file.buffer, file.byteOffset, file.byteLength);
 	const task = getDocument({
 		data,
 		disableAutoFetch: true,

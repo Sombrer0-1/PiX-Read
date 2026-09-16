@@ -6,7 +6,7 @@
  */
 
 import "./env-setup.js";
-import { BrowserWindow, Menu, app, shell, type MenuItemConstructorOptions } from "electron";
+import { BrowserWindow, Menu, app, dialog, shell, type MenuItemConstructorOptions } from "electron";
 import { dirname, join } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { registerIpcHandlers, setupEventForwarding } from "./ipc-handlers.js";
@@ -212,7 +212,12 @@ if (gotSingleInstanceLock) {
       registerIpcHandlers(reopened, sessionBridge, settingsStore);
     }
   });
-});
+  }).catch((err) => {
+    // Without this net a startup failure (e.g. an unreadable settings file)
+    // leaves no window and no error surface at all.
+    console.error("[main] whenReady failed:", err);
+    dialog.showErrorBox("PiX-Read 启动失败", err instanceof Error ? err.message : String(err));
+  });
 }
 
 app.on("window-all-closed", () => {

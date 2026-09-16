@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getLibraryRoot, isLibraryFilePath, isPathInsideDirectory } from "./library-root.js";
 import type {
@@ -537,7 +537,8 @@ export function resetCorruptNotes(): ReaderNotesResetResult {
 
   const backupPath = uniqueBackupPath(paths.file, Date.now());
   try {
-    renameSync(paths.file, backupPath);
+    // copy-first：原文件不动，备份与原文同时在；先改名会把用户唯一副本留在半路，写失败时无法回退
+    copyFileSync(paths.file, backupPath);
   } catch {
     return { success: false, notes: [], code: "write-failed", error: ERROR_MESSAGES["write-failed"] };
   }

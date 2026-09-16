@@ -105,6 +105,12 @@ async function deleteKey(provider: string): Promise<void> {
   }
 }
 
+/** IME 组合态回车不提交密钥（与发送框同口径）。 */
+function onSaveKeyEnter(provider: string, e: KeyboardEvent): void {
+  if (e.isComposing) return;
+  void saveKey(provider);
+}
+
 // ---- Option lists ----
 const thinkingLevelItems = [
   { title: "关闭", value: "off" },
@@ -308,7 +314,10 @@ async function downloadAndInstall(): Promise<void> {
   try {
     const result = await window.pixApi.downloadUpdate();
     if (result.success) {
-      window.pixApi.installUpdate();
+      const installed = await window.pixApi.installUpdate();
+      if (!installed.success) {
+        updateError.value = installed.error ?? "安装更新失败";
+      }
     } else {
       updateError.value = result.error ?? "下载更新失败";
     }
@@ -479,7 +488,7 @@ async function downloadAndInstall(): Promise<void> {
                   </div>
                 </div>
                 <div v-if="editingProvider === provider" class="auth-edit-row">
-                  <v-text-field v-model="editingKeys[provider]" type="password" :placeholder="status.configured ? '输入新密钥以替换…' : '粘贴 API 密钥…'" hide-details density="comfortable" @keydown.enter="saveKey(provider)" class="mb-3" />
+                  <v-text-field v-model="editingKeys[provider]" type="password" :placeholder="status.configured ? '输入新密钥以替换…' : '粘贴 API 密钥…'" hide-details density="comfortable" @keydown.enter="onSaveKeyEnter(provider, $event)" class="mb-3" />
                   <div class="auth-btn-group">
                     <v-btn size="small" color="primary" variant="tonal" :disabled="!editingKeys[provider]?.trim()" @click="saveKey(provider)">保存</v-btn>
                     <v-btn v-if="status.configured" size="small" color="error" variant="text" @click="deleteKey(provider)">删除</v-btn>

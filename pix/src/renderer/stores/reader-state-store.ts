@@ -59,6 +59,8 @@ export const useReaderStateStore = defineStore("readerState", () => {
 
   /** 内部非响应式状态：竞态序号、去抖、快照、去重基线、落点认领键。 */
   let loadSeq = 0;
+  /** 保存世代：resetState 递增，跨复位的迟到 save 响应一律丢弃（不得回灌已清空的 store）。 */
+  let saveEpoch = 0;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let snapshot: ReaderSnapshot | null = null;
   let committed: ReaderSnapshot | null = null;
@@ -106,18 +108,22 @@ export const useReaderStateStore = defineStore("readerState", () => {
   }
 
   async function submit(next: ReaderSnapshot): Promise<void> {
+    const epoch = saveEpoch;
     try {
       const result = await bridge().readerStateSave({
         docFilePath: next.filePath,
         page: next.page,
         scale: next.scale,
       });
+      // 响应到达前已 resetState（切工作区）：上一轮的状态不得写进本轮的内存模型
+      if (epoch !== saveEpoch) return;
       if (result.success) {
         applyState(result.state);
         return;
       }
       warn(`save rejected (${result.code ?? "unknown"}): ${result.error ?? ""}`);
     } catch (err) {
+      if (epoch !== saveEpoch) return;
       warn(`save failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -156,6 +162,14 @@ export const useReaderStateStore = defineStore("readerState", () => {
       // 过期响应（切工作区 / 被 resetState 作废）不写任何状态
       if (seq !== loadSeq) return;
       ready.value = true;
+      if (!result.success) {
+        // 读取失败（no-root 等）：按空模型继续并记一条日志；ready 必须置位，否则本轮永不落盘
+        degraded.value = false;
+        applyState(result.state);
+        committed = null;
+        warn(`load failed (${result.code ?? "unknown"}): ${result.error ?? ""}`);
+        return;
+      }
       degraded.value = result.degraded;
       applyState(result.state);
       const last = lastDoc.value;
@@ -228,6 +242,7 @@ export const useReaderStateStore = defineStore("readerState", () => {
   /** 跨工作区残留防护：清空全部内存与在途状态；调用前必须先 flush（否则丢最后一次现场）。 */
   function resetState(): void {
     loadSeq += 1;
+    saveEpoch += 1;
     if (debounceTimer !== null) {
       clearTimeout(debounceTimer);
       debounceTimer = null;

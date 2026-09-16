@@ -73,6 +73,8 @@ const restoring = ref(false);
 const refreshing = ref(false);
 const copiedNoteId = ref<string | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
+/** 逃生口成功后的备份路径：「在文件夹中显示」所指；任何新提示先清空，不会指向上一份备份。 */
+const lastBackupPath = ref("");
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 let confirmTimer: ReturnType<typeof setTimeout> | null = null;
@@ -150,6 +152,8 @@ const countLabel = computed(() => {
 });
 
 function setNotice(kind: "success" | "error", text: string): void {
+  // 提示与备份路径同一生命周期：新提示一律先从空开始
+  lastBackupPath.value = "";
   notice.value = { kind, text };
   if (noticeTimer) clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => {
@@ -396,10 +400,13 @@ async function onRecover(): Promise<void> {
   const result = await notesStore.recoverCorruptNotes();
   recovering.value = false;
   if (!result.ok) {
-    setNotice("error", `重建失败：${result.message}`);
+    const suffix = result.backupPath ? `（原文件已备份：${result.backupPath}）` : "";
+    setNotice("error", `重建失败：${result.message}${suffix}`);
+    lastBackupPath.value = result.backupPath ?? "";
     return;
   }
-  setNotice("success", "已备份原文件并新建空库");
+  setNotice("success", `已备份原文件并新建空库：${result.backupPath}`);
+  lastBackupPath.value = result.backupPath ?? "";
 }
 
 async function revealPath(path: string): Promise<void> {
@@ -566,6 +573,15 @@ onBeforeUnmount(() => {
 
     <div v-if="notice" class="notes-notice" :class="`is-${notice.kind}`">
       <span class="notice-text">{{ notice.text }}</span>
+      <button
+        v-if="lastBackupPath"
+        type="button"
+        class="notice-reveal"
+        title="在文件夹中显示备份文件"
+        @click="revealPath(lastBackupPath)"
+      >
+        在文件夹中显示
+      </button>
       <button type="button" class="notice-close" title="关闭" @click="dismissNotice">
         <v-icon size="12">mdi-close</v-icon>
       </button>
@@ -1025,6 +1041,17 @@ onBeforeUnmount(() => {
   border-radius: var(--pix-radius-sm);
   background: transparent;
   color: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.notice-reveal {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  text-decoration: underline;
   cursor: pointer;
   flex-shrink: 0;
 }

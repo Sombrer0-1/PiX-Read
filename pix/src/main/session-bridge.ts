@@ -49,6 +49,7 @@ import type {
 	ChatMessageAttachment,
 } from "../shared/types.js";
 import { processChatFiles } from "./chat-files.js";
+import { normalizeFsPath } from "./library-root.js";
 import { createPdfToolsFactory } from "./pdf-tools.js";
 import { READING_ASSISTANT_SYSTEM_PROMPT } from "./reading-prompt.js";
 import {
@@ -198,32 +199,52 @@ export class SessionBridge {
 
 	private _isCompacting = false;
 	private _pendingMessageCount = 0;
+	// 生命周期串行门：start/newSession/switchSession/fork/navigateTree/dispose 一律排队执行，
+	// 避免并发调用（双击最近打开、快速返回首页）造成孤儿会话、句柄覆盖与事件次数漂移。
+	private _lifecycleChain: Promise<void> = Promise.resolve();
+
+	private _enqueueLifecycle<T>(job: () => Promise<T>): Promise<T> {
+		const run = this._lifecycleChain.then(job, job); // 前序失败也继续（门不吞错，只串行）
+		this._lifecycleChain = run.then(() => undefined, () => undefined);
+		return run;
+	}
 
 	async start(projectDir: string, guiSettings?: GuiSettings): Promise<void> {
-		this._assertProjectDirectory(projectDir);
-		await this._closeCurrentSession("quit");
+		return this._enqueueLifecycle(async () => {
+			this._assertProjectDirectory(projectDir);
 
-		this._cwd = projectDir;
-		this._guiSettings = guiSettings;
+			// 同 dir 幂等（串行段内、关闭当前会话之前判定）：同一项目重复 start 不重建会话
+			if (this._session && this.isRunning() && normalizeFsPath(projectDir) === normalizeFsPath(this._cwd)) {
+				if (guiSettings) this._guiSettings = guiSettings;
+				return;
+			}
 
-		this._authStorage = AuthStorage.create(pixAuthJsonFile);
+			await this._closeCurrentSession("quit");
 
-		const settingsManager = this._createSettingsManager();
-		const sessionDir = settingsManager.getSessionDir() ?? pixProjectSessionsDir(projectDir);
-		this._sessionManager = SessionManager.continueRecent(projectDir, sessionDir);
+			this._cwd = projectDir;
+			this._guiSettings = guiSettings;
 
-		const result = await this._createSession(projectDir, this._sessionManager, {
-			type: "session_start",
-			reason: "startup",
+			this._authStorage = AuthStorage.create(pixAuthJsonFile);
+
+			const settingsManager = this._createSettingsManager();
+			const sessionDir = settingsManager.getSessionDir() ?? pixProjectSessionsDir(projectDir);
+			this._sessionManager = SessionManager.continueRecent(projectDir, sessionDir);
+
+			const result = await this._createSession(projectDir, this._sessionManager, {
+				type: "session_start",
+				reason: "startup",
+			});
+			await this._activateSession(result.session);
 		});
-		await this._activateSession(result.session);
 	}
 
 	async dispose(): Promise<void> {
-		const hadSession = await this._closeCurrentSession("quit");
-		if (hadSession) {
-			this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
-		}
+		return this._enqueueLifecycle(async () => {
+			const hadSession = await this._closeCurrentSession("quit");
+			if (hadSession) {
+				this._emitLifecycle("exit", { code: 0, signal: null, stderr: "" });
+			}
+		});
 	}
 
 	updateGuiSettings(settings: GuiSettings): void {
@@ -277,76 +298,102 @@ export class SessionBridge {
 	}
 
 	async newSession(parentSession?: string): Promise<CommandResult> {
-		const previousSessionFile = this._session?.sessionFile;
-		const sessionDir = this._sessionManager?.getSessionDir() ?? pixProjectSessionsDir(this._cwd);
-		await this._closeCurrentSession("new");
+		return this._enqueueLifecycle(async () => {
+			const previousSessionFile = this._session?.sessionFile;
+			const sessionDir = this._sessionManager?.getSessionDir() ?? pixProjectSessionsDir(this._cwd);
+			await this._closeCurrentSession("new");
 
-		this._sessionManager = SessionManager.create(this._cwd, sessionDir);
-		if (parentSession) {
-			this._sessionManager.newSession({ parentSession });
-		}
+			this._sessionManager = SessionManager.create(this._cwd, sessionDir);
+			if (parentSession) {
+				this._sessionManager.newSession({ parentSession });
+			}
 
-		const result = await this._createSession(this._cwd, this._sessionManager, {
-			type: "session_start",
-			reason: "new",
-			previousSessionFile,
+			const result = await this._createSession(this._cwd, this._sessionManager, {
+				type: "session_start",
+				reason: "new",
+				previousSessionFile,
+			});
+			await this._activateSession(result.session);
+			return { cancelled: false };
 		});
-		await this._activateSession(result.session);
-		return { cancelled: false };
 	}
 
 	async switchSession(sessionPath: string): Promise<CommandResult> {
-		const previousSessionFile = this._session?.sessionFile;
-		await this._closeCurrentSession("resume", sessionPath);
+		return this._enqueueLifecycle(async () => {
+			const previousSessionFile = this._session?.sessionFile;
+			await this._closeCurrentSession("resume", sessionPath);
 
-		this._sessionManager = SessionManager.open(sessionPath, undefined, this._cwd);
-		this._cwd = this._sessionManager.getCwd();
-		const result = await this._createSession(this._cwd, this._sessionManager, {
-			type: "session_start",
-			reason: "resume",
-			previousSessionFile,
+			this._sessionManager = SessionManager.open(sessionPath, undefined, this._cwd);
+			this._cwd = this._sessionManager.getCwd();
+			const result = await this._createSession(this._cwd, this._sessionManager, {
+				type: "session_start",
+				reason: "resume",
+				previousSessionFile,
+			});
+			await this._activateSession(result.session);
+			return { cancelled: false };
 		});
-		await this._activateSession(result.session);
-		return { cancelled: false };
 	}
 
 	async fork(entryId: string, position: "before" | "at" = "before", label?: string): Promise<CommandResult> {
-		const session = this._getSession();
-		const sessionManager = session.sessionManager;
-		if (!sessionManager.isPersisted()) {
-			throw new Error("Cannot fork: session is not persisted");
-		}
+		return this._enqueueLifecycle(async () => {
+			const session = this._getSession();
+			const sessionManager = session.sessionManager;
+			if (!sessionManager.isPersisted()) {
+				throw new Error("Cannot fork: session is not persisted");
+			}
 
-		const selectedEntry = sessionManager.getEntry(entryId);
-		if (!selectedEntry) {
-			throw new Error("Invalid entry ID for forking");
-		}
-
-		let targetLeafId: string | null;
-		if (position === "at") {
-			targetLeafId = selectedEntry.id;
-		} else {
-			if (selectedEntry.type !== "message") {
+			const selectedEntry = sessionManager.getEntry(entryId);
+			if (!selectedEntry) {
 				throw new Error("Invalid entry ID for forking");
 			}
-			targetLeafId = selectedEntry.parentId;
-		}
 
-		const previousSessionFile = session.sessionFile;
-		const currentSessionFile = session.sessionFile;
-		if (!currentSessionFile) {
-			throw new Error("Persisted session is missing a session file");
-		}
-
-		const sessionDir = sessionManager.getSessionDir();
-		if (!targetLeafId) {
-			if (label) {
-				sessionManager.appendLabelChange(selectedEntry.id, label);
+			let targetLeafId: string | null;
+			if (position === "at") {
+				targetLeafId = selectedEntry.id;
+			} else {
+				if (selectedEntry.type !== "message") {
+					throw new Error("Invalid entry ID for forking");
+				}
+				targetLeafId = selectedEntry.parentId;
 			}
-			const newSessionManager = SessionManager.create(this._cwd, sessionDir);
-			newSessionManager.newSession({ parentSession: currentSessionFile });
-			await this._closeCurrentSession("fork");
-			this._sessionManager = newSessionManager;
+
+			const previousSessionFile = session.sessionFile;
+			const currentSessionFile = session.sessionFile;
+			if (!currentSessionFile) {
+				throw new Error("Persisted session is missing a session file");
+			}
+
+			const sessionDir = sessionManager.getSessionDir();
+			if (!targetLeafId) {
+				if (label) {
+					sessionManager.appendLabelChange(selectedEntry.id, label);
+				}
+				const newSessionManager = SessionManager.create(this._cwd, sessionDir);
+				newSessionManager.newSession({ parentSession: currentSessionFile });
+				await this._closeCurrentSession("fork");
+				this._sessionManager = newSessionManager;
+
+				const result = await this._createSession(this._cwd, this._sessionManager, {
+					type: "session_start",
+					reason: "fork",
+					previousSessionFile,
+				});
+				await this._activateSession(result.session);
+				return { cancelled: false };
+			}
+
+			const forkManager = SessionManager.open(currentSessionFile, sessionDir);
+			const forkedSessionPath = forkManager.createBranchedSession(targetLeafId);
+			if (!forkedSessionPath) {
+				throw new Error("Failed to create forked session");
+			}
+
+			await this._closeCurrentSession("fork", forkedSessionPath);
+			this._sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
+			if (label) {
+				this._sessionManager.appendLabelChange(targetLeafId, label);
+			}
 
 			const result = await this._createSession(this._cwd, this._sessionManager, {
 				type: "session_start",
@@ -355,37 +402,19 @@ export class SessionBridge {
 			});
 			await this._activateSession(result.session);
 			return { cancelled: false };
-		}
-
-		const forkManager = SessionManager.open(currentSessionFile, sessionDir);
-		const forkedSessionPath = forkManager.createBranchedSession(targetLeafId);
-		if (!forkedSessionPath) {
-			throw new Error("Failed to create forked session");
-		}
-
-		await this._closeCurrentSession("fork", forkedSessionPath);
-		this._sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
-		if (label) {
-			this._sessionManager.appendLabelChange(targetLeafId, label);
-		}
-
-		const result = await this._createSession(this._cwd, this._sessionManager, {
-			type: "session_start",
-			reason: "fork",
-			previousSessionFile,
 		});
-		await this._activateSession(result.session);
-		return { cancelled: false };
 	}
 
 	async navigateTree(targetId: string, options?: NavigateTreeOptions): Promise<CommandResult> {
-		const result = await this._getSession().navigateTree(targetId, {
-			summarize: options?.summarize,
-			customInstructions: options?.customInstructions,
-			replaceInstructions: options?.replaceInstructions,
-			label: options?.label,
+		return this._enqueueLifecycle(async () => {
+			const result = await this._getSession().navigateTree(targetId, {
+				summarize: options?.summarize,
+				customInstructions: options?.customInstructions,
+				replaceInstructions: options?.replaceInstructions,
+				label: options?.label,
+			});
+			return { cancelled: result.cancelled };
 		});
-		return { cancelled: result.cancelled };
 	}
 
 	async clone(): Promise<CommandResult> {
@@ -1010,12 +1039,36 @@ export class SessionBridge {
 
 		const config = this._guiSettings?.takeHerEyes;
 		if (!config?.enabled || !config.provider || !config.modelId) return null;
-
-		const eyeModel = session.modelRegistry.find(config.provider, config.modelId);
-		if (!eyeModel || !eyeModel.input.includes("image")) return null;
-		if (!session.modelRegistry.hasConfiguredAuth(eyeModel)) return null;
+		// 闭包内保留窄化：属性访问的窄化不会进闭包（TS 不保留）
+		const eyeProvider = config.provider;
+		const eyeModelId = config.modelId;
 
 		const operationId = `eye_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+		// F13：已启用但不可用的分支不再静默——渲染层据此渲染 vision-status 失败块。
+		// 只覆盖「配置完整且本次确实带图」的不可用分支；images.length === 0 / 未启用 / 配置不完整
+		// 一律不发（_tryTakeHerEyes 每次 prompt 都被调用，否则普通文本提问会长出失败块噪声）。
+		const emitUnavailable = (errorMessage: string): void => {
+			this._emitSessionEvent({
+				type: "eye_model_end",
+				id: operationId,
+				provider: eyeProvider,
+				modelId: eyeModelId,
+				imageCount: images.length,
+				success: false,
+				errorMessage,
+			});
+		};
+
+		const eyeModel = session.modelRegistry.find(config.provider, config.modelId);
+		if (!eyeModel || !eyeModel.input.includes("image")) {
+			emitUnavailable("配置的视觉模型不可用");
+			return null;
+		}
+		if (!session.modelRegistry.hasConfiguredAuth(eyeModel)) {
+			emitUnavailable("视觉模型未配置鉴权");
+			return null;
+		}
+
 		let emittedStart = false;
 		const emitEnd = (success: boolean, errorMessage?: string): void => {
 			if (!emittedStart) return;
@@ -1035,6 +1088,7 @@ export class SessionBridge {
 			const auth = await session.modelRegistry.getApiKeyAndHeaders(eyeModel);
 			if (!auth.ok) {
 				console.warn(`[takeHerEyes] Auth unavailable for ${eyeModel.provider}/${eyeModel.id}: ${auth.error}`);
+				emitUnavailable("鉴权失败");
 				return null;
 			}
 
@@ -1148,7 +1202,12 @@ export class SessionBridge {
 			session.setScopedModels([]);
 			return;
 		}
-		session.setScopedModels(this._resolveScopedModels(session, patterns));
+		const scopedModels = this._resolveScopedModels(session, patterns);
+		if (scopedModels.length === 0) {
+			// F20 降级处置：0 命中时内核同样回退为全部模型（model-resolver 有 warn），此处仅补一行日志、不改行为
+			console.warn(`[SessionBridge] enabledModels 未命中任何模型，已回退为全部模型：${patterns.join(", ")}`);
+		}
+		session.setScopedModels(scopedModels);
 	}
 
 	private _resolveScopedModels(
@@ -1256,6 +1315,9 @@ export class SessionBridge {
 			modelRegistry: ModelRegistry.create(authStorage, pixModelsJsonFile),
 			sessionStartEvent,
 			requestUserInput: (request, signal) => this._requestUserInput(request, signal),
+			// 只读边界（F5）：这份显式白名单是模型可用工具的唯一来源，不含任何 mcp__* 工具。
+			// MCP 服务器照常连接并在设置页展示状态/工具清单，但其工具不会提供给模型——
+			// 设置页的面板级说明必须与这里保持一致（不新增写能力）。
 			tools: [
 				"read",
 				"ls",
@@ -1381,6 +1443,9 @@ export class SessionBridge {
 	}
 
 	private _setupEventSubscription(session: AgentSession): void {
+		// 二次覆盖点：先解除旧订阅再挂新句柄，避免旧订阅泄漏（重复订阅同一会话时）
+		this._unsubscribe?.();
+		this._unsubscribe = null;
 		this._isCompacting = false;
 		this._pendingMessageCount = 0;
 

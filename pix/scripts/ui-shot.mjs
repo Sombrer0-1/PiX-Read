@@ -393,6 +393,12 @@ function writeFixtures() {
   // 上一轮遗留的状态文件会让「首启 missing」不可复现：fixture 冻结为两个工作区都没有它
   rmSync(join(LIBRARY_DIR, ".pix-read", "reader-state.json"), { force: true });
   rmSync(join(LIBRARY_B_DIR, ".pix-read", "reader-state.json"), { force: true });
+  // F12：corrupt 重建会留下 .corrupt-* 备份，不清会跨轮累积（13d 的 .pix-read 断言用相位内基线）
+  for (const dir of [LIBRARY_DIR, LIBRARY_B_DIR]) {
+    for (const name of readdirSync(join(dir, ".pix-read"))) {
+      if (name.startsWith("reader-state.json.corrupt-")) rmSync(join(dir, ".pix-read", name), { force: true });
+    }
+  }
   writeFileSync(join(LIBRARY_DIR, "archive", "older-paper.pdf"), buildPdf(OLDER_PAGES));
   // long-book.pdf:420 节点规模场景的夹具（与 sample-paper 同格式，无页码声明表以外的内容依赖）
   writeFileSync(join(LIBRARY_DIR, "long-book.pdf"), buildPdf(LONG_BOOK_PAGES, LONG_BOOK_OUTLINE));
@@ -475,6 +481,11 @@ const sendCalls = [];
 const libraryShowPaths = [];
 let sendFailure = null;
 let agentEventHandlers = [];
+// F16 判据：工作区卸载后的迟到注册（注册/解绑计数与在册句柄数）
+let agentEventRegisterCount = 0;
+let agentEventUnregisterCount = 0;
+// F16 判据：agent_start 是否仍然触发工作区同步（syncWorkspaceState → listSessions）
+let listSessionsCalls = 0;
 // onUserInputRequest 的保留回调（与 onAgentEvent 同形）：emitUserInputRequest 逐个投递
 let userInputHandlers = [];
 let stubMessages = [];
@@ -849,8 +860,11 @@ const api = {
 
   onAgentEvent: function (handler) {
     agentEventHandlers.push(handler);
+    agentEventRegisterCount += 1;
     return function () {
+      const before = agentEventHandlers.length;
       agentEventHandlers = agentEventHandlers.filter(function (item) { return item !== handler; });
+      if (agentEventHandlers.length !== before) agentEventUnregisterCount += 1;
     };
   },
   onAgentReady: function () { return function () {}; },
@@ -863,7 +877,7 @@ const api = {
     };
   },
 
-  listSessions: async function () { return []; },
+  listSessions: async function () { listSessionsCalls += 1; return []; },
   deleteSession: async function () { return { success: true }; },
 
   libraryList: async function (dir) { return libraryList(dir); },
@@ -1107,6 +1121,10 @@ const api = {
     const file = stateFilePath();
     const read = readStateFile();
     if (!read.ok) {
+      // 与真实主进程同步：missing 不是降级（degraded:false），只有 corrupt/version/read-failed 才降级
+      if (read.reason === "missing") {
+        return { success: true, state: emptyState(), filePath: file, degraded: false };
+      }
       return { success: true, state: emptyState(), filePath: file, degraded: true, reason: read.reason, error: read.reason };
     }
     return { success: true, state: read.state, filePath: file, degraded: false };
@@ -1144,7 +1162,7 @@ const api = {
 
   checkForUpdates: async function () { return { success: true, hasUpdate: false, currentVersion: "0.1.0" }; },
   downloadUpdate: async function () { return { success: true }; },
-  installUpdate: function () {},
+  installUpdate: async function () { return { success: true }; },
 };
 
 contextBridge.exposeInMainWorld("pixApi", api);
@@ -1196,6 +1214,14 @@ contextBridge.exposeInMainWorld("__pixStub", {
     });
   },
   setLoadDelay: function (ms) { loadDelayMs = ms; },
+  agentEventListenerCount: function () {
+    return {
+      handlers: agentEventHandlers.length,
+      registered: agentEventRegisterCount,
+      unregistered: agentEventUnregisterCount,
+    };
+  },
+  listSessionsCalls: function () { return listSessionsCalls; },
   setLibraryReadDelay: function (ms) { libraryReadDelayMs = ms; },
   setLoadFailure: function (code, error) { loadFailure = code ? { code: code, error: error } : null; },
   relativeDocPath: function (target) { return relativeDocPath(target); },
@@ -1802,16 +1828,21 @@ async function runReaderStateScenarios(win, log) {
   const warnBase20b = warnCount();
   await enterWorkspace(LIBRARY_NAME);
   await waitTreeRows(2);
-  await waitWarnIncrement(warnBase20b, "missing 降级 warn");
+  // missing 不再降级：有界静默后由断言判定 warn 增量为 0（真实等待窗口，不是直接读计数）
+  await sleep(600);
   const emptyState = {
     resume: await has(".reader-resume"),
     title: await textOf(".empty-title"),
     emptyError: await has(".reader-empty-error"),
+    warnDelta20b: warnCount() - warnBase20b,
   };
   await capturePage(win, "20b-resume-empty.png");
   record("resume-entry", { phase: "no-record", ...emptyState }, [
     ...(emptyState.resume === false ? [] : ["无记录时不应有入口"]),
     ...(emptyState.title === "选择左侧文件开始阅读" ? [] : [`空态文案异常：${emptyState.title}`]),
+    ...(emptyState.warnDelta20b === 0
+      ? []
+      : [`missing 不得再产生 [reader-state] warn，实际增量 ${emptyState.warnDelta20b}`]),
   ]);
 
   // --- 20d 加载窗口内连点笔记：落点取最后一次点击 --------------------------------
@@ -2140,6 +2171,90 @@ async function runReaderStateScenarios(win, log) {
   record("note-jump", { phase: "recorded-target", ...jumpRestored }, [
     ...(jumpRestored.page === "第 2 / 2 页" ? [] : [`跳转页应覆盖恢复页：${jumpRestored.page}`]),
     ...(jumpRestored.zoom === "150%" ? [] : [`缩放应取目标文档恢复值：${jumpRestored.zoom}`]),
+  ]);
+
+  // --- 22f 触底钳制（R15-F2）-----------------------------------------------------
+  // 编号说明：R15-fix 建议「22c」，但 22c 已被写失败注入相位占用（同函数内不得重号）⇒ 新相位取 22f；
+  // 截图名沿用计划指定的 r15-22c-bottom-50.png。
+  log("22f 触底钳制：50% 滚到底 = 第 3 / 3 页；fitted（不可滚动）不被钳到末页");
+  await goHome();
+  removeState(STATE_FILE_A);
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(4);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const zoomOut22f = () => js(`document.querySelector('.pdf-toolbar button[title="缩小"]').click(), true`);
+  for (let i = 0; i < 5; i++) await zoomOut22f();
+  await waitFor(
+    "缩放 50%",
+    `document.querySelector(".zoom-label") && document.querySelector(".zoom-label").textContent.trim() === "50%"`,
+  );
+  const scrollProbe22f = () => js(`(() => {
+    const root = document.querySelector(".pdf-scroll");
+    return root
+      ? { scrollTop: Math.round(root.scrollTop), scrollHeight: root.scrollHeight, clientHeight: root.clientHeight }
+      : null;
+  })()`);
+  const zoom50 = await zoomLabel();
+  const beforeBottom22f = await scrollProbe22f();
+  await js(`(() => { const root = document.querySelector(".pdf-scroll"); root.scrollTop = root.scrollHeight; return true; })()`);
+  await waitPage(3, 3);
+  const bottom22f = { page: await pageLabel(), scroll: await scrollProbe22f() };
+  await capturePage(win, "r15-22c-bottom-50.png");
+  record("page-tracking", { phase: "bottom-clamp-50", zoom: zoom50, before: beforeBottom22f, after: bottom22f }, [
+    ...(beforeBottom22f && beforeBottom22f.scrollHeight - beforeBottom22f.clientHeight > 1
+      ? []
+      : [`50% 下必须可滚动（防空断言）：${JSON.stringify(beforeBottom22f)}`]),
+    ...(bottom22f.scroll && bottom22f.scroll.scrollTop > 0 ? [] : [`触底后 scrollTop 应大于 0（防空断言）：${JSON.stringify(bottom22f.scroll)}`]),
+    ...(bottom22f.page === "第 3 / 3 页" ? [] : [`触底后当前页应为末页：${bottom22f.page}`]),
+  ]);
+  await js(`(() => { const root = document.querySelector(".pdf-scroll"); root.scrollTop = 0; return true; })()`);
+  await waitPage(1, 3);
+  const top22f = { page: await pageLabel() };
+  record("page-tracking", { phase: "top-back-50", ...top22f }, [
+    ...(top22f.page === "第 1 / 3 页" ? [] : [`回到顶部应为第 1 页：${top22f.page}`]),
+  ]);
+  // fitted 负向：把滚动容器拉高到内容装得下（scrollHeight - clientHeight <= 1）⇒ 不得钳到末页。
+  // 合成 KeyboardEvent 不触发原生滚动，故这里直接派发 scroll 事件驱动 onScroll → rAF → updateCurrentPage。
+  await js(`(() => {
+    const root = document.querySelector(".pdf-scroll");
+    root.style.flex = "0 0 auto";
+    root.style.height = "3000px";
+    root.scrollTop = 0;
+    root.dispatchEvent(new Event("scroll"));
+    return true;
+  })()`);
+  await sleep(300);
+  const fitted22f = await js(`(() => {
+    const root = document.querySelector(".pdf-scroll");
+    const label = document.querySelector(".page-label");
+    return {
+      page: label ? label.textContent.replace(/\\s+/g, " ").trim() : null,
+      scrollTop: Math.round(root.scrollTop),
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+    };
+  })()`);
+  await capturePage(win, "r15-22f-fitted-no-clamp.png");
+  record("page-tracking", { phase: "fitted-no-clamp", ...fitted22f }, [
+    ...(fitted22f.scrollHeight - fitted22f.clientHeight <= 1
+      ? []
+      : [`该相位要求不可滚动（防空断言）：${JSON.stringify(fitted22f)}`]),
+    ...(fitted22f.page === "第 1 / 3 页" ? [] : [`不可滚动时不得钳到末页：${fitted22f.page}`]),
+  ]);
+  await js(`(() => { const root = document.querySelector(".pdf-scroll"); root.style.flex = ""; root.style.height = ""; return true; })()`);
+  const zoomIn22f = () => js(`document.querySelector('.pdf-toolbar button[title="放大"]').click(), true`);
+  for (let i = 0; i < 5; i++) await zoomIn22f();
+  await waitFor(
+    "缩放回 100%",
+    `document.querySelector(".zoom-label") && document.querySelector(".zoom-label").textContent.trim() === "100%"`,
+  );
+  await waitPage(1, 3);
+  const restored22f = { page: await pageLabel(), zoom: await zoomLabel() };
+  record("page-tracking", { phase: "restored-100", ...restored22f }, [
+    ...(restored22f.zoom === "100%" ? [] : [`相位收尾缩放应为 100%：${restored22f.zoom}`]),
+    ...(restored22f.page === "第 1 / 3 页" ? [] : [`相位收尾应回到第 1 页：${restored22f.page}`]),
   ]);
 
   // --- 23 损坏状态下的阅读与重建 -------------------------------------------------
@@ -4062,6 +4177,117 @@ async function runReaderStateScenarios(win, log) {
       ...(resend45.message.includes("reader_notes:") ? [] : ["恢复后重发仍应注入"]),
       ...(notesCount45 === 2 ? [] : [`重发注入条数异常：${notesCount45}`]),
       ...(resend45.type === "prompt" ? [] : [`重发应走 prompt：${resend45.type}`]),
+    ],
+  );
+
+  // --- 45d 发送失败还原：草稿回填 + 恢复后重发（R15 F6；45/45B/45C 不动）--------
+  log("45d 发送失败还原：失败回填草稿且可重发");
+  const ASK45D = "45d：失败后草稿应还原。";
+  const errorBase45d = await countOf(".error-block");
+  const base45d = await userBlocks();
+  await clearSendCalls();
+  await setSendFailure("throw");
+  await setDraft(ASK45D);
+  await js(`document.querySelector(".composer-send").click(), true`);
+  await waitFor("45d 发送异常错误块", `document.querySelectorAll(".error-block").length > ${errorBase45d}`);
+  await sleep(200);
+  const restore45d = {
+    value: await js(`document.querySelector(".input-area").value`),
+    userBlocksRolledBack: (await userBlocks()) === base45d,
+    sendDisabled: await js(`(() => { const b = document.querySelector(".composer-send"); return !!b && b.disabled; })()`),
+    focused: await js(`document.activeElement === document.querySelector(".input-area")`),
+  };
+  await capturePage(win, "45d-send-failure-restore.png");
+  await setSendFailure(null);
+  await clearSendCalls();
+  await js(`document.querySelector(".composer-send").click(), true`);
+  await waitSendCalls(1);
+  await sleep(200);
+  const retry45d = {
+    value: await js(`document.querySelector(".input-area").value`),
+    type: (await lastSend()).type,
+  };
+  record(
+    "composer-send",
+    { phase: "failure-restore", ...restore45d, retry: retry45d },
+    [
+      ...(restore45d.value === ASK45D ? [] : [`失败后草稿必须还原：${JSON.stringify(restore45d.value)}`]),
+      ...(restore45d.userBlocksRolledBack ? [] : ["失败后乐观用户块应回滚"]),
+      ...(restore45d.sendDisabled === false ? [] : ["还原后发送按钮必须可点"]),
+      ...(restore45d.focused === true ? [] : ["还原后焦点应回到输入框"]),
+      ...(retry45d.value === "" ? [] : [`重发成功后草稿应清空：${JSON.stringify(retry45d.value)}`]),
+      ...(retry45d.type === "prompt" ? [] : [`重发应走 prompt：${retry45d.type}`]),
+    ],
+  );
+
+  // --- r15-ime 发送框 IME 组合态守卫（R15 F1）-----------------------------------
+  log("r15-ime：组合态回车不发送，非组合态回车发送（成对断言）");
+  await clearSendCalls();
+  await setDraft("IME 测试");
+  const imeValueBefore = await js(`document.querySelector(".input-area").value`);
+  await js(`document.querySelector(".input-area").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: true })), true`);
+  await sleep(250);
+  const imeComposing = {
+    sendCount: (await sendCalls()).count,
+    value: await js(`document.querySelector(".input-area").value`),
+  };
+  await capturePage(win, "r15-ime-guard.png");
+  await js(`document.querySelector(".input-area").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: false })), true`);
+  await waitSendCalls(1);
+  await sleep(200);
+  const imePlain = {
+    sendCount: (await sendCalls()).count,
+    value: await js(`document.querySelector(".input-area").value`),
+  };
+  record(
+    "composer-ime",
+    { phase: "enter-guard", valueBefore: imeValueBefore, composing: imeComposing, plain: imePlain },
+    [
+      ...(imeComposing.sendCount === 0 ? [] : [`组合态回车不得发送：${imeComposing.sendCount}`]),
+      ...(imeComposing.value === "IME 测试" ? [] : [`组合态回车不得改草稿：${JSON.stringify(imeComposing.value)}`]),
+      ...(imePlain.sendCount === 1 ? [] : [`非组合态回车必须发送：${imePlain.sendCount}`]),
+      ...(imePlain.value === "" ? [] : [`发送后草稿应清空：${JSON.stringify(imePlain.value)}`]),
+    ],
+  );
+
+  // --- r15-clarify 澄清请求替换：进度与作答必须复位（R15 F8）-------------------
+  log("r15-clarify 澄清请求替换（r1 两问 → r2 一问）：进度复位到 1 / 1");
+  const clarifyQ = (id, question) => ({ id: id, header: "澄清", question: question });
+  await emitUserInputRequest({ id: "r15-clarify-1", questions: [clarifyQ("q1", "第一个问题"), clarifyQ("q2", "第二个问题")] });
+  await waitFor("澄清卡片（r1）", `document.querySelector(".clarification-card")`);
+  const progressBefore = await textOf(".question-progress");
+  await js(`(() => {
+    const el = document.querySelector(".clarification-card .card-textarea");
+    if (!el) throw new Error("card textarea not found");
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    setter.call(el, "第一题回答");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  await waitFor("继续按钮可点", `(() => { const b = document.querySelector(".clarification-card .next-btn"); return !!b && !b.disabled; })()`);
+  await js(`document.querySelector(".clarification-card .next-btn").click(), true`);
+  await waitFor("推进到第 2 题", `(() => { const el = document.querySelector(".question-progress"); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === "2 / 2"; })()`);
+  await emitUserInputRequest({ id: "r15-clarify-2", questions: [clarifyQ("q1", "替换后的唯一问题")] });
+  await sleep(600);
+  const replaced = {
+    inDom: await has(".clarification-card"),
+    progress: await textOf(".question-progress"),
+    questionText: await textOf(".clarification-card .question-text"),
+    textareaDisabled: await js(`(() => { const el = document.querySelector(".clarification-card .card-textarea"); return el ? el.disabled : null; })()`),
+  };
+  await capturePage(win, "r15-clarify-replace.png");
+  await emitUserInputRequest(null);
+  await sleep(400);
+  const cleared = await has(".clarification-card");
+  record(
+    "clarify-replace",
+    { phase: "replace", progressBefore: progressBefore, ...replaced, cleared: cleared },
+    [
+      ...(progressBefore === "1 / 2" ? [] : [`前置：r1 应停在第 1 / 2 题：${progressBefore}`]),
+      ...(replaced.inDom === true ? [] : ["替换后澄清卡片必须仍在 DOM"]),
+      ...(replaced.progress === "1 / 1" ? [] : [`替换后进度必须复位：${replaced.progress}`]),
+      ...(replaced.textareaDisabled === false ? [] : [`替换后输入框必须可用：${replaced.textareaDisabled}`]),
+      ...(cleared === false ? [] : ["撤销后卡片应消失"]),
     ],
   );
 
@@ -6446,6 +6672,106 @@ async function runReaderStateScenarios(win, log) {
     ...(notesHash() === hashR11b ? [] : ["Esc 不得改写 notes.json"]),
   ]);
 
+  // --- r15-f18：框选失败保留模式 + 提示（R15-F18）--------------------------------
+  log("r15-f18 框选：无可截内容时保留模式并提示；正常拖拽仍退出并给出截图 chip");
+  const captureProbeR15 = () => js(`(() => {
+    const viewer = document.querySelector(${JSON.stringify(SEL.pdfViewer)});
+    const fab = document.querySelector(${JSON.stringify(SEL.captureFabBtn)});
+    return {
+      layerInDom: !!document.querySelector(${JSON.stringify(SEL.captureLayer)}),
+      errorHint: !!document.querySelector(".capture-error-hint"),
+      viewerCapture: !!viewer && viewer.classList.contains("capture-mode"),
+      fabPressed: fab ? fab.getAttribute("aria-pressed") : null,
+    };
+  })()`);
+  const chipTextsR15 = () => js(`Array.from(document.querySelectorAll(".attachment-chip")).map((el) => el.textContent.replace(/\\s+/g, " ").trim())`);
+  /** 合成指针拖拽：起点/终点都在第 1 页画布内（clientX/clientY 由画布矩形推出，不依赖真实鼠标）。
+   *  setPointerCapture 对合成事件可能抛 NotFoundError：状态在抛错前已置位，后续 pointerup 仍能收敛。 */
+  const dragOnPageOneR15 = (fraction) => js(`(() => {
+    const layer = document.querySelector(${JSON.stringify(SEL.captureLayer)});
+    const canvas = document.querySelector('.pdf-page[data-page="1"] canvas');
+    if (!layer || !canvas) throw new Error("capture layer / page canvas not found");
+    const layerRect = layer.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    const x1 = canvasRect.left + canvasRect.width * ${fraction};
+    const y1 = canvasRect.top + canvasRect.height * ${fraction};
+    const fire = (type, x, y) => layer.dispatchEvent(new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      pointerId: 7,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      buttons: type === "pointerup" ? 0 : 1,
+    }));
+    fire("pointerdown", x1, y1);
+    fire("pointermove", x1 + 120, y1 + 80);
+    fire("pointerup", x1 + 120, y1 + 80);
+    return { withinLayer: x1 + 120 <= layerRect.right && y1 + 80 <= layerRect.bottom, x1: Math.round(x1), y1: Math.round(y1) };
+  })()`);
+  const clickElR15 = (selector) => js(`document.querySelector(${JSON.stringify(selector)}).click(), true`);
+  const enterCaptureR15 = async () => {
+    if (!(await has(SEL.captureLayer))) await clickElR15(SEL.captureFabBtn);
+    await waitFor("框选层就绪", `document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  };
+  await enterCaptureR15();
+  await waitFor(
+    "第 1 页画布已渲染",
+    `(() => { const c = document.querySelector('.pdf-page[data-page="1"] canvas'); return !!c && c.width > 0 && c.height > 0; })()`,
+  );
+  const zeroedCanvasR15 = await js(`(() => {
+    const canvas = document.querySelector('.pdf-page[data-page="1"] canvas');
+    if (!canvas) throw new Error("page canvas not found");
+    window.__pixR15CanvasSize = { width: canvas.width, height: canvas.height };
+    canvas.width = 0;
+    canvas.height = 0;
+    return { width0: canvas.width, height0: canvas.height, saved: window.__pixR15CanvasSize };
+  })()`);
+  const dragFailR15 = await dragOnPageOneR15(0.3);
+  await sleep(200);
+  const failStateR15 = await captureProbeR15();
+  await capturePage(win, "r15-f18-capture-failure.png");
+  record("r15-capture-region", { phase: "failure-keeps-mode", canvas: zeroedCanvasR15, drag: dragFailR15, ...failStateR15 }, [
+    ...(zeroedCanvasR15.saved.width > 0 && zeroedCanvasR15.saved.height > 0 ? [] : [`置零前画布本应有尺寸（防空断言）：${JSON.stringify(zeroedCanvasR15)}`]),
+    ...(dragFailR15.withinLayer === true ? [] : [`拖拽终点必须在框选层内（防空断言）：${JSON.stringify(dragFailR15)}`]),
+    ...(failStateR15.layerInDom === true ? [] : ["失败时必须保留框选模式（.capture-layer 应仍在 DOM）"]),
+    ...(failStateR15.errorHint === true ? [] : ["失败时应出现 .capture-error-hint 提示"]),
+    ...(failStateR15.viewerCapture === true ? [] : [".pdf-viewer 应仍含 capture-mode"]),
+    ...(failStateR15.fabPressed === "true" ? [] : [`框选按钮应仍激活：${failStateR15.fabPressed}`]),
+  ]);
+  const restoredCanvasR15 = await js(`(() => {
+    const canvas = document.querySelector('.pdf-page[data-page="1"] canvas');
+    const size = window.__pixR15CanvasSize;
+    canvas.width = size.width;
+    canvas.height = size.height;
+    return { width: canvas.width, height: canvas.height };
+  })()`);
+  const dragOkR15 = await dragOnPageOneR15(0.5);
+  await waitFor("框选退出（成功后）", `!document.querySelector(${JSON.stringify(SEL.captureLayer)})`);
+  await waitFor(
+    "截图 chip",
+    `Array.from(document.querySelectorAll(".attachment-chip")).some((el) => (el.textContent || "").includes("截图 1"))`,
+  );
+  const okStateR15 = { layerInDom: await has(SEL.captureLayer), chips: await chipTextsR15(), errorHint: await has(".capture-error-hint") };
+  await capturePage(win, "r15-f18-capture-success.png");
+  record("r15-capture-region", { phase: "success-exits", canvas: restoredCanvasR15, drag: dragOkR15, ...okStateR15 }, [
+    ...(restoredCanvasR15.width > 0 && restoredCanvasR15.height > 0 ? [] : [`还原后画布应有尺寸（防空断言）：${JSON.stringify(restoredCanvasR15)}`]),
+    ...(okStateR15.layerInDom === false ? [] : ["成功后应退出框选模式（.capture-layer 应离开 DOM）"]),
+    ...(okStateR15.chips.some((text) => text.includes("截图 1")) ? [] : [`composer 应出现「截图 1」chip：${JSON.stringify(okStateR15.chips)}`]),
+  ]);
+  // 收尾：移除截图 chip，恢复发送态的初值（后续相位会断言发送载荷）。
+  await js(`(() => {
+    const chip = Array.from(document.querySelectorAll(".attachment-chip")).find((el) => (el.textContent || "").includes("截图 1"));
+    if (chip) {
+      const remove = chip.querySelector(".attachment-remove");
+      if (remove) remove.click();
+    }
+    return true;
+  })()`);
+  await waitFor("截图 chip 已移除", `!Array.from(document.querySelectorAll(".attachment-chip")).some((el) => (el.textContent || "").includes("截图 1"))`);
+
   // --- r11-3：面板滚动不再吞掉摘录反馈（组 r11-quick-ask-scroll-scope）----------
   log("r11-3 摘录反馈不被面板滚动吞掉 + 阅读区滚动仍隐藏");
   await enterNotesProbe([], 0);
@@ -8793,7 +9119,134 @@ async function runReaderStateScenarios(win, log) {
     ],
   );
 
+  // --- r15-f9 逃生口：备份路径透传 + 「在文件夹中显示」（新增记录/截图）-----------
+  log("r15-f9 笔记逃生口：备份路径透传与提示入口");
+  await goHome();
+  // 错误态必须走 stub 注入：stub 的 readNotesFile 对坏 JSON 静默回空（与 10 / 52-err / 60-6 同口径），
+  // 直接写坏文件不会产生 .notes-error（R15 复核首跑实测挂在 waitFor，记录不成立）
+  await js(`window.__pixStub.setLoadFailure("corrupt", "笔记文件无法读取（文件已损坏，未被修改）"), true`);
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(4);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("笔记错误态", `document.querySelector(".notes-error")`);
+  await js(`(() => {
+    const btn = Array.from(document.querySelectorAll(".notes-error button")).find(
+      (el) => el.textContent.trim() === "备份原文件并新建空库",
+    );
+    if (!btn) throw new Error("逃生口按钮未找到");
+    btn.click();
+    return true;
+  })()`);
+  await waitFor("重建提示", `document.querySelector(".notes-notice")`);
+  const recoverNotice = {
+    text: await textOf(".notes-notice .notice-text"),
+    reveal: await has(".notes-notice .notice-reveal"),
+    revealTitle: await js(`(() => {
+      const el = document.querySelector(".notes-notice .notice-reveal");
+      return el ? el.getAttribute("title") : null;
+    })()`),
+    rows: await countOf(".note-row"),
+  };
+  await capturePage(win, "r15-f9-recover-backup.png");
+  record("r15-notes-recover", { phase: "backup-path", ...recoverNotice }, [
+    ...(recoverNotice.text &&
+    recoverNotice.text.startsWith("已备份原文件并新建空库：") &&
+    recoverNotice.text.includes(NOTES_FILE + ".bak")
+      ? []
+      : [`提示未透传 backupPath：${recoverNotice.text}`]),
+    ...(recoverNotice.reveal === true && recoverNotice.revealTitle === "在文件夹中显示备份文件"
+      ? []
+      : [`缺少「在文件夹中显示」入口：${JSON.stringify(recoverNotice)}`]),
+  ]);
+
+  await js(`window.__pixStub.setLoadFailure(null, ""), true`);
   await restoreStandardSeed();
+
+  // --- r15-f13 渲染兜底：无 start 的 eye_model_end 仍渲染失败块（仅覆盖渲染层）-----
+  // 性质说明：本记录只验证「不可用分支直接发 end（无 start）」在渲染层的可读性；
+  // F13 的发射条件本身由源码走查 + 真机走查覆盖，不由本记录代表。
+  log("r15-f13 vision-status：不可用分支的 eye_model_end（无 start）渲染为失败块");
+  const visionRowsBefore = await js(
+    `Array.from(document.querySelectorAll(".chat-messages .note-row")).map((el) => el.textContent.replace(/\\s+/g, " ").trim())`,
+  );
+  await emit({
+    type: "eye_model_end",
+    id: "r15-f13-eye",
+    provider: "stub",
+    modelId: "stub-vision",
+    imageCount: 2,
+    success: false,
+    errorMessage: "配置的视觉模型不可用",
+  });
+  await waitFor(
+    "视觉模型失败块",
+    `Array.from(document.querySelectorAll(".chat-messages .note-row")).some((el) => el.textContent.includes("视觉模型读取失败"))`,
+  );
+  await sleep(200);
+  const visionRowsAfter = await js(
+    `Array.from(document.querySelectorAll(".chat-messages .note-row")).map((el) => el.textContent.replace(/\\s+/g, " ").trim())`,
+  );
+  await capturePage(win, "r15-f13-vision-failure-block.png");
+  record("r15-vision-fallback", { phase: "unavailable-end-without-start", before: visionRowsBefore, after: visionRowsAfter }, [
+    ...(visionRowsAfter.length === visionRowsBefore.length + 1
+      ? []
+      : [`应恰好多出一个块：${visionRowsBefore.length} → ${visionRowsAfter.length}`]),
+    ...(visionRowsAfter.includes("视觉模型读取失败") ? [] : [`缺少失败块文案：${JSON.stringify(visionRowsAfter)}`]),
+  ]);
+
+  // --- r15-f16 工作区卸载后的迟到注册（R15 F16）---------------------------------
+  // 慢 IPC（notesLoad 4s）造出「onMounted 未完、页面已卸载」窗口：迟到段不得再往 window 上挂订阅（无解绑即泄漏）。
+  log("r15-f16 慢加载下返回首页：迟到挂载段不得再注册事件订阅");
+  await goHome();
+  await sleep(300);
+  const evtBefore = await js("window.__pixStub.agentEventListenerCount()");
+  await setLoadDelay(4000);
+  await js(`(() => {
+    const cards = Array.from(document.querySelectorAll(".project-list-item"));
+    const card = cards.find((el) => {
+      const title = el.querySelector(".v-list-item-title");
+      return !!title && title.textContent.trim() === ${JSON.stringify(LIBRARY_NAME)};
+    });
+    if (!card) throw new Error("project card not found: " + ${JSON.stringify(LIBRARY_NAME)});
+    card.click();
+    return true;
+  })()`);
+  await waitFor("工作区三栏（慢加载）", `document.querySelector(".workspace-page")`);
+  await sleep(150);
+  await goHome();
+  // 基线取在「已返回首页、迟到段尚未落地」的窗口内：此后新增的注册/在册句柄都属迟到段
+  const evtMid = await js("window.__pixStub.agentEventListenerCount()");
+  await sleep(5000);
+  const evtAfter = await js("window.__pixStub.agentEventListenerCount()");
+  const lateListBase = await js("window.__pixStub.listSessionsCalls()");
+  await emit({ type: "agent_start" });
+  await sleep(600);
+  const lateListDelta = (await js("window.__pixStub.listSessionsCalls()")) - lateListBase;
+  // 收尾：清掉 agent_start 留下的流式标记（useRpc 的 get_state 刷新会把它恢复为 false）
+  await emit({ type: "agent_end", messages: [] });
+  await sleep(300);
+  await setLoadDelay(0);
+  await capturePage(win, "r15-f16-late-register.png");
+  record(
+    "r15-workspace-late-register",
+    {
+      phase: "unmount-during-load",
+      before: evtBefore,
+      mid: evtMid,
+      after: evtAfter,
+      lateRegistered: evtAfter.registered - evtMid.registered,
+      lateUnregistered: evtAfter.unregistered - evtMid.unregistered,
+      lateHandlers: evtAfter.handlers - evtMid.handlers,
+      listSessionsDelta: lateListDelta,
+    },
+    [
+      ...(evtAfter.registered - evtMid.registered === evtAfter.unregistered - evtMid.unregistered
+        ? []
+        : [`迟到段注册数必须等于解绑数：${JSON.stringify(evtMid)} → ${JSON.stringify(evtAfter)}`]),
+      ...(evtAfter.handlers - evtMid.handlers === 0 ? [] : [`迟到段不得留下在册句柄：+${evtAfter.handlers - evtMid.handlers}`]),
+      ...(lateListDelta === 0 ? [] : [`agent_start 不得再触发工作区同步（listSessions 调用 +${lateListDelta}）`]),
+    ],
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -61,6 +61,8 @@ const pageInputEl = ref<HTMLInputElement | null>(null);
 const captureLayerEl = ref<HTMLDivElement | null>(null);
 /** Drag rectangle relative to the capture layer, in CSS pixels. */
 const captureRect = ref<{ left: number; top: number; width: number; height: number } | null>(null);
+/** 上一次框选失败（页面未渲染等）：保留框选模式并提示，进入框选/成功后清空。 */
+const captureFailed = ref(false);
 
 const failureMessage = computed(() => (failure.value ? libraryReadFailureMessage(failure.value) : ""));
 const failureIcon = computed(() =>
@@ -290,6 +292,11 @@ function observePages(): void {
 function updateCurrentPage(): void {
   const root = scrollEl.value;
   if (!root) return;
+  // 触底钳制：只在内容确实可滚动时生效——否则一屏装得下的文档会被钉在末页
+  if (root.scrollHeight - root.clientHeight > 1 && root.scrollTop + root.clientHeight >= root.scrollHeight - 1) {
+    readerStore.setPage(readerStore.pageCount);
+    return;
+  }
   const rootRect = root.getBoundingClientRect();
   const marker = rootRect.top + Math.min(120, root.clientHeight * 0.2);
   if (pageNodes.length !== pageSizes.value.length) {
@@ -538,7 +545,11 @@ function onCapturePointerUp(event: PointerEvent): void {
   const rect = captureRect.value;
   resetCaptureDrag();
   if (rect && rect.width >= MIN_CAPTURE_PX && rect.height >= MIN_CAPTURE_PX) {
-    captureRegion(rect);
+    if (!captureRegion(rect)) {
+      // 失败（页面未渲染 / 来源画布不可用）：保留框选模式并提示，让用户重试
+      captureFailed.value = true;
+      return;
+    }
   }
   exitCaptureMode();
 }
@@ -553,10 +564,10 @@ function onCapturePointerCancel(event: PointerEvent): void {
  * capture-layer coordinates; page lookup and clipping run in viewport
  * coordinates so scroll offset needs no special handling.
  */
-function captureRegion(rect: CaptureRect): void {
+function captureRegion(rect: CaptureRect): boolean {
   const root = scrollEl.value;
   const layer = captureLayerEl.value;
-  if (!root || !layer) return;
+  if (!root || !layer) return false;
   const layerRect = layer.getBoundingClientRect();
   const dragLeft = layerRect.left + rect.left;
   const dragTop = layerRect.top + rect.top;
@@ -585,11 +596,11 @@ function captureRegion(rect: CaptureRect): void {
       target = el;
     }
   }
-  if (!target) return;
+  if (!target) return false;
   const source = target.querySelector("canvas");
-  if (!source || source.width <= 0 || source.height <= 0) return;
+  if (!source || source.width <= 0 || source.height <= 0) return false;
   const canvasRect = source.getBoundingClientRect();
-  if (canvasRect.width <= 0 || canvasRect.height <= 0) return;
+  if (canvasRect.width <= 0 || canvasRect.height <= 0) return false;
 
   // Intersect the drag rect with the canvas, then map CSS px -> device px
   // (the canvas backing store is scaled by window.devicePixelRatio).
@@ -599,7 +610,7 @@ function captureRegion(rect: CaptureRect): void {
   const iy1 = Math.min(dragBottom, canvasRect.bottom);
   const cssWidth = ix1 - ix0;
   const cssHeight = iy1 - iy0;
-  if (cssWidth <= 0 || cssHeight <= 0) return;
+  if (cssWidth <= 0 || cssHeight <= 0) return false;
   const scaleX = source.width / canvasRect.width;
   const scaleY = source.height / canvasRect.height;
   const sx = Math.max(0, Math.min(source.width - 1, Math.round((ix0 - canvasRect.left) * scaleX)));
@@ -614,12 +625,13 @@ function captureRegion(rect: CaptureRect): void {
   out.width = Math.max(1, Math.round(sw * captureScale));
   out.height = Math.max(1, Math.round(sh * captureScale));
   const ctx = out.getContext("2d");
-  if (!ctx) return;
+  if (!ctx) return false;
   ctx.drawImage(source, sx, sy, sw, sh, 0, 0, out.width, out.height);
   const base64 = canvasToPngBase64(out);
-  if (!base64) return;
+  if (!base64) return false;
   const capture: PageCapture = { mimeType: "image/png", base64 };
   emitRegionCapture(capture);
+  return true;
 }
 
 async function loadPdf(filePath: string): Promise<void> {
@@ -840,6 +852,7 @@ watch(
     if (!active) return;
     document.getSelection()?.removeAllRanges();
     readerStore.setSelectedText("");
+    captureFailed.value = false;
   },
 );
 
@@ -932,6 +945,7 @@ defineExpose({ gotoPage });
     >
       <div v-if="captureRect" class="capture-rect" :style="captureRectStyle" />
       <div class="capture-hint">拖拽框选要提问的区域，Esc 取消</div>
+      <div v-if="captureFailed" class="capture-error-hint">截图失败：页面内容尚未就绪，请稍后重试</div>
     </div>
 
     <div v-if="readerStore.pageCount > 0" class="pdf-capture-fab">
@@ -1121,6 +1135,20 @@ defineExpose({ gotoPage });
   padding: 2px 10px;
   border-radius: 999px;
   background: rgba(31, 41, 51, 0.78);
+  color: #fff;
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.capture-error-hint {
+  position: absolute;
+  top: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: rgba(140, 40, 40, 0.86);
   color: #fff;
   font-size: 12px;
   white-space: nowrap;

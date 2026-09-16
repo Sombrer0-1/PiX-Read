@@ -216,6 +216,15 @@ const currentAnswer = computed(() => {
   return q ? answerMap.value[q.id] ?? "" : "";
 });
 
+// 澄清请求被替换（新 id）或撤销（id 变 null）时复位作答进度；浅层 getter，answerMap 变更不触发。
+watch(
+  () => props.pendingUserInput?.id ?? null,
+  () => {
+    currentQuestionIndex.value = 0;
+    answerMap.value = {};
+  },
+);
+
 const blocks = computed(() => sessionStore.displayBlocks);
 const nowTick = ref(Date.now());
 let elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -365,6 +374,10 @@ async function send(): Promise<void> {
     ? { docFilePath: readContext.filePath, page: readContext.page }
     : null;
   const filePaths = attachments.value.map((a) => a.path);
+  // 发送失败还原用的快照（发送瞬间的草稿/附件/粘贴图；必须在清空前取）
+  const sentDraft = draft.value;
+  const sentAttachments = [...attachments.value];
+  const sentImages = [...clipboardImages.value];
   optimisticBlockId.value = sessionStore.appendOptimisticUserMessage(text, filePaths, anchor);
   draft.value = "";
   attachments.value = [];
@@ -386,6 +399,12 @@ async function send(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     sessionStore.failOptimisticUserMessage(optimisticBlockId.value, errorMessage);
+    // 还原的是发送瞬间的快照；不覆盖在途新输入。
+    // 文件若已被外部删除会显示为失效 chip（既有 chip 语义）
+    if (draft.value === "") draft.value = sentDraft;
+    if (attachments.value.length === 0 && sentAttachments.length > 0) attachments.value = sentAttachments;
+    if (clipboardImages.value.length === 0 && sentImages.length > 0) clipboardImages.value = sentImages;
+    nextTick(() => composerInput.value?.focus());
     if (AUTH_ERROR_PATTERN.test(errorMessage)) {
       sessionStore.appendGuide("auth", AUTH_GUIDE_MESSAGE);
     }
@@ -661,10 +680,12 @@ function onMessagesClick(event: MouseEvent): void {
 const renameDialogOpen = ref(false);
 const renameDraft = ref("");
 const renameSaving = ref(false);
+const renameError = ref("");
 const canRename = computed(() => !!rpc.sessionState.value?.sessionFile);
 
 function openRenameDialog(): void {
   renameDraft.value = paneTitle.value;
+  renameError.value = "";
   renameDialogOpen.value = true;
 }
 
@@ -672,12 +693,21 @@ async function saveRename(): Promise<void> {
   const name = renameDraft.value.trim();
   if (!name || renameSaving.value) return;
   renameSaving.value = true;
+  renameError.value = "";
   try {
     await rpc.setSessionName(name);
     renameDialogOpen.value = false;
+  } catch (err) {
+    renameError.value = `重命名失败：${err instanceof Error ? err.message : String(err)}`;
   } finally {
     renameSaving.value = false;
   }
+}
+
+/** IME 组合态回车不提交重命名（与发送框同口径）。 */
+function onRenameEnter(e: KeyboardEvent): void {
+  if (e.isComposing) return;
+  void saveRename();
 }
 
 function updateAnswer(value: string): void {
@@ -1133,8 +1163,11 @@ onUnmounted(() => {
             label="对话名称"
             autofocus
             :disabled="renameSaving"
-            @keydown.enter="saveRename"
+            @keydown.enter="onRenameEnter"
           />
+          <v-alert v-if="renameError" type="error" density="compact" class="rename-error">
+            {{ renameError }}
+          </v-alert>
         </v-card-text>
         <v-card-actions>
           <v-spacer />

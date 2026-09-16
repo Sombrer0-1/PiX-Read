@@ -321,7 +321,7 @@ async function setThinkingLevel(level: ThinkingLevel): Promise<void> {
 }
 
 async function setSessionName(name: string): Promise<void> {
-	await sendCommand({ type: "set_session_name", name });
+	await sendCommandOrThrow({ type: "set_session_name", name });
 	await refreshState();
 }
 
@@ -338,7 +338,8 @@ async function supportsThinking(): Promise<boolean | null> {
 }
 
 async function setScopedModels(patterns: string[]): Promise<void> {
-	await sendCommand({ type: "set_scoped_models", patterns });
+	// 当前零调用点（缩放模型范围仍走设置面板路径）
+	await sendCommandOrThrow({ type: "set_scoped_models", patterns });
 }
 
 async function getScopedModels(): Promise<ModelInfo[] | null> {
@@ -354,12 +355,12 @@ async function getAuthStatus(): Promise<AuthStatusMap | null> {
 }
 
 async function setApiKey(provider: string, key: string): Promise<void> {
-	await sendCommand({ type: "set_api_key", provider, key });
+	await sendCommandOrThrow({ type: "set_api_key", provider, key });
 	await Promise.all([refreshModels(), refreshState()]);
 }
 
 async function removeAuth(provider: string): Promise<void> {
-	await sendCommand({ type: "remove_auth", provider });
+	await sendCommandOrThrow({ type: "remove_auth", provider });
 	await Promise.all([refreshModels(), refreshState()]);
 }
 
@@ -425,7 +426,8 @@ async function exportJsonl(outputPath?: string): Promise<string | null> {
 // =========================================================================
 
 async function setSteeringMode(mode: "all" | "one-at-a-time"): Promise<void> {
-	await sendCommand({ type: "set_steering_mode", mode });
+	// 当前零调用点
+	await sendCommandOrThrow({ type: "set_steering_mode", mode });
 }
 
 // =========================================================================
@@ -439,7 +441,8 @@ async function compact(customInstructions?: string): Promise<void> {
 }
 
 async function setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
-	await sendCommand({ type: "set_follow_up_mode", mode });
+	// 当前零调用点
+	await sendCommandOrThrow({ type: "set_follow_up_mode", mode });
 }
 
 // =========================================================================
@@ -447,7 +450,8 @@ async function setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
 // =========================================================================
 
 async function reloadResources(): Promise<void> {
-	await sendCommand({ type: "reload_resources" });
+	// 当前零调用点
+	await sendCommandOrThrow({ type: "reload_resources" });
 	await Promise.all([refreshCommands(), refreshModels(), refreshState()]);
 }
 

@@ -42,6 +42,8 @@ const leftTab = ref<"library" | "notes">("library");
 
 let unsubscribeEvent: (() => void) | null = null;
 let unsubscribeUserInput: (() => void) | null = null;
+/** 卸载标志：onMounted 的 await 继续体在页面已卸载后不得再往 window 上挂订阅（迟到注册泄漏）。 */
+let disposed = false;
 
 const rootDir = computed(() => projectStore.currentProject?.path ?? "");
 const currentSessionPath = computed(() => projectStore.currentSession?.path);
@@ -79,12 +81,14 @@ onMounted(async () => {
 
   if (!rpc.isConnected.value) {
     const started = await rpc.startSession(projectStore.currentProject.path);
+    if (disposed) return;
     if (!started) {
       const error = encodeURIComponent(rpc.lastError.value || "工作区启动失败");
       router.push({ path: "/", query: { error } });
       return;
     }
     const newSessionResult = await rpc.newSession();
+    if (disposed) return;
     if (!newSessionResult || newSessionResult.cancelled === true) {
       const error = encodeURIComponent(rpc.lastError.value || "新建对话失败");
       router.push({ path: "/", query: { error } });
@@ -93,12 +97,15 @@ onMounted(async () => {
   }
 
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
+  if (disposed) return;
 
   // 跨工作区残留防护：先清空本地状态，再读当前工作区的笔记与阅读现场
   notesStore.resetNotes();
   await notesStore.loadNotes();
+  if (disposed) return;
   readerStateStore.resetState();
   await readerStateStore.loadReaderState();
+  if (disposed) return;
   // 安全点 d：监听生命周期与工作区页面严格对齐；窗口可能只是被隐藏，所以只 flush 不 reset
   document.addEventListener("visibilitychange", onDocumentVisibilityChange);
   window.addEventListener("pagehide", onWindowPageHide);
@@ -125,6 +132,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  disposed = true;
   // 安全点 c：顺序固定 flush → resetState（resetState 会清掉快照，反了会丢最后一次现场）
   readerStateStore.flush();
   document.removeEventListener("visibilitychange", onDocumentVisibilityChange);

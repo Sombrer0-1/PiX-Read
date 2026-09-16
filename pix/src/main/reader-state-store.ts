@@ -6,10 +6,11 @@
  * 因此两次 IPC 交错不会丢写；不需要写队列。
  * 写入协议：mkdir → 写 <target>.tmp → renameSync 覆盖；失败清理 tmp、原文件不动。
  * 读侧只回报原因（missing/corrupt/version-unsupported/read-failed），任何分支都不改写文件。
- * 不 import notes-store：它的原子写与备份策略不适用于本文件（无备份、无逃生口）。
+ * 不 import notes-store：它的原子写与逃生口不适用于本文件；本文件只在 save 侧对 corrupt
+ * 留一份同规则的 .corrupt-* 备份，不提供用户可见的重建入口。
  */
 
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getLibraryRoot, isLibraryFilePath } from "./library-root.js";
 import type {
@@ -49,7 +50,10 @@ type StateRead = { ok: true; file: ReaderStateFile } | { ok: false; reason: Read
 
 type StateWrite = { ok: true } | { ok: false };
 
-/** 状态类失败对用户完全不可见：一条失败恰好一行日志（degraded ⇔ 恰一行 warn）。 */
+/**
+ * 状态类失败对用户完全不可见：一条失败恰好一行日志（load 侧：degraded ⇔ 恰一行 warn；missing 不计降级）；
+ * save 侧另有一条 corrupt 备份路径日志，不带 degraded 语义。
+ */
 function warn(message: string): void {
   console.warn(`[reader-state] ${message}`);
 }
@@ -201,7 +205,27 @@ function serializeState(file: ReaderStateFile): string {
   return `${JSON.stringify(file, null, 2)}\n`;
 }
 
-/** 读入口：降级只回报原因（success 仍为 true），无根时 success:false 且静默（不记 warn、不写盘）。 */
+/** 备份文件后缀用紧凑格式：yyyyMMdd-HHmmss（与 notes-store 同规则）。 */
+function formatStampDashed(ms: number): string {
+  const date = new Date(ms);
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/** 备份名必须唯一：同名目标会被静默覆盖，同一秒内的二次重建不得覆盖上一份备份。 */
+function uniqueBackupPath(filePath: string, now: number): string {
+  const base = `${filePath}.corrupt-${formatStampDashed(now)}`;
+  if (!existsSync(base)) return base;
+  for (let index = 2; ; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+/**
+ * 读入口：降级只回报原因（success 仍为 true），无根时 success:false 且静默（不记 warn、不写盘）。
+ * missing 不是降级：首次启动本来就没有现场文件，记 warn 会让「一行失败一行日志」变成噪声。
+ */
 export function loadReaderState(): ReaderStateLoadResult {
   const root = getLibraryRoot();
   const filePath = stateFilePath();
@@ -210,6 +234,7 @@ export function loadReaderState(): ReaderStateLoadResult {
   }
   const read = readStateFile(filePath, root);
   if (!read.ok) {
+    if (read.reason === "missing") return { success: true, state: emptyState(), filePath, degraded: false };
     warn(`load degraded (${read.reason}): ${DEGRADE_MESSAGES[read.reason]}`);
     return { success: true, state: emptyState(), filePath, degraded: true, reason: read.reason, error: DEGRADE_MESSAGES[read.reason] };
   }
@@ -218,7 +243,8 @@ export function loadReaderState(): ReaderStateLoadResult {
 
 /**
  * 写入口：只改目标条目（page/scale/updatedAt）+ lastDocPath，其它条目字段一字不动。
- * 读到 missing/corrupt/version-unsupported 允许以空模型整体覆盖重建；
+ * 读到 missing 允许以空模型整体覆盖重建；读到 corrupt 先 copy-first 备份再重建；
+ * 读到 version-unsupported 直接拒写且原文件字节不变（与 notes-store 同口径：不认识的版本不覆盖）；
  * 读到 read-failed 直接拒写且原文件字节不变——读不到就不知道其它文档的现场，
  * 覆盖 = 一次瞬时占用清空全部文档的阅读位置（与 notes-store.addNote 同口径）。
  */
@@ -236,6 +262,21 @@ export function saveReaderState(draft: ReaderStateSaveDraft): ReaderStateSaveRes
 
   const read = readStateFile(filePath, root);
   if (!read.ok && read.reason === "read-failed") return failure("read-failed");
+  if (!read.ok && read.reason === "version-unsupported") {
+    // 不带 code 的失败返回：ReaderStateErrorCode 码表本轮不扩
+    warn("save rejected: 阅读状态文件版本不支持（未写入）");
+    return { success: false, state: emptyState(), error: "阅读状态文件版本不支持（未写入）" };
+  }
+  if (!read.ok && read.reason === "corrupt") {
+    // copy-first：原文件不动，备份与原文同时在；备份失败就不覆盖（读不到现场时重建风险更大）
+    const backupPath = uniqueBackupPath(filePath, Date.now());
+    try {
+      copyFileSync(filePath, backupPath);
+    } catch {
+      return failure("write-failed");
+    }
+    warn(`corrupt state backed up: ${backupPath}`);
+  }
   const current = read.ok ? read.file : emptyState();
 
   const key = docPathKey(docPath);

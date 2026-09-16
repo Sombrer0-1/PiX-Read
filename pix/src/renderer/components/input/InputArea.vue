@@ -26,6 +26,8 @@ function onInput(e: Event): void {
 }
 
 function onKeydown(e: KeyboardEvent): void {
+  // IME 组合态回车不触发发送（与 PdfSearchPanel 同写法；不再叠加已废弃的 keyCode === 229）
+  if (e.isComposing) return;
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     emit("send");

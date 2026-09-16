@@ -12,7 +12,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -63,6 +63,7 @@ let passed = 0;
 let failed = 0;
 let notesStore = null;
 let libraryRoot = null;
+let readerStateStore = null;
 
 function group(name) {
   console.log(`== 组 ${name} ==`);
@@ -505,6 +506,59 @@ function runUndoSlotLifecycle() {
     relayMatchesFile(finalLoad),
     JSON.stringify({ result: idsOf(finalLoad.notes), file: idsOf(readFileNotes()) }),
   );
+
+  // F9（新增，追加在 #1–#6 之后；既有断言逐字未动）：copy-first 逃生口
+  writeFileSync(NOTES_A, "not json", "utf8");
+  const corruptBytes7 = readFileSync(NOTES_A);
+  const resetCopy = notesStore.resetCorruptNotes();
+  const backupPath7 = resetCopy.backupPath;
+  const backupExists7 = typeof backupPath7 === "string" && backupPath7.length > 0 && existsSync(backupPath7);
+  check(
+    G,
+    7,
+    "F9 成功路径：backupPath 非空 + 备份存在且字节 === 损坏前字节 + 备份名合规 + 原路径重建为空库",
+    resetCopy.success === true &&
+      backupExists7 &&
+      readFileSync(backupPath7).equals(corruptBytes7) &&
+      /^notes\.json\.corrupt-\d{8}-\d{6}(-\d+)?$/.test(basename(backupPath7)) &&
+      readFileSync(NOTES_A, "utf8") === serialize([]),
+    JSON.stringify({
+      success: resetCopy.success,
+      backupPath: backupPath7,
+      backupExists: backupExists7,
+      rebuilt: readFileSync(NOTES_A, "utf8"),
+    }),
+  );
+
+  // 写失败注入（notes.json.tmp 预置为目录）：copy 语义下原文件必须仍在、备份必须存在
+  writeFileSync(NOTES_A, "not json again", "utf8");
+  const corruptBytes8 = readFileSync(NOTES_A);
+  mkdirSync(TMP_INJECT, { recursive: true });
+  const resetWriteFail = notesStore.resetCorruptNotes();
+  const keptBytes8 = readFileSync(NOTES_A);
+  const injectExists8 = existsSync(TMP_INJECT);
+  rmSync(TMP_INJECT, { recursive: true, force: true });
+  const failBackupPath = resetWriteFail.backupPath;
+  const failBackupExists = typeof failBackupPath === "string" && existsSync(failBackupPath);
+  check(
+    G,
+    8,
+    "F9 写失败路径：success:false + 原文件仍在且字节不变（copy 语义）+ backupPath 非空且存在",
+    resetWriteFail.success === false &&
+      resetWriteFail.code === "write-failed" &&
+      injectExists8 === true &&
+      keptBytes8.equals(corruptBytes8) &&
+      failBackupExists &&
+      readFileSync(failBackupPath).equals(corruptBytes8),
+    JSON.stringify({
+      resetWriteFail,
+      injectExists: injectExists8,
+      keptBytesSame: keptBytes8.equals(corruptBytes8),
+      backupExists: failBackupExists,
+    }),
+  );
+  // 收尾：把文件恢复为空库，后续组的夹具写入不受本次注入影响
+  writeNotesFile([]);
 }
 
 function runExportAndEmpty() {
@@ -1054,6 +1108,218 @@ function runNotesStat() {
   );
 }
 
+function runLibraryRootContainment() {
+  const G = "library-root-containment";
+  group(G);
+  const realDir = join(TMP, "root-real");
+  const linkDir = join(TMP, "root-link");
+  const otherDir = join(TMP, "root-other");
+  rmSync(linkDir, { recursive: true, force: true });
+  mkdirSync(join(realDir, "sub"), { recursive: true });
+  mkdirSync(otherDir, { recursive: true });
+  writeFileSync(join(realDir, "doc.pdf"), "%PDF smoke\n", "utf8");
+  // 目录联接（Windows 免管理员；与 %TEMP% 探针的 mklink /J 同物）
+  symlinkSync(realDir, linkDir, "junction");
+
+  // F4-a/b：库根 = 目录联接时，联接路径与真实路径两种访问都必须判为库内
+  libraryRoot.setLibraryRoot(linkDir);
+  check(
+    G,
+    1,
+    "F4-a/b 联接根：经联接路径访问已存在文件 = true，经真实路径访问 = true",
+    libraryRoot.isLibraryFilePath(join(linkDir, "doc.pdf")) === true &&
+      libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")) === true,
+    JSON.stringify({
+      viaLink: libraryRoot.isLibraryFilePath(join(linkDir, "doc.pdf")),
+      viaReal: libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")),
+    }),
+  );
+  check(
+    G,
+    2,
+    "F4-c 联接根：兄弟目录与 ../ 逃逸 = false",
+    libraryRoot.isLibraryFilePath(join(otherDir, "x.pdf")) === false &&
+      libraryRoot.isLibraryFilePath(join(linkDir, "..", "root-other", "x.pdf")) === false &&
+      libraryRoot.isLibraryFilePath(join(linkDir, "..", "..", "escape.pdf")) === false,
+    JSON.stringify({
+      sibling: libraryRoot.isLibraryFilePath(join(otherDir, "x.pdf")),
+      dotdot: libraryRoot.isLibraryFilePath(join(linkDir, "..", "root-other", "x.pdf")),
+      escape: libraryRoot.isLibraryFilePath(join(linkDir, "..", "..", "escape.pdf")),
+    }),
+  );
+  check(
+    G,
+    3,
+    "F4-d 联接根：不存在的库内路径（字面/联接根下）= true",
+    libraryRoot.isLibraryFilePath(join(linkDir, "missing.pdf")) === true &&
+      libraryRoot.isLibraryFilePath(join(linkDir, "sub", "missing.pdf")) === true,
+    JSON.stringify({
+      top: libraryRoot.isLibraryFilePath(join(linkDir, "missing.pdf")),
+      sub: libraryRoot.isLibraryFilePath(join(linkDir, "sub", "missing.pdf")),
+    }),
+  );
+
+  // F19：isLibraryDirAllowed（library-list 专用，额外放行库根自身）与 isLibraryFilePath 的严格语义
+  check(
+    G,
+    4,
+    "F19-1 isLibraryDirAllowed：库根/根内子目录/真实路径 = true，兄弟与 ../ 逃逸 = false",
+    libraryRoot.isLibraryDirAllowed(linkDir) === true &&
+      libraryRoot.isLibraryDirAllowed(join(linkDir, "sub")) === true &&
+      libraryRoot.isLibraryDirAllowed(realDir) === true &&
+      libraryRoot.isLibraryDirAllowed(otherDir) === false &&
+      libraryRoot.isLibraryDirAllowed(join(linkDir, "..", "root-other")) === false,
+    JSON.stringify({
+      root: libraryRoot.isLibraryDirAllowed(linkDir),
+      sub: libraryRoot.isLibraryDirAllowed(join(linkDir, "sub")),
+      real: libraryRoot.isLibraryDirAllowed(realDir),
+      sibling: libraryRoot.isLibraryDirAllowed(otherDir),
+      dotdot: libraryRoot.isLibraryDirAllowed(join(linkDir, "..", "root-other")),
+    }),
+  );
+  check(
+    G,
+    5,
+    "F19-2 isLibraryFilePath 保留严格语义：库根自身 = false（普通根与联接根均如此）",
+    libraryRoot.isLibraryFilePath(linkDir) === false &&
+      libraryRoot.isLibraryFilePath(join(linkDir, "doc.pdf")) === true,
+    JSON.stringify({
+      selfViaLink: libraryRoot.isLibraryFilePath(linkDir),
+      docViaLink: libraryRoot.isLibraryFilePath(join(linkDir, "doc.pdf")),
+    }),
+  );
+  libraryRoot.setLibraryRoot(realDir);
+  check(
+    G,
+    6,
+    "F4-e 普通目录根行为不变：内含 true / 根自身与兄弟 false / 不存在的库内路径 true",
+    libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")) === true &&
+      libraryRoot.isLibraryFilePath(join(realDir, "sub", "inner.pdf")) === true &&
+      libraryRoot.isLibraryFilePath(realDir) === false &&
+      libraryRoot.isLibraryFilePath(otherDir) === false &&
+      libraryRoot.isLibraryFilePath(join(realDir, "..", "escape.pdf")) === false &&
+      libraryRoot.isLibraryDirAllowed(realDir) === true,
+    JSON.stringify({
+      doc: libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")),
+      inner: libraryRoot.isLibraryFilePath(join(realDir, "sub", "inner.pdf")),
+      self: libraryRoot.isLibraryFilePath(realDir),
+      other: libraryRoot.isLibraryFilePath(otherDir),
+      escape: libraryRoot.isLibraryFilePath(join(realDir, "..", "escape.pdf")),
+      dirAllowed: libraryRoot.isLibraryDirAllowed(realDir),
+    }),
+  );
+  libraryRoot.clearLibraryRoot();
+  check(
+    G,
+    7,
+    "F19-3 无根：isLibraryDirAllowed / isLibraryFilePath 均恒 false",
+    libraryRoot.isLibraryDirAllowed(realDir) === false && libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")) === false,
+    JSON.stringify({
+      dirAllowed: libraryRoot.isLibraryDirAllowed(realDir),
+      fileAllowed: libraryRoot.isLibraryFilePath(join(realDir, "doc.pdf")),
+    }),
+  );
+  // 恢复为 A 库根：后续组自行设根，这里只保证不把「无根」留给别人
+  libraryRoot.setLibraryRoot(WS_A);
+}
+
+function runReaderStateStore() {
+  const G = "reader-state-store";
+  group(G);
+  libraryRoot.setLibraryRoot(WS_A);
+  const STATE_A = join(PIX_READ_A, "reader-state.json");
+  const warns = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => {
+    const line = args.map((value) => String(value)).join(" ");
+    if (line.includes("[reader-state]")) warns.push(line);
+  };
+  try {
+    // F12-a：missing 不再是降级，不得产生任何 [reader-state] warn
+    rmSync(STATE_A, { recursive: true, force: true });
+    warns.length = 0;
+    const missing = readerStateStore.loadReaderState();
+    check(
+      G,
+      1,
+      "F12-a missing ⇒ success:true + degraded:false + 无 reason/error + warn 计数 0",
+      missing.success === true &&
+        missing.degraded === false &&
+        missing.reason === undefined &&
+        Object.keys(missing.state.documents).length === 0 &&
+        warns.length === 0,
+      JSON.stringify({ result: missing, warns }),
+    );
+
+    // F12-b/e：corrupt ⇒ load 降级恰 1 条 warn；save 先 copy-first 备份再重建（成功）
+    writeFileSync(STATE_A, '{\n  "version": 1,\n  "lastDocPath": "sample-paper.pdf",\n  "documents": {', "utf8");
+    const corruptBytes = readFileSync(STATE_A);
+    warns.length = 0;
+    const corrupt = readerStateStore.loadReaderState();
+    const corruptWarns = warns.length;
+    const savedCorrupt = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 2, scale: 1.5 });
+    const backups = readdirSync(PIX_READ_A).filter((name) => name.startsWith("reader-state.json.corrupt-"));
+    check(
+      G,
+      2,
+      "F12-b corrupt ⇒ degraded:true + warn 1 + 备份字节 === 损坏前字节 + save 成功且条目已重建",
+      corrupt.success === true &&
+        corrupt.degraded === true &&
+        corrupt.reason === "corrupt" &&
+        corruptWarns === 1 &&
+        backups.length === 1 &&
+        readFileSync(join(PIX_READ_A, backups[0])).equals(corruptBytes) &&
+        savedCorrupt.success === true &&
+        savedCorrupt.state.documents["sample-paper.pdf"].page === 2,
+      JSON.stringify({ corrupt, corruptWarns, backups, saved: savedCorrupt.success }),
+    );
+    check(
+      G,
+      3,
+      "F12-e 备份名匹配 /^reader-state\.json\.corrupt-\d{8}-\d{6}(-\d+)?$/",
+      backups.length === 1 && /^reader-state\.json\.corrupt-\d{8}-\d{6}(-\d+)?$/.test(backups[0]),
+      JSON.stringify(backups),
+    );
+
+    // F12-c：version:2 ⇒ load 降级；save 拒写且原文件字节不变
+    writeFileSync(STATE_A, `${JSON.stringify({ version: 2, lastDocPath: null, documents: {} }, null, 2)}\n`, "utf8");
+    const v2Bytes = readFileSync(STATE_A);
+    warns.length = 0;
+    const v2Load = readerStateStore.loadReaderState();
+    const v2Save = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 3, scale: 1.1 });
+    check(
+      G,
+      4,
+      "F12-c version:2 ⇒ load degraded + save 拒写（success:false、error 逐字「阅读状态文件版本不支持（未写入）」）且文件 sha256 不变",
+      v2Load.success === true &&
+        v2Load.degraded === true &&
+        v2Load.reason === "version-unsupported" &&
+        v2Save.success === false &&
+        v2Save.code === undefined &&
+        v2Save.error === "阅读状态文件版本不支持（未写入）" &&
+        sha256(readFileSync(STATE_A)) === sha256(v2Bytes),
+      JSON.stringify({ v2Load, v2Save, same: sha256(readFileSync(STATE_A)) === sha256(v2Bytes) }),
+    );
+
+    // F12-d：read-failed 注入（文件位置预置为目录）⇒ load 降级 + save 拒写（回归）
+    rmSync(STATE_A, { force: true });
+    mkdirSync(STATE_A, { recursive: true });
+    warns.length = 0;
+    const rfLoad = readerStateStore.loadReaderState();
+    const rfSave = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 1, scale: 1 });
+    check(
+      G,
+      5,
+      "F12-d read-failed ⇒ load degraded:true + save 拒写（code=read-failed，回归）",
+      rfLoad.success === true && rfLoad.degraded === true && rfLoad.reason === "read-failed" && rfSave.success === false && rfSave.code === "read-failed",
+      JSON.stringify({ rfLoad, rfSave }),
+    );
+    rmSync(STATE_A, { recursive: true, force: true });
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
   mkdirSync(WS_A, { recursive: true });
@@ -1073,6 +1339,7 @@ function compileAndLoad() {
     files: [
       join(REPO_DIR, "pix", "src", "main", "notes-store.ts"),
       join(REPO_DIR, "pix", "src", "main", "library-root.ts"),
+      join(REPO_DIR, "pix", "src", "main", "reader-state-store.ts"),
     ],
   };
   writeFileSync(TSCONFIG, JSON.stringify(config, null, 2), "utf8");
@@ -1086,7 +1353,7 @@ function compileAndLoad() {
   }
 
   const require = createRequire(import.meta.url);
-  const required = ["main/notes-store.js", "main/library-root.js"];
+  const required = ["main/notes-store.js", "main/library-root.js", "main/reader-state-store.js"];
   const allowed = new Set([...required, "shared/types.js"]);
   const emitted = readdirSync(OUT_DIR, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile())
@@ -1108,6 +1375,7 @@ function compileAndLoad() {
 
   notesStore = require(join(OUT_DIR, "main", "notes-store.js"));
   libraryRoot = require(join(OUT_DIR, "main", "library-root.js"));
+  readerStateStore = require(join(OUT_DIR, "main", "reader-state-store.js"));
   libraryRoot.clearLibraryRoot();
   return true;
 }
@@ -1125,6 +1393,8 @@ function main() {
       runReportFiles();
       runReportFailures();
       runNotesStat();
+      runLibraryRootContainment();
+      runReaderStateStore();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;
