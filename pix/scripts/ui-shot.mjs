@@ -103,6 +103,13 @@ const SEL = {
   reportRow: ".notes-report-row",
   reportText: ".notes-report-row .report-text",
   reportReveal: ".notes-report-row .report-reveal",
+  // R14 新增 6 项（设计档 §5.4.1）
+  rowNotes: ".row-notes",
+  staleRow: ".notes-stale",
+  staleText: ".notes-stale .stale-text",
+  staleRefresh: ".notes-stale .stale-refresh",
+  groupName: ".notes-group-head .group-name",
+  centerDocLabel: ".center-pill .pill-label",
 };
 
 // ---------------------------------------------------------------------------
@@ -423,6 +430,7 @@ function buildStub() {
 const { contextBridge } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const CONFIG = ${configJson};
 const NOTES_FILE = CONFIG.notesFilePath;
@@ -458,6 +466,9 @@ const RESTORE_EXISTS_MESSAGE = "该笔记已重新存在，无法撤销";
 const RESTORE_DUPLICATE_MESSAGE = "该笔记内容已重新存在，无法撤销";
 // notesLoad 计数器：52h 的「goHome 不得触发加载」判据（只计数，不影响返回）
 let notesLoadCalls = 0;
+// R14 笔记文件指纹：调用计数 + 失败注入（null / 错误码 / "throw"），只影响 notesStat 的返回
+let notesStatCalls = 0;
+let notesStatFailure = null;
 // 发送类命令（prompt/steer）的记录：notes-context / notes-chip 断言的事实源（N50 验收 1）
 const sendCalls = [];
 // 「在文件夹中显示」的参数记录（r13-5 相位 reveal-and-clear 的唯一判据；行为与返回值不变）
@@ -481,7 +492,7 @@ function sleep(ms) {
 function readNotesFile() {
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(NOTES_FILE, "utf8"));
+    parsed = JSON.parse(fs.readFileSync(currentNotesFile(), "utf8"));
   } catch (err) {
     return [];
   }
@@ -490,8 +501,8 @@ function readNotesFile() {
 }
 
 function writeNotesFile(list) {
-  fs.mkdirSync(path.dirname(NOTES_FILE), { recursive: true });
-  fs.writeFileSync(NOTES_FILE, JSON.stringify({ version: 1, notes: list }, null, 2) + "\\n", "utf8");
+  fs.mkdirSync(path.dirname(currentNotesFile()), { recursive: true });
+  fs.writeFileSync(currentNotesFile(), JSON.stringify({ version: 1, notes: list }, null, 2) + "\\n", "utf8");
 }
 
 function normalizeNoteText(value) {
@@ -677,6 +688,11 @@ function normalizePath(value) {
 
 function stateFilePath() {
   return path.join(activeRoot, STATE_DIR, STATE_FILE_NAME);
+}
+
+/** R14：笔记文件根随 activeRoot（与 stateFilePath 同纪律）——A 侧 activeRoot 初值 = CONFIG.root ⇒ 行为与恒 A 根等价。 */
+function currentNotesFile() {
+  return path.join(activeRoot, ".pix-read", "notes.json");
 }
 
 function emptyState() {
@@ -866,9 +882,9 @@ const api = {
     notesLoadCalls += 1;
     if (loadDelayMs) await sleep(loadDelayMs);
     if (loadFailure) {
-      return { success: false, notes: [], filePath: NOTES_FILE, code: loadFailure.code, error: loadFailure.error };
+      return { success: false, notes: [], filePath: currentNotesFile(), code: loadFailure.code, error: loadFailure.error };
     }
-    return { success: true, notes: readNotesFile(), filePath: NOTES_FILE };
+    return { success: true, notes: readNotesFile(), filePath: currentNotesFile() };
   },
   notesAdd: async function (draft) {
     const payload = {
@@ -1053,6 +1069,38 @@ const api = {
     deleteSlot = null;
     return { success: true, notes: [], backupPath: NOTES_FILE + ".bak" };
   },
+  /** R14 指纹：只读的最小事实（不解析内容、不建目录/文件、不改 mtime、永不抛错）。 */
+  notesStat: async function () {
+    notesStatCalls += 1;
+    if (notesStatFailure === "throw") throw new Error("stub notesStat 注入异常");
+    if (notesStatFailure) {
+      return {
+        success: false,
+        exists: false,
+        size: 0,
+        mtimeMs: 0,
+        hash: "",
+        code: notesStatFailure,
+        error: NOTES_ERRORS[notesStatFailure] || notesStatFailure,
+      };
+    }
+    const file = currentNotesFile();
+    let bytes;
+    try {
+      bytes = fs.readFileSync(file);
+    } catch (err) {
+      if (err && err.code === "ENOENT") return { success: true, exists: false, size: 0, mtimeMs: 0, hash: "" };
+      return { success: false, exists: false, size: 0, mtimeMs: 0, hash: "", code: "read-failed", error: NOTES_ERRORS["read-failed"] };
+    }
+    const stat = fs.statSync(file);
+    return {
+      success: true,
+      exists: true,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      hash: crypto.createHash("sha256").update(bytes).digest("hex"),
+    };
+  },
 
   readerStateLoad: async function () {
     if (stateLoadDelayMs) await sleep(stateLoadDelayMs);
@@ -1110,6 +1158,8 @@ contextBridge.exposeInMainWorld("__pixStub", {
     return { count: notesAddCalls.length, payloads: notesAddCalls.slice(-8) };
   },
   notesLoadCalls: function () { return notesLoadCalls; },
+  notesStatCalls: function () { return { count: notesStatCalls }; },
+  setNotesStatFailure: function (code) { notesStatFailure = code || null; },
   setNotesAddFailure: function (code) { notesAddFailure = code || null; },
   setNotesDeleteFailure: function (code) { notesDeleteFailure = code || null; },
   notesRestoreCalls: function () {
@@ -2172,7 +2222,9 @@ async function runReaderStateScenarios(win, log) {
     row: bRow,
     progressCount: await countOf(".row-progress"),
     resume: await has(".reader-resume"),
-    title: await textOf(".empty-title"),
+    // R14 登记修复：B 的笔记根随 activeRoot 后笔记面板进入空态（同样渲染 .empty-title）
+    // ⇒ 阅读区空态文案必须限定在 .reader-empty 内，否则读到的是左栏笔记空态（与 R11 同款限定口径）
+    title: await textOf(".reader-empty .empty-title"),
   };
   await capturePage(win, "24-workspace-switch.png");
   record("workspace-switch", { phase: "b-workspace", ...bSide }, [
@@ -8007,6 +8059,737 @@ async function runReaderStateScenarios(win, log) {
         : [`在途重复点击不得发第二次 IPC：${callsAfterDouble13h - callsBase13h}`]),
       ...(probe13h.rowInDom === false ? [] : [`在途切文档后迟到的响应应被丢弃：${probe13h.rowText}`]),
       ...(notice13h === null ? [] : [`在途结果丢弃后不得弹提示：${JSON.stringify(notice13h)}`]),
+    ],
+  );
+
+  await restoreStandardSeed();
+
+  // -------------------------------------------------------------------------
+  // 场景 r14-1…r14-5：资产贯通（N87–N90，设计档 §5.4）
+  //
+  // 挂载位置：本函数末尾（R13 场景之后）。每个场景自带复位、以自己的
+  // restoreStandardSeed() 收尾；外部改动一律由 Node 侧真写真改（模拟编辑器）。
+  // 命名登记：设计档 §5.4.2 的 badgeProbe / staleProbe 与本作用域既有常量重名
+  // （早前场景的局部读数变量），故改名为 badgeRowProbe / staleRowProbe（语义不变）。
+  // -------------------------------------------------------------------------
+
+  const statCalls = () => js("window.__pixStub.notesStatCalls()");
+  const setNotesStatFailure = (code) => js(`window.__pixStub.setNotesStatFailure(${JSON.stringify(code)}), true`);
+  const triggerWindowFocus = () => js(`window.dispatchEvent(new Event("focus")), true`);
+
+  /** 树行徽标现场：文本 / tooltip / 盒模型 / 让位判据两侧读数（一次 js 读完，字段集合封闭）。 */
+  const badgeRowProbe = (expr) => js(`(() => {
+    const box = (el) => { const b = el.getBoundingClientRect(); return { left: b.left, right: b.right, w: b.width, h: b.height }; };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const rows = Array.from(document.querySelectorAll(".tree-row"));
+    const row = rows.find(${expr});
+    if (!row) return null;
+    const style = getComputedStyle(row);
+    const notes = row.querySelector(".row-notes");
+    const progress = row.querySelector(".row-progress");
+    const label = row.querySelector(".row-label");
+    const spacer = row.querySelector(".row-chevron-spacer");
+    const icon = row.querySelector(".row-icon");
+    const paddingLeft = parseFloat(style.paddingLeft);
+    const paddingRight = parseFloat(style.paddingRight);
+    const gap = parseFloat(style.columnGap) || 0;
+    const spacerWidth = spacer ? spacer.getBoundingClientRect().width : 0;
+    const iconWidth = icon ? icon.getBoundingClientRect().width : 0;
+    const progressClientWidth = progress ? progress.clientWidth : 0;
+    const labelFloor =
+      row.clientWidth - paddingLeft - paddingRight - spacerWidth - iconWidth - progressClientWidth - 4 * gap;
+    return {
+      title: row.getAttribute("title"),
+      text: text(notes),
+      notesTitle: notes ? notes.getAttribute("title") : null,
+      notesCount: row.querySelectorAll(".row-notes").length,
+      notesClientWidth: notes ? notes.clientWidth : null,
+      notesScrollWidth: notes ? notes.scrollWidth : null,
+      notesBox: notes ? box(notes) : null,
+      progress: text(progress),
+      progressCount: row.querySelectorAll(".row-progress").length,
+      progressClientWidth,
+      progressBox: progress ? box(progress) : null,
+      labelClientWidth: label ? label.clientWidth : null,
+      labelScrollWidth: label ? label.scrollWidth : null,
+      labelFloor,
+      rowClientWidth: row.clientWidth,
+      rowScrollWidth: row.scrollWidth,
+      rowBox: box(row),
+      spacing: { paddingLeft, paddingRight, gap, spacerWidth, iconWidth },
+      domOrder: !!(label && notes && progress) && (label.compareDocumentPosition(notes) & 4) === 4 && (notes.compareDocumentPosition(progress) & 4) === 4,
+    };
+  })()`);
+
+  /** 提示行现场：文本 / 按钮 / DOM 位次（.notes-panel 直接子元素的类名序列）。 */
+  const staleRowProbe = () => js(`(() => {
+    const panel = document.querySelector(".notes-panel");
+    const names = Array.from(panel.children).map((el) => String(el.className).split(" ")[0]);
+    const at = (name) => names.indexOf(name);
+    const row = document.querySelector(".notes-stale");
+    const text = row ? row.querySelector(".stale-text") : null;
+    const btn = row ? row.querySelector(".stale-refresh") : null;
+    return {
+      present: !!row,
+      text: text ? text.textContent.replace(/\\s+/g, " ").trim() : null,
+      btnText: btn ? btn.textContent.replace(/\\s+/g, " ").trim() : null,
+      btnTitle: btn ? btn.getAttribute("title") : null,
+      btnHeight: btn ? Math.round(btn.getBoundingClientRect().height) : null,
+      btnDisabled: btn ? btn.disabled : null,
+      order: {
+        names,
+        header: at("notes-header"),
+        notice: at("notes-notice"),
+        stale: at("notes-stale"),
+        undo: at("notes-undo"),
+        exportRow: at("notes-export-row"),
+        reportRow: at("notes-report-row"),
+        list: at("notes-list"),
+      },
+    };
+  })()`);
+
+  /** 徽标文本轮询表达式（面板打开时树隐藏、几何为 0 ⇒ 只读 textContent；缺席返回 false）。 */
+  const badgeTextWaitExpr = (suffix, expected) => `(() => {
+    const rows = Array.from(document.querySelectorAll(".tree-row"));
+    const row = rows.find((el) => (el.getAttribute("title") || "").endsWith(${JSON.stringify(suffix)}));
+    const el = row ? row.querySelector(".row-notes") : null;
+    return !!el && el.textContent.replace(/\\s+/g, " ").trim() === ${JSON.stringify(expected)};
+  })()`;
+
+  /** Node 侧笔记文件改写（与 stub 的 writeNotesFile 同字节格式）：外部改动必须真写真改。 */
+  const writeNotesOutside = (list) =>
+    writeFileSync(NOTES_FILE, `${JSON.stringify({ version: 1, notes: list }, null, 2)}\n`, "utf8");
+  const appendExternalNote = (note) => writeNotesOutside([...readNotes(), note]);
+  const removeExternalNote = (id) => writeNotesOutside(readNotes().filter((note) => note.id !== id));
+
+  const EXTERNAL_TEXT = "External edit: this note was appended outside the app.";
+  const externalNote = (id, docPath) => ({ id, kind: "excerpt", docPath, page: 1, text: EXTERNAL_TEXT, comment: "", createdAt: Date.now(), updatedAt: Date.now() });
+  const EXTERNAL_1 = externalNote("n-external-1", "archive/older-paper.pdf");
+  const EXTERNAL_2 = externalNote("n-external-2", "reading-notes.md");
+  const EXTERNAL_3 = externalNote("n-external-3", "sample-paper.pdf");
+
+  const SAMPLE_ROW = `(el) => (el.getAttribute("title") || "").endsWith("sample-paper.pdf")`;
+  const OLDER_ROW = `(el) => (el.getAttribute("title") || "").endsWith("older-paper.pdf")`;
+  const rowByLabelExpr = (name) =>
+    `(el) => { const l = el.querySelector(".row-label"); return !!l && l.textContent.trim() === ${JSON.stringify(name)}; }`;
+  /** 徽标让位判据（设计档 §1.4）：labelClientWidth ≥ min(labelScrollWidth, labelFloor) − 1。 */
+  const badgeYieldOk = (probe) =>
+    !!probe && probe.labelClientWidth >= Math.min(probe.labelScrollWidth, probe.labelFloor) - 1;
+  const rowFits = (probe) => !!probe && probe.rowScrollWidth <= probe.rowClientWidth + 1;
+  const progressPinnedRight = (probe) =>
+    !!probe && probe.progressBox.right >= probe.rowBox.right - probe.spacing.paddingRight - 1;
+
+  // --- r14-1 树行笔记徽标：完整 / 压缩两种形态 + 实时联动 + 窄栏让位 -------------
+  log("r14-1 树行笔记徽标（默认宽度 / 实时联动 / 窄栏让位）");
+  await goHome();
+  await clearStateA();
+  writeState(STATE_FILE_A, {
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: { "sample-paper.pdf": entry(2, 1), "archive/older-paper.pdf": entry(1024, 1.1) },
+  });
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(5);
+  await js(`window.__pixStub.seedNotes(${JSON.stringify(seedNotes())}), true`);
+  await waitFor("树徽标行数 = 2", `document.querySelectorAll(${JSON.stringify(SEL.rowNotes)}).length === 2`);
+  const badgePhase = {
+    sample: await badgeRowProbe(SAMPLE_ROW),
+    older: await badgeRowProbe(OLDER_ROW),
+    notes: await badgeRowProbe(rowByLabelExpr("reading-notes.md")),
+    longBook: await badgeRowProbe(rowByLabelExpr("long-book.pdf")),
+    archive: await badgeRowProbe(rowByLabelExpr("archive")),
+  };
+  await capturePage(win, "r14-1-tree-notes-badge.png", await rectOfSelector(SEL.layoutLeft));
+  const badgeData = {
+    phase: "badges",
+    sample: badgePhase.sample,
+    older: badgePhase.older,
+    notesRow: badgePhase.notes,
+    archiveRow: badgePhase.archive,
+    longBookRow: badgePhase.longBook,
+  };
+  record("r14-tree-badge", badgeData, [
+    ...(badgePhase.sample &&
+    badgePhase.sample.text === "3 条" &&
+    badgePhase.sample.notesTitle === "摘录 2 条 · AI 结论 1 条" &&
+    badgePhase.sample.notesScrollWidth <= badgePhase.sample.notesClientWidth + 1
+      ? []
+      : [`sample 行徽标应为完整「3 条」：${JSON.stringify(badgePhase.sample)}`]),
+    ...(badgePhase.older &&
+    badgePhase.older.text === "1 条" &&
+    badgePhase.older.notesTitle === "摘录 1 条 · AI 结论 0 条" &&
+    badgePhase.older.notesClientWidth >= 9 &&
+    badgePhase.older.notesClientWidth <= 11 &&
+    badgePhase.older.notesScrollWidth > badgePhase.older.notesClientWidth &&
+    (badgePhase.older.notesClientWidth === 0 || badgePhase.older.notesClientWidth >= 5)
+      ? []
+      : [`older 行徽标应为压缩态（≈10px、无空胶囊）：${JSON.stringify(badgePhase.older)}`]),
+    ...(badgePhase.notes && badgePhase.longBook && badgePhase.archive &&
+    [badgePhase.notes, badgePhase.longBook, badgePhase.archive].every((probe) => probe.notesCount === 0 && probe.progressCount === 0)
+      ? []
+      : [`无笔记行不得出现任何标记：${JSON.stringify([badgePhase.notes, badgePhase.longBook, badgePhase.archive])}`]),
+    ...(badgePhase.sample && badgePhase.older &&
+    badgePhase.sample.progress === "第 2 页" &&
+    badgePhase.older.progress === "第 1024 页" &&
+    progressPinnedRight(badgePhase.sample) &&
+    progressPinnedRight(badgePhase.older) &&
+    badgePhase.sample.notesBox.right <= badgePhase.sample.progressBox.left &&
+    badgePhase.older.notesBox.right <= badgePhase.older.progressBox.left &&
+    badgePhase.sample.domOrder === true &&
+    badgePhase.older.domOrder === true
+      ? []
+      : [`行内两枚标记的文本 / 右缘 / 不重叠 / 位次异常：${JSON.stringify({ sample: badgePhase.sample, older: badgePhase.older })}`]),
+    ...([badgePhase.sample, badgePhase.older, badgePhase.notes, badgePhase.longBook, badgePhase.archive].every(overflowFree) &&
+    badgeYieldOk(badgePhase.sample) &&
+    badgeYieldOk(badgePhase.older)
+      ? []
+      : [`行级溢出或徽标反向挤动行名：${JSON.stringify({ sample: badgePhase.sample, older: badgePhase.older })}`]),
+  ]);
+
+  await openNotesPanel(4);
+  await deleteRowByText("Table 2 repo");
+  await waitFor("sample 徽标 → 2 条", badgeTextWaitExpr("sample-paper.pdf", "2 条"));
+  const liveAfterDelete = await badgeRowProbe(SAMPLE_ROW);
+  const liveRowsAfterDelete = await countOf(SEL.noteRow);
+  await clickUndo();
+  await waitFor("sample 徽标 → 3 条", badgeTextWaitExpr("sample-paper.pdf", "3 条"));
+  const liveAfterUndo = await badgeRowProbe(SAMPLE_ROW);
+  const liveRowsAfterUndo = await countOf(SEL.noteRow);
+  await setSearch("Reproducibility");
+  await waitFor("搜索命中 1 条", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 1`);
+  const liveFilteredCount = await textOf(".notes-count");
+  const liveGroupCounts = await groupHeads();
+  const liveBadgeUnderFilter = await badgeRowProbe(SAMPLE_ROW);
+  await setSearch("");
+  await waitFor("搜索清空后回到 4 行", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 4`);
+  record(
+    "r14-tree-badge",
+    {
+      phase: "live",
+      afterDelete: liveAfterDelete,
+      afterUndo: liveAfterUndo,
+      rows: { afterDelete: liveRowsAfterDelete, afterUndo: liveRowsAfterUndo },
+      filteredCount: liveFilteredCount,
+      groupCounts: liveGroupCounts,
+      badgeUnderFilter: liveBadgeUnderFilter,
+    },
+    [
+      ...(liveAfterDelete && liveAfterDelete.text === "2 条" && liveAfterDelete.notesTitle === "摘录 1 条 · AI 结论 1 条"
+        ? []
+        : [`删除后徽标未联动：${JSON.stringify(liveAfterDelete)}`]),
+      ...(liveAfterUndo && liveAfterUndo.text === "3 条" && liveAfterUndo.notesTitle === "摘录 2 条 · AI 结论 1 条"
+        ? []
+        : [`撤销后徽标未回位：${JSON.stringify(liveAfterUndo)}`]),
+      ...(liveRowsAfterDelete === 3 && liveRowsAfterUndo === 4
+        ? []
+        : [`列表未真实变化（徽标断言会变空断言）：${liveRowsAfterDelete} → ${liveRowsAfterUndo}`]),
+      ...(liveGroupCounts.length === 1 &&
+      !liveGroupCounts.some((head) => head.count === "共 3 条") &&
+      liveBadgeUnderFilter &&
+      liveBadgeUnderFilter.text === "3 条"
+        ? []
+        : [`过滤态口径异常（徽标恒示全量）：${JSON.stringify({ count: liveFilteredCount, groups: liveGroupCounts, badge: liveBadgeUnderFilter })}`]),
+    ],
+  );
+
+  await backToLibraryTab();
+  await js(`document.documentElement.style.setProperty("--pix-left-width", "220px"), true`);
+  await repaint(win);
+  const narrowLeft = await js(`Math.round(document.querySelector(${JSON.stringify(SEL.layoutLeft)}).getBoundingClientRect().width)`);
+  const narrowSample = await badgeRowProbe(SAMPLE_ROW);
+  const narrowOlder = await badgeRowProbe(OLDER_ROW);
+  await capturePage(win, "r14-1b-tree-badges-narrow.png", await rectOfSelector(SEL.layoutLeft));
+  await js(`document.documentElement.style.removeProperty("--pix-left-width"), true`);
+  await repaint(win);
+  const restoredLeft = await js(`Math.round(document.querySelector(${JSON.stringify(SEL.layoutLeft)}).getBoundingClientRect().width)`);
+  const restoredSample = await badgeRowProbe(SAMPLE_ROW);
+  const restoredOlder = await badgeRowProbe(OLDER_ROW);
+  const badgeWidthOk = (probe) => !!probe && (probe.notesClientWidth === 0 || probe.notesClientWidth >= 5);
+  record(
+    "r14-tree-badge",
+    {
+      phase: "narrow",
+      leftWidth: narrowLeft,
+      row: {
+        sample: { rowScrollWidth: narrowSample.rowScrollWidth, rowClientWidth: narrowSample.rowClientWidth },
+        older: { rowScrollWidth: narrowOlder.rowScrollWidth, rowClientWidth: narrowOlder.rowClientWidth },
+      },
+      notesBadge: { sample: narrowSample, older: narrowOlder },
+      progressBadge: {
+        sample: { progress: narrowSample.progress, progressClientWidth: narrowSample.progressClientWidth },
+        older: { progress: narrowOlder.progress, progressClientWidth: narrowOlder.progressClientWidth },
+      },
+      restored: { leftWidth: restoredLeft, sample: restoredSample, older: restoredOlder },
+    },
+    [
+      ...(narrowLeft >= 218 && narrowLeft <= 222 ? [] : [`窄栏宽度异常：${narrowLeft}`]),
+      ...(narrowSample && narrowOlder && narrowSample.notesCount === 1 && narrowOlder.notesCount === 1 &&
+      narrowSample.notesClientWidth !== null && narrowOlder.notesClientWidth !== null
+        ? []
+        : ["窄栏相位徽标缺席（防空）：选择器或渲染异常"]),
+      ...(rowFits(narrowSample) && rowFits(narrowOlder) ? [] : [`窄栏下树行横向溢出：${JSON.stringify([narrowSample, narrowOlder])}`]),
+      ...(narrowSample.progress === "第 2 页" &&
+      narrowOlder.progress === "第 1024 页" &&
+      Math.abs(narrowSample.progressClientWidth - badgePhase.sample.progressClientWidth) <= 1 &&
+      Math.abs(narrowOlder.progressClientWidth - badgePhase.older.progressClientWidth) <= 1 &&
+      progressPinnedRight(narrowSample) &&
+      progressPinnedRight(narrowOlder)
+        ? []
+        : [`窄栏下进度徽标不得位移 / 变形：${JSON.stringify({ narrow: [narrowSample, narrowOlder], base: [badgePhase.sample, badgePhase.older] })}`]),
+      ...(badgeYieldOk(narrowSample) && badgeYieldOk(narrowOlder)
+        ? []
+        : [`窄栏下徽标反向挤动行名：${JSON.stringify({ sample: narrowSample, older: narrowOlder })}`]),
+      ...(badgeWidthOk(narrowSample) && badgeWidthOk(narrowOlder) ? [] : ["窄栏下徽标出现空胶囊：宽度既非 0 也小于 5"]),
+      ...(Math.abs(restoredLeft - 268) <= 2 ? [] : [`窄栏变量未复位：${restoredLeft}`]),
+      ...(restoredSample && restoredOlder &&
+      restoredSample.notesScrollWidth <= restoredSample.notesClientWidth + 1 &&
+      restoredOlder.notesClientWidth >= 9 &&
+      restoredOlder.notesClientWidth <= 11 &&
+      rowFits(restoredSample) &&
+      rowFits(restoredOlder) &&
+      badgeYieldOk(restoredSample) &&
+      badgeYieldOk(restoredOlder)
+        ? []
+        : [`复原后徽标未回到默认读数：${JSON.stringify({ left: restoredLeft, sample: restoredSample, older: restoredOlder })}`]),
+    ],
+  );
+
+  // --- r14-2 徽标作用域：B 工作区 0 徽标 + 回切 A 恢复 ---------------------------
+  log("r14-2 徽标作用域（B 无徽标 / 回切 A 恢复）");
+  await restoreStandardSeed();
+  const loadBaseR142 = await loadCalls();
+  await goHome();
+  await enterWorkspace(LIBRARY_B_NAME);
+  await waitTreeRows(1);
+  await js(`document.querySelector('.pill-tab[data-tab="notes"]').click(), true`);
+  await waitFor("B 笔记空态", `document.querySelector(".notes-empty")`);
+  const bTreeRow = await rowByTitle("sample-paper.pdf");
+  const bBadgeCount = await countOf(SEL.rowNotes);
+  const bEmptyShown = await has(".notes-empty");
+  const bStale = await has(SEL.staleRow);
+  const bLoadDelta = (await loadCalls()) - loadBaseR142;
+  await capturePage(win, "r14-2-tree-badge-workspace-b.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r14-tree-badge-scope",
+    { phase: "b-workspace", loadDelta: bLoadDelta, rows: bTreeRow, badgeCount: bBadgeCount, emptyShown: bEmptyShown, stale: bStale },
+    [
+      ...(bLoadDelta >= 1 ? [] : [`进入 B 工作区未读盘：${bLoadDelta}`]),
+      ...(bTreeRow !== null && bBadgeCount === 0 ? [] : [`B 侧树上不得出现徽标：rows=${JSON.stringify(bTreeRow)} badgeCount=${bBadgeCount}`]),
+      ...(bEmptyShown ? [] : ["B 侧笔记空态缺失（断言可能是未加载的假绿）"]),
+      ...(bStale === false ? [] : ["B 侧不得出现外部改动提示"]),
+    ],
+  );
+
+  await goHome();
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(5);
+  await waitFor("回切 A 后徽标 ≥ 2", `document.querySelectorAll(${JSON.stringify(SEL.rowNotes)}).length >= 2`);
+  const backSample = await badgeRowProbe(SAMPLE_ROW);
+  const backOlder = await badgeRowProbe(OLDER_ROW);
+  record(
+    "r14-tree-badge-scope",
+    { phase: "back-to-a", sample: backSample, older: backOlder },
+    [
+      ...(backSample && backSample.text === "3 条" && backOlder && backOlder.text === "1 条"
+        ? []
+        : [`回切 A 后徽标异常（跨工作区残留 / 未恢复）：${JSON.stringify({ sample: backSample, older: backOlder })}`]),
+    ],
+  );
+
+  // --- r14-3 外部改动感知：进入不误报 / 焦点检测 / 刷新保留草稿 -------------------
+  log("r14-3 外部改动感知（进入不误报 / 焦点检测 / 刷新保留草稿）");
+  await goHome();
+  await clearStateA();
+  writeNotesOutside([...seedNotes(), EXTERNAL_1]);
+  await enterWorkspace(LIBRARY_NAME);
+  await waitTreeRows(5);
+  await waitFor("5 条种子后的徽标行数 = 2", `document.querySelectorAll(${JSON.stringify(SEL.rowNotes)}).length === 2`);
+  const freshSample = await badgeRowProbe(SAMPLE_ROW);
+  const freshOlder = await badgeRowProbe(OLDER_ROW);
+  await openNotesPanel(5);
+  const freshRows = await countOf(SEL.noteRow);
+  const freshStale = await has(SEL.staleRow);
+  const freshExternalVisible = await js(`Boolean(${rowFinder(EXTERNAL_TEXT, false)})`);
+  record(
+    "r14-notes-stale",
+    { phase: "enter-fresh", rows: freshRows, stale: freshStale, sample: freshSample, older: freshOlder },
+    [
+      ...(freshRows === 5 && freshExternalVisible ? [] : [`外部新增未随读盘进入面板：rows=${freshRows} external=${freshExternalVisible}`]),
+      ...(freshStale === false ? [] : ["进入工作区即一致，不得误报外部改动"]),
+      ...(freshSample && freshSample.text === "3 条" && freshOlder && freshOlder.text === "2 条"
+        ? []
+        : [`树徽标与文件不一致：${JSON.stringify({ sample: freshSample, older: freshOlder })}`]),
+    ],
+  );
+
+  const detectStatBase = (await statCalls()).count;
+  appendExternalNote(EXTERNAL_2);
+  // 只读基线必须在外部写入之后、触发检测之前取：检测本身不得改文件
+  const detectHashBefore = notesHash();
+  await triggerWindowFocus();
+  await waitFor("外部改动提示", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const detectStale = await staleRowProbe();
+  const detectRows = await countOf(SEL.noteRow);
+  const detectCount = await textOf(".notes-count");
+  const detectStatDelta = (await statCalls()).count - detectStatBase;
+  await js(`(() => {
+    const row = document.querySelectorAll(${JSON.stringify(SEL.noteRow)})[0];
+    const wrap = row ? row.querySelector(".note-select-wrap") : null;
+    if (!wrap) throw new Error("note-select-wrap not found");
+    wrap.click();
+    return true;
+  })()`);
+  await waitFor("选择条（提示期间可交互）", `document.querySelector(".notes-selection-count")`);
+  const detectSelectable = await textOf(".notes-selection-count");
+  await js(`document.querySelector(".notes-selection-clear").click(), true`);
+  await waitFor("选择条消失", `!document.querySelector(".notes-selection-bar")`);
+  await sleep(4500);
+  const detectStillAfterWait = await has(SEL.staleRow);
+  await capturePage(win, "r14-3-stale-row.png", await rectOfSelector(SEL.layoutLeft));
+  record(
+    "r14-notes-stale",
+    {
+      phase: "detect",
+      stale: detectStale,
+      rows: detectRows,
+      countText: detectCount,
+      hashSame: notesHash() === detectHashBefore,
+      statDelta: detectStatDelta,
+      selectable: detectSelectable,
+      stillAfterWait: detectStillAfterWait,
+    },
+    [
+      ...(detectStale.present &&
+      detectStale.text === "笔记文件已被外部修改，面板内容可能过期" &&
+      detectStale.btnText === "刷新" &&
+      detectStale.btnTitle === "重新读取笔记文件"
+        ? []
+        : [`提示行文案 / 按钮异常：${JSON.stringify(detectStale)}`]),
+      ...(detectStale.order.header >= 0 &&
+      detectStale.order.stale === detectStale.order.header + 1 + (detectStale.order.notice === -1 ? 0 : 1)
+        ? []
+        : [`提示行位置异常：${JSON.stringify(detectStale.order)}`]),
+      ...(detectRows === 5 && detectCount === "共 5 条" ? [] : [`检测不得改列表：rows=${detectRows} count=${detectCount}`]),
+      ...(notesHash() === detectHashBefore && detectStatDelta >= 1
+        ? []
+        : [`检测必须只读（走新通道）：hashSame=${notesHash() === detectHashBefore} statDelta=${detectStatDelta}`]),
+      ...(detectSelectable !== null && detectSelectable.includes("已选") ? [] : [`提示期间既有控件被阻塞：${detectSelectable}`]),
+      ...(detectStillAfterWait ? [] : ["提示不得随时间自动消失"]),
+    ],
+  );
+
+  await js(`(() => {
+    const row = ${rowFinder("We study retrieval", false)};
+    if (!row) throw new Error("draft target row not found");
+    const trigger = row.querySelector(".comment-trigger");
+    if (!trigger) throw new Error("comment trigger not found");
+    trigger.click();
+    return true;
+  })()`);
+  await waitFor("备注编辑态", `document.querySelector(".note-comment textarea")`);
+  await js(`(() => {
+    const input = document.querySelector(".note-comment textarea");
+    if (!input) throw new Error("comment textarea not found");
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    setter.call(input, "刷新不应丢弃这段草稿");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return true;
+  })()`);
+  const refreshHashBefore = notesHash();
+  const refreshLoadBase = await loadCalls();
+  const refreshAddBase = (await notesAddCalls()).count;
+  const refreshReportBase = (await notesReportCalls()).count;
+  await clickEl(SEL.staleRefresh);
+  await waitFor("刷新后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  await waitFor("刷新后列表 6 行", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 6`);
+  const draft = await js(`(() => {
+    const input = document.querySelector(".note-comment textarea");
+    const actions = Array.from(document.querySelectorAll(".note-comment .comment-actions .v-btn")).map((el) => el.textContent.replace(/\\s+/g, " ").trim());
+    return { value: input ? input.value : null, inDom: !!input, actions };
+  })()`);
+  const refreshRows = await countOf(SEL.noteRow);
+  const refreshFileRows = readNotes().length;
+  const refreshBadges = {
+    reading: await badgeRowProbe(rowByLabelExpr("reading-notes.md")),
+    older: await badgeRowProbe(OLDER_ROW),
+    sample: await badgeRowProbe(SAMPLE_ROW),
+  };
+  const refreshHashSame = notesHash() === refreshHashBefore;
+  const refreshLoadDelta = (await loadCalls()) - refreshLoadBase;
+  const refreshAddDelta = (await notesAddCalls()).count - refreshAddBase;
+  const refreshReportDelta = (await notesReportCalls()).count - refreshReportBase;
+  await capturePage(win, "r14-3b-refresh-keeps-draft.png", await rectOfSelector(SEL.layoutLeft));
+  await capturePage(win, "r14-3c-refresh-list-synced.png", await rectOfSelector(SEL.layoutLeft));
+
+  removeExternalNote("n-current-1");
+  await triggerWindowFocus();
+  await waitFor("外部删除后提示再现", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const segmentLoadBase = await loadCalls();
+  await clickEl(SEL.staleRefresh);
+  await waitFor("续段刷新后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  await waitFor("续段刷新后列表 5 行", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === 5`);
+  const removedRowGone = await js(`!(${rowFinder("We study retrieval", false)})`);
+  const removedTextarea = await has(".note-comment textarea");
+  const removedRows = await countOf(SEL.noteRow);
+  const removedFileRows = readNotes().length;
+  const removedStale = await has(SEL.staleRow);
+  const removedNotice = await notesNotice();
+  const draftNotSaved = !JSON.stringify(readNotes()).includes("刷新不应丢弃这段草稿");
+  const segmentAddDelta = (await notesAddCalls()).count - refreshAddBase;
+  const segmentReportDelta = (await notesReportCalls()).count - refreshReportBase;
+  const segmentLoadDelta = (await loadCalls()) - segmentLoadBase;
+  record(
+    "r14-notes-stale",
+    {
+      phase: "refresh-draft",
+      stale: await has(SEL.staleRow),
+      draft,
+      draftKept: draft.inDom && draft.value === "刷新不应丢弃这段草稿",
+      rows: refreshRows,
+      fileRows: refreshFileRows,
+      badges: refreshBadges,
+      hashSame: refreshHashSame,
+      loadDelta: refreshLoadDelta,
+      writeDelta: { add: refreshAddDelta, report: refreshReportDelta },
+      removedRowGone,
+      removedTextarea,
+      removedRows,
+      removedFileRows,
+      removedStale,
+      removedNotice,
+      draftNotSaved,
+      segmentDelta: { load: segmentLoadDelta, add: segmentAddDelta, report: segmentReportDelta },
+    },
+    [
+      ...((await has(SEL.staleRow)) === false ? [] : ["刷新成功后提示应消失"]),
+      ...(draft.inDom && draft.value === "刷新不应丢弃这段草稿" && draft.actions.includes("保存") && draft.actions.includes("取消")
+        ? []
+        : [`刷新不得丢弃草稿 / 关闭编辑框：${JSON.stringify(draft)}`]),
+      ...(refreshRows === 6 && refreshFileRows === 6 ? [] : [`刷新后面板与文件不一致：rows=${refreshRows} file=${refreshFileRows}`]),
+      ...(refreshBadges.sample && refreshBadges.sample.text === "3 条" &&
+      refreshBadges.older && refreshBadges.older.text === "2 条" &&
+      refreshBadges.reading && refreshBadges.reading.text === "1 条"
+        ? []
+        : [`刷新后徽标未同步：${JSON.stringify(refreshBadges)}`]),
+      ...(refreshHashSame && refreshLoadDelta === 1 && refreshAddDelta === 0 && refreshReportDelta === 0
+        ? []
+        : [`刷新必须只读且只发一次 IPC：hashSame=${refreshHashSame} load=${refreshLoadDelta} add=${refreshAddDelta} report=${refreshReportDelta}`]),
+      ...(removedRowGone && !removedTextarea ? [] : [`外部删除后行与编辑框应随数据消失：rowGone=${removedRowGone} textarea=${removedTextarea}`]),
+      ...(removedRows === 5 && removedFileRows === 5 ? [] : [`续段刷新后面板与文件不一致：rows=${removedRows} file=${removedFileRows}`]),
+      ...(removedStale === false && removedNotice === null ? [] : [`续段不得残留提示 / 弹错：stale=${removedStale} notice=${JSON.stringify(removedNotice)}`]),
+      ...(draftNotSaved && segmentAddDelta === refreshAddDelta && segmentReportDelta === refreshReportDelta && segmentLoadDelta === 1
+        ? []
+        : [`草稿未自动保存 / 未自动丢弃且刷新只读：saved=${!draftNotSaved} delta=${JSON.stringify({ segmentLoadDelta, segmentAddDelta, segmentReportDelta })}`]),
+    ],
+  );
+
+  // --- r14-4 外部改动检测的失败静默与在途守卫 -----------------------------------
+  log("r14-4 检测失败静默与在途守卫");
+  await restoreStandardSeed();
+  const rebaseHashBefore = notesHash();
+  appendExternalNote(EXTERNAL_1);
+  await triggerWindowFocus();
+  await waitFor("外部改动提示（防空）", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const rebaseStaleBefore = await has(SEL.staleRow);
+  await deleteRowByText("Table 2 repo");
+  await waitFor("写成功后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const rebaseStaleAfter = await has(SEL.staleRow);
+  const rebaseRows = await countOf(SEL.noteRow);
+  const rebaseFileRows = readNotes().length;
+  const rebaseExternalVisible = await js(`Boolean(${rowFinder(EXTERNAL_TEXT, false)})`);
+  record(
+    "r14-notes-stale-failure",
+    {
+      phase: "write-rebaseline",
+      staleBefore: rebaseStaleBefore,
+      staleAfter: rebaseStaleAfter,
+      rows: rebaseRows,
+      fileRows: rebaseFileRows,
+      externalVisible: rebaseExternalVisible,
+      hashChanged: notesHash() !== rebaseHashBefore,
+    },
+    [
+      ...(rebaseStaleBefore ? [] : ["外部改动后提示必须出现（防空）"]),
+      ...(rebaseStaleAfter === false ? [] : ["写操作成功后必须重新对标（提示消失）"]),
+      ...(rebaseRows === rebaseFileRows && rebaseExternalVisible ? [] : [`面板行数必须等于文件条数且不丢外部改动：rows=${rebaseRows} file=${rebaseFileRows} external=${rebaseExternalVisible}`]),
+      ...(notesHash() !== rebaseHashBefore ? [] : ["删除必须真实落盘"]),
+    ],
+  );
+
+  appendExternalNote(EXTERNAL_3);
+  await triggerWindowFocus();
+  await waitFor("置位态（防空）", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const silentStatBase = (await statCalls()).count;
+  await setNotesStatFailure("read-failed");
+  await triggerWindowFocus();
+  await sleep(400);
+  const silentReadFailed = { stale: await has(SEL.staleRow), notice: await notesNotice(), rows: await countOf(SEL.noteRow) };
+  await setNotesStatFailure("throw");
+  await triggerWindowFocus();
+  await sleep(400);
+  const silentThrow = { stale: await has(SEL.staleRow), notice: await notesNotice(), rows: await countOf(SEL.noteRow) };
+  await capturePage(win, "r14-4-stat-failure-silent.png", await rectOfSelector(SEL.layoutLeft));
+  await setNotesStatFailure(null);
+  await clickEl(SEL.staleRefresh);
+  await waitFor("刷新后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const silentStaleAfterClear = await has(SEL.staleRow);
+  await setNotesStatFailure("read-failed");
+  await triggerWindowFocus();
+  await sleep(400);
+  const silentAfterClear = await has(SEL.staleRow);
+  await setNotesStatFailure(null);
+  const silentStatDelta = (await statCalls()).count - silentStatBase;
+  record(
+    "r14-notes-stale-failure",
+    {
+      phase: "stat-failure-silent",
+      staleWhileFailed: { readFailed: silentReadFailed.stale, throw: silentThrow.stale },
+      notice: { readFailed: silentReadFailed.notice, throw: silentThrow.notice },
+      rows: silentReadFailed.rows,
+      rowsAfterThrow: silentThrow.rows,
+      staleAfterClear: silentStaleAfterClear,
+      silentAfterClear,
+      statDelta: silentStatDelta,
+    },
+    [
+      ...(silentReadFailed.stale && silentThrow.stale ? [] : [`检测失败不得清除已置位状态：${JSON.stringify({ readFailed: silentReadFailed, throw: silentThrow })}`]),
+      ...(silentReadFailed.notice === null && silentThrow.notice === null && silentReadFailed.rows === silentThrow.rows
+        ? []
+        : [`检测失败必须静默且不动列表：${JSON.stringify({ readFailed: silentReadFailed, throw: silentThrow })}`]),
+      ...(silentStatDelta >= 1 ? [] : [`检测必须真实走新通道：${silentStatDelta}`]),
+      ...(silentStaleAfterClear === false ? [] : ["置位态下刷新成功后提示应消失"]),
+      ...(silentAfterClear === false ? [] : ["未置位时检测失败不得置位"]),
+    ],
+  );
+
+  await setLoadDelay(1200);
+  appendExternalNote(EXTERNAL_2);
+  await triggerWindowFocus();
+  await waitFor("在途守卫前置提示", `document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  const inflightLoadBase = await loadCalls();
+  const inflightTargetRows = readNotes().length;
+  await js(`(() => {
+    const btn = document.querySelector(${JSON.stringify(SEL.staleRefresh)});
+    if (!btn) throw new Error("stale refresh button not found");
+    btn.click();
+    btn.click();
+    return true;
+  })()`);
+  const inflightLoadDelta = (await loadCalls()) - inflightLoadBase;
+  await waitFor("在途刷新后提示消失", `!document.querySelector(${JSON.stringify(SEL.staleRow)})`);
+  await waitFor("在途刷新后列表与文件一致", `document.querySelectorAll(${JSON.stringify(SEL.noteRow)}).length === ${inflightTargetRows}`);
+  await setLoadDelay(0);
+  const inflightRows = await countOf(SEL.noteRow);
+  record(
+    "r14-notes-stale-failure",
+    { phase: "inflight-guard", loadDelta: inflightLoadDelta, staleAfter: await has(SEL.staleRow), rows: inflightRows, fileRows: readNotes().length },
+    [
+      ...(inflightLoadDelta === 1 ? [] : [`在途双击必须只发一次 IPC：${inflightLoadDelta}`]),
+      ...((await has(SEL.staleRow)) === false && inflightRows === readNotes().length
+        ? []
+        : [`在途刷新落地后应清标记且列表与文件一致：stale=${await has(SEL.staleRow)} rows=${inflightRows} file=${readNotes().length}`]),
+    ],
+  );
+
+  // --- r14-5 组头跳转：当前文档零副作用 / 非当前文档跳转 -------------------------
+  log("r14-5 组头跳转（当前文档零副作用 / 非当前文档跳转）");
+  await enterNotesProbe();
+  const currentHead = await js(`(() => {
+    const head = document.querySelector(".notes-group .notes-group-head");
+    return head ? { openable: head.classList.contains("is-openable"), cursor: getComputedStyle(head).cursor, title: head.getAttribute("title") } : null;
+  })()`);
+  const noopHashBefore = notesHash();
+  const noopGroupsBefore = await groupPaths();
+  await js(`(() => {
+    const head = document.querySelector(".notes-group .notes-group-head");
+    const name = head ? head.querySelector(${JSON.stringify(SEL.groupName)}) : null;
+    if (!name) throw new Error("current group name not found");
+    name.click();
+    return true;
+  })()`);
+  await sleep(300);
+  const noopPill = await textOf(SEL.centerDocLabel);
+  const noopPage = await pageLabel();
+  const noopGroupsAfter = await groupPaths();
+  const noopHashSame = notesHash() === noopHashBefore;
+  record(
+    "r14-group-jump",
+    {
+      phase: "current-noop",
+      openable: currentHead.openable,
+      cursor: currentHead.cursor,
+      title: currentHead.title,
+      pillLabel: noopPill,
+      pageLabel: noopPage,
+      hashSame: noopHashSame,
+      groupsSame: JSON.stringify(noopGroupsAfter) === JSON.stringify(noopGroupsBefore),
+    },
+    [
+      ...(currentHead && currentHead.openable === false && currentHead.cursor !== "pointer" && currentHead.title === "sample-paper.pdf"
+        ? []
+        : [`当前文档组头不得有可点暗示：${JSON.stringify(currentHead)}`]),
+      ...(noopPill === "sample-paper.pdf" && (noopPage || "").includes("第 1 / 3 页") && noopHashSame && JSON.stringify(noopGroupsAfter) === JSON.stringify(noopGroupsBefore)
+        ? []
+        : [`点当前文档组头必须零副作用：${JSON.stringify({ pill: noopPill, page: noopPage, hashSame: noopHashSame, groups: noopGroupsAfter })}`]),
+    ],
+  );
+
+  const otherHead = await js(`(() => {
+    const heads = Array.from(document.querySelectorAll(".notes-group-head"));
+    const head = heads.find((el) => (el.getAttribute("title") || "").includes("archive/older-paper.pdf"));
+    return head ? { openable: head.classList.contains("is-openable"), cursor: getComputedStyle(head).cursor, title: head.getAttribute("title") } : null;
+  })()`);
+  const jumpHashBefore = notesHash();
+  const jumpLoadBase = await loadCalls();
+  const jumpStatBase = (await statCalls()).count;
+  await js(`(() => {
+    const heads = Array.from(document.querySelectorAll(".notes-group-head"));
+    const head = heads.find((el) => (el.getAttribute("title") || "").includes("archive/older-paper.pdf"));
+    const name = head ? head.querySelector(${JSON.stringify(SEL.groupName)}) : null;
+    if (!name) throw new Error("other group name not found");
+    name.click();
+    return true;
+  })()`);
+  await waitPdfLoaded();
+  await waitPage(1, 2);
+  const jumpPill = await textOf(SEL.centerDocLabel);
+  const jumpPage = await pageLabel();
+  const jumpFirstGroup = await js(`(() => {
+    const head = document.querySelector(".notes-group .notes-group-head");
+    return head ? { title: head.getAttribute("title"), chip: !!head.querySelector(".v-chip"), openable: head.classList.contains("is-openable") } : null;
+  })()`);
+  const jumpRows = await countOf(SEL.noteRow);
+  const jumpHashSame = notesHash() === jumpHashBefore;
+  const jumpLoadDelta = (await loadCalls()) - jumpLoadBase;
+  const jumpStatDelta = (await statCalls()).count - jumpStatBase;
+  await capturePage(win, "r14-5-group-jump.png");
+  record(
+    "r14-group-jump",
+    {
+      phase: "jump-other-doc",
+      openable: otherHead.openable,
+      cursor: otherHead.cursor,
+      pillLabel: jumpPill,
+      pageLabel: jumpPage,
+      firstGroup: jumpFirstGroup,
+      rows: jumpRows,
+      hashSame: jumpHashSame,
+      loadDelta: jumpLoadDelta,
+      statDelta: jumpStatDelta,
+    },
+    [
+      ...(otherHead && otherHead.openable === true && otherHead.cursor === "pointer" ? [] : [`非当前文档组头应可点：${JSON.stringify(otherHead)}`]),
+      ...(jumpPill === "older-paper.pdf" && (jumpPage || "").includes("第 1 / 2 页")
+        ? []
+        : [`跳转未落到目标文档：pill=${jumpPill} page=${jumpPage}`]),
+      ...(jumpFirstGroup && jumpFirstGroup.title === "archive/older-paper.pdf" && jumpFirstGroup.chip === true && jumpFirstGroup.openable === false
+        ? []
+        : [`分组未随当前文档重排：${JSON.stringify(jumpFirstGroup)}`]),
+      ...(jumpRows === 4 && jumpHashSame && jumpLoadDelta === 0 && jumpStatDelta === 0
+        ? []
+        : [`跳转不得读写笔记：rows=${jumpRows} hashSame=${jumpHashSame} load=${jumpLoadDelta} stat=${jumpStatDelta}`]),
     ],
   );
 

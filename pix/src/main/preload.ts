@@ -23,6 +23,7 @@ import type {
   ReaderNotesReportInput,
   ReaderNotesReportResult,
   ReaderNotesResetResult,
+  ReaderNotesStatResult,
   ReaderStateLoadResult,
   ReaderStateSaveDraft,
   ReaderStateSaveResult,
@@ -76,6 +77,7 @@ export interface PixApi {
   notesExport: () => Promise<ReaderNotesExportResult>;
   notesExportReport: (input: ReaderNotesReportInput) => Promise<ReaderNotesReportResult>;
   notesReset: () => Promise<ReaderNotesResetResult>;
+  notesStat: () => Promise<ReaderNotesStatResult>;
 
   // Reader state (workspace .pix-read/reader-state.json)
   readerStateLoad: () => Promise<ReaderStateLoadResult>;
@@ -167,6 +169,7 @@ const api: PixApi = {
   notesExportReport: (input: ReaderNotesReportInput) =>
     ipcRenderer.invoke("notes-export-report", input) as Promise<ReaderNotesReportResult>,
   notesReset: () => ipcRenderer.invoke("notes-reset") as Promise<ReaderNotesResetResult>,
+  notesStat: () => ipcRenderer.invoke("notes-stat") as Promise<ReaderNotesStatResult>,
 
   readerStateLoad: () => ipcRenderer.invoke("reader-state-load") as Promise<ReaderStateLoadResult>,
   readerStateSave: (draft: ReaderStateSaveDraft) =>

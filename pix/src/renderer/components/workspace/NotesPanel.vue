@@ -7,10 +7,11 @@
  * This component never builds storage paths: notes.json lives wherever the
  * main process put it (notesStore.notesFilePath is display-only).
  */
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useNotesStore } from "../../stores/notes-store";
 import { emitNotesAsk } from "../../composables/useQuickAsk";
 import { docDisplayName } from "../../utils/notes-path";
+import type { NoteGroup } from "../../utils/notes-path";
 import {
   buildNoteCopyFragment,
   resolveListEmptyReason,
@@ -51,6 +52,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "open-note": [note: ReaderNote];
+  "open-note-doc": [docPath: string];
 }>();
 
 const notesStore = useNotesStore();
@@ -67,6 +69,8 @@ const exportingReport = ref(false);
 const recovering = ref(false);
 /** 撤销在途守卫：只在 finally 复位，stale 分支不得让按钮永久禁用。 */
 const restoring = ref(false);
+/** 外部改动提示行的刷新在途守卫：只在 finally 复位（与 restoring 同处）。 */
+const refreshing = ref(false);
 const copiedNoteId = ref<string | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
 
@@ -412,7 +416,34 @@ function retryLoad(): void {
   void notesStore.loadNotes();
 }
 
+/** 刷新的唯一动作：既有读盘语义（status=loading → 覆盖列表 → 成功后清标记）；只读，不发任何写 IPC。 */
+async function onRefreshNotes(): Promise<void> {
+  if (refreshing.value) return; // 在途第二次点击零副作用（不发第二次 IPC）
+  refreshing.value = true;
+  try {
+    await notesStore.loadNotes();
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+/** 窗口重新获得焦点即检测（window 级 focus 只在窗口激活时派发，面板内输入框聚焦不会误报）。 */
+function onWindowFocus(): void {
+  void notesStore.checkNotesFile();
+}
+
+/** 非当前文档组头跳转：只换文档，不切标签 / 不写盘 / 不发任何笔记 IPC。 */
+function onGroupOpen(group: NoteGroup): void {
+  if (group.isCurrentDoc) return;
+  emit("open-note-doc", group.docPath);
+}
+
+onMounted(() => {
+  window.addEventListener("focus", onWindowFocus);
+});
+
 onBeforeUnmount(() => {
+  window.removeEventListener("focus", onWindowFocus);
   if (noticeTimer) {
     clearTimeout(noticeTimer);
     noticeTimer = null;
@@ -540,6 +571,22 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
+    <div v-if="notesStore.externalChange" class="notes-stale">
+      <span class="stale-text">笔记文件已被外部修改，面板内容可能过期</span>
+      <v-btn
+        class="stale-refresh"
+        size="x-small"
+        variant="text"
+        prepend-icon="mdi-refresh"
+        title="重新读取笔记文件"
+        :loading="refreshing"
+        :disabled="refreshing"
+        @click="onRefreshNotes"
+      >
+        刷新
+      </v-btn>
+    </div>
+
     <div v-if="notesStore.pendingUndo" class="notes-undo">
       <span class="undo-text">已删除「{{ undoSnippet }}」· 第 {{ notesStore.pendingUndo.page }} 页</span>
       <button type="button" class="notes-undo-btn" title="还原这条笔记" :disabled="restoring" @click="onUndoClick">
@@ -618,7 +665,7 @@ onBeforeUnmount(() => {
 
     <div v-else class="notes-list">
       <div v-for="group in notesStore.groups" :key="group.key" class="notes-group">
-        <div class="notes-group-head" :title="group.docPath">
+        <div class="notes-group-head" :class="{ 'is-openable': !group.isCurrentDoc }" :title="group.docPath" @click="onGroupOpen(group)">
           <div class="group-titles">
             <span class="group-name">{{ group.displayName }}</span>
             <span v-if="group.docPath !== group.displayName" class="group-path">{{ group.docPath }}</span>
@@ -1027,6 +1074,27 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 
+/* 外部改动提示行：盒模型逐字对齐撤销行（同 margin / padding / 边框 / 圆角 / 背景）；刷新按钮保持 Vuetify x-small text 形态。 */
+.notes-stale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 10px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: var(--pix-radius-md);
+  background: var(--pix-bg-elevated, #ffffff);
+}
+
+.stale-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
+  word-break: break-word;
+}
+
 .notes-export-row {
   display: flex;
   align-items: center;
@@ -1186,6 +1254,15 @@ onBeforeUnmount(() => {
   padding: 4px 6px;
   /* 组头与组内卡片正文同为 12px，靠分隔线拉开分组层级 */
   border-bottom: 1px solid var(--pix-border-light, #e3eaf0);
+}
+
+/* 非当前文档组头可点击：只给指针与悬停变色，几何与既有组名字 / 路径 / 计数零变化 */
+.notes-group-head.is-openable {
+  cursor: pointer;
+}
+
+.notes-group-head.is-openable:hover .group-name {
+  color: var(--pix-text-link, #314b5f);
 }
 
 .group-titles {

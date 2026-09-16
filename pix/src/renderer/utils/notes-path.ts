@@ -63,6 +63,26 @@ export function matchesChapterFilter(note: ReaderNote, docKey: string | null, ra
   return range === null || rangeContains(range, note.page);
 }
 
+export interface NotesBadgeCount {
+  total: number;
+  excerpt: number;
+  answer: number;
+}
+
+/** 按文档聚合的笔记计数（R14 树徽标唯一派生）：单次遍历、键 = docPathKey、只产出 total > 0 的文档、每次返回新 Map。 */
+export function countNotesByDocument(notes: ReaderNote[]): Map<string, NotesBadgeCount> {
+  const counts = new Map<string, NotesBadgeCount>();
+  for (const note of notes) {
+    const key = docPathKey(note.docPath);
+    const current = counts.get(key) ?? { total: 0, excerpt: 0, answer: 0 };
+    current.total += 1;
+    if (note.kind === "answer") current.answer += 1;
+    else current.excerpt += 1;
+    counts.set(key, current);
+  }
+  return counts;
+}
+
 /** 分组顺序：当前文档组置顶 → 其余按 key 升序；组内 page 升序 → 同页 createdAt 升序。 */
 export function groupNotesByDocument(
   notes: ReaderNote[],

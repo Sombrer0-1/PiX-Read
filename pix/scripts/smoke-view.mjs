@@ -77,10 +77,27 @@ const LEGACY_TAIL = "</reading_context>\n\nQ";
 /** 旧格式（无 section 行）的逐字期望。 */
 const legacyPayload = () => `<reading_context>\npath: ${FILE_PATH}\npage: 2\npageCount: ${SAMPLE_PAGE_COUNT}\n${LEGACY_TAIL}`;
 
+// ── badge-counts 夹具（手写；期望值不由被测函数生成） ────────────────────
+
+/** 标准 4 条（与 ui-shot 的 seedNotes 同构：sample 3 = 摘录 2 + AI 结论 1；archive 1 = 摘录 1）。 */
+const BADGE_SEED = [
+  { id: "n-current-1", kind: "excerpt", docPath: "sample-paper.pdf", page: 1, text: "badge seed p1", comment: "", createdAt: 1, updatedAt: 1 },
+  { id: "n-current-2", kind: "excerpt", docPath: "sample-paper.pdf", page: 2, text: "badge seed p2", comment: "", createdAt: 2, updatedAt: 2 },
+  { id: "n-current-3", kind: "answer", docPath: "sample-paper.pdf", page: 2, text: "badge seed answer", comment: "", createdAt: 3, updatedAt: 3 },
+  { id: "n-other-1", kind: "excerpt", docPath: "archive/older-paper.pdf", page: 7, text: "badge seed archive", comment: "", createdAt: 4, updatedAt: 4 },
+];
+/** 比较键归一：大小写不同与尾反斜杠必须合并为同一键。 */
+const BADGE_CASE = [
+  { id: "c-1", kind: "excerpt", docPath: "sample-paper.pdf", page: 1, text: "case 1", comment: "", createdAt: 5, updatedAt: 5 },
+  { id: "c-2", kind: "excerpt", docPath: "Sample-Paper.PDF", page: 2, text: "case 2", comment: "", createdAt: 6, updatedAt: 6 },
+  { id: "c-3", kind: "answer", docPath: "sample-paper.pdf\\", page: 3, text: "case 3", comment: "", createdAt: 7, updatedAt: 7 },
+];
+
 let passed = 0;
 let failed = 0;
 let outlineNotes = null;
 let readingContext = null;
+let notesPath = null;
 
 function group(name) {
   console.log(`== 组 ${name} ==`);
@@ -408,6 +425,82 @@ function runSectionFormat() {
   check(G, 5, "filePath: null ⇒ 返回 userText 原样（既有早退语义，不注入任何上下文）", noFilePath === "Q", JSON.stringify(noFilePath));
 }
 
+/**
+ * 组 badge-counts（R14）：树徽标唯一派生 countNotesByDocument 的计数口径。
+ * 每条的期望值均手写（不由被测函数生成）；入参夹具在 §断言#6 后复核逐字未变。
+ */
+function runBadgeCounts() {
+  const G = "badge-counts";
+  group(G);
+
+  const seedCounts = notesPath.countNotesByDocument(BADGE_SEED);
+  const sample = seedCounts.get("sample-paper.pdf");
+  const older = seedCounts.get("archive/older-paper.pdf");
+  check(
+    G,
+    1,
+    "标准种子 ⇒ 2 个文档键；sample-paper.pdf {total:3, excerpt:2, answer:1}、archive/older-paper.pdf {total:1, excerpt:1, answer:0}",
+    seedCounts.size === 2 &&
+      !!sample && sample.total === 3 && sample.excerpt === 2 && sample.answer === 1 &&
+      !!older && older.total === 1 && older.excerpt === 1 && older.answer === 0,
+    JSON.stringify({ size: seedCounts.size, sample, older }),
+  );
+
+  const emptyCounts = notesPath.countNotesByDocument([]);
+  check(G, 2, "空数组 ⇒ 空 Map（size === 0、不抛错）", emptyCounts.size === 0, JSON.stringify({ size: emptyCounts.size }));
+
+  const fiveCounts = notesPath.countNotesByDocument([
+    ...BADGE_SEED,
+    { id: "n-current-4", kind: "answer", docPath: "sample-paper.pdf", page: 3, text: "badge seed extra", comment: "", createdAt: 5, updatedAt: 5 },
+  ]);
+  check(
+    G,
+    3,
+    "只产出 total > 0 的文档：5 条 / 2 个文档 ⇒ size === 2 且 reading-notes.md 无键",
+    fiveCounts.size === 2 && fiveCounts.get("reading-notes.md") === undefined,
+    JSON.stringify({ size: fiveCounts.size, keys: [...fiveCounts.keys()] }),
+  );
+
+  const caseCounts = notesPath.countNotesByDocument(BADGE_CASE);
+  const caseSample = caseCounts.get("sample-paper.pdf");
+  check(
+    G,
+    4,
+    "比较键归一：大小写不同 / 尾反斜杠合并为同一键 ⇒ size === 1、total 3、excerpt 2、answer 1",
+    caseCounts.size === 1 && !!caseSample && caseSample.total === 3 && caseSample.excerpt === 2 && caseSample.answer === 1,
+    JSON.stringify({ size: caseCounts.size, sample: caseSample, keys: [...caseCounts.keys()] }),
+  );
+
+  const mixedCounts = notesPath.countNotesByDocument([
+    { id: "m-1", kind: "excerpt", docPath: "sample-paper.pdf", page: 1, text: "m1", comment: "", createdAt: 1, updatedAt: 1 },
+    { id: "m-2", kind: "excerpt", docPath: "sample-paper.pdf", page: 2, text: "m2", comment: "", createdAt: 2, updatedAt: 2 },
+    { id: "m-3", kind: "excerpt", docPath: "sample-paper.pdf", page: 3, text: "m3", comment: "", createdAt: 3, updatedAt: 3 },
+    { id: "m-4", kind: "answer", docPath: "sample-paper.pdf", page: 4, text: "m4", comment: "", createdAt: 4, updatedAt: 4 },
+    { id: "m-5", kind: "answer", docPath: "sample-paper.pdf", page: 5, text: "m5", comment: "", createdAt: 5, updatedAt: 5 },
+  ]);
+  const mixed = mixedCounts.get("sample-paper.pdf");
+  check(
+    G,
+    5,
+    "恒等式：同一文档 3 摘录 + 2 结论 ⇒ total === 5 === excerpt + answer",
+    !!mixed && mixed.total === 5 && mixed.excerpt === 3 && mixed.answer === 2 && mixed.total === mixed.excerpt + mixed.answer,
+    JSON.stringify(mixed),
+  );
+
+  const inputBefore = JSON.stringify(BADGE_SEED);
+  const first = notesPath.countNotesByDocument(BADGE_SEED);
+  const second = notesPath.countNotesByDocument(BADGE_SEED);
+  first.get("sample-paper.pdf").total = 99;
+  const inputAfter = JSON.stringify(BADGE_SEED);
+  check(
+    G,
+    6,
+    "输入零改动 + 每次返回新 Map：入参 JSON 逐字不变、first !== second、改第一次结果不影响第二次",
+    inputBefore === inputAfter && first !== second && second.get("sample-paper.pdf").total === 3,
+    JSON.stringify({ inputSame: inputBefore === inputAfter, distinct: first !== second, secondTotal: second.get("sample-paper.pdf").total }),
+  );
+}
+
 /** 编译仓库内三个源文件到 %TEMP%（不复制源码），校验产物集合后加载。 */
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
@@ -464,6 +557,7 @@ function compileAndLoad() {
   const require = createRequire(import.meta.url);
   outlineNotes = require(join(OUT_DIR, "renderer", "utils", "outline-notes.js"));
   readingContext = require(join(OUT_DIR, "renderer", "utils", "reading-context.js"));
+  notesPath = require(join(OUT_DIR, "renderer", "utils", "notes-path.js"));
   return true;
 }
 
@@ -476,6 +570,7 @@ function main() {
       runSectionNull();
       runSectionNav();
       runSectionFormat();
+      runBadgeCounts();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;

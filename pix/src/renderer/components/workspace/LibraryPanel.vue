@@ -8,6 +8,8 @@
 import { computed, ref, watch } from "vue";
 import type { LibraryNode } from "@/types/rpc";
 import { useReaderStateStore } from "../../stores/reader-state-store";
+import { useNotesStore } from "../../stores/notes-store";
+import { countNotesByDocument, currentDocKey } from "../../utils/notes-path";
 
 const props = defineProps<{
   rootDir: string;
@@ -29,6 +31,7 @@ const isLoading = ref(false);
 const errorText = ref<string | null>(null);
 
 const readerStateStore = useReaderStateStore();
+const notesStore = useNotesStore();
 
 const rows = computed(() => flattenVisible(tree.value, 0, expanded.value));
 /** 行徽标：只有 PDF 行有阅读现场；键用树节点自己的 path（不引入第二套键实现）。 */
@@ -41,6 +44,16 @@ const progressMap = computed(() => {
   }
   return map;
 });
+
+/** 聚合结果：仅随 notes 列表变化重算（Vue computed memo；面板与树读同一份事实）。 */
+const noteCountMap = computed(() => countNotesByDocument(notesStore.notes));
+/** 行 + 徽标：键与树节点同源（currentDocKey）；每行恰一次 Map.get；0 命中 / 目录行 ⇒ null（不渲染）。 */
+const rowsWithBadge = computed(() =>
+  rows.value.map((row) => {
+    const key = row.node.type === "file" ? currentDocKey(row.node.path, props.rootDir) : null;
+    return { ...row, badge: key === null ? null : noteCountMap.value.get(key) ?? null };
+  }),
+);
 
 watch(
   () => props.rootDir,
@@ -148,7 +161,7 @@ function chevronFor(node: LibraryNode): string {
     <div class="panel-scroll">
       <div class="tree-section">
         <button
-          v-for="row in rows"
+          v-for="row in rowsWithBadge"
           :key="row.node.path"
           class="tree-row"
           :class="{ selected: isSelected(row.node) }"
@@ -162,6 +175,9 @@ function chevronFor(node: LibraryNode): string {
           <span v-else class="row-chevron-spacer"></span>
           <v-icon size="16" class="row-icon">{{ iconFor(row.node) }}</v-icon>
           <span class="row-label">{{ row.node.name }}</span>
+          <span v-if="row.badge" class="row-notes" :title="`摘录 ${row.badge.excerpt} 条 · AI 结论 ${row.badge.answer} 条`">
+            {{ row.badge.total }} 条
+          </span>
           <span v-if="progressMap.has(row.node.path)" class="row-progress">
             第 {{ progressMap.get(row.node.path) }} 页
           </span>
@@ -253,6 +269,18 @@ function chevronFor(node: LibraryNode): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 笔记计数：行内唯一可收缩项——缺口全部由它承担（份额压到 0 亚像素以内 ⇒ 行名零位移），空间不足时右端硬裁切（数字在最左优先保留），不用省略号 */
+.row-notes {
+  flex-shrink: 10000;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  padding: 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--pix-text-secondary);
 }
 
 /* 进度徽标不参与收缩（min-width + flex-shrink），否则窄栏下会被行名挤没 */

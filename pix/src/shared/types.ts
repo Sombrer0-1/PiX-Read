@@ -388,6 +388,17 @@ export interface ReaderNotesLoadResult {
   error?: string;
 }
 
+/** 笔记文件指纹：只读的最小事实（不解析内容、不改文件）；失败时 success=false 且事实字段归零。 */
+export interface ReaderNotesStatResult {
+  success: boolean;
+  exists: boolean;
+  size: number;
+  mtimeMs: number;
+  hash: string;
+  code?: ReaderNotesErrorCode;
+  error?: string;
+}
+
 /** Mutations return the authoritative full list; `duplicateOf` marks a dedup hit (no new note). */
 export interface ReaderNotesMutationResult {
   success: boolean;

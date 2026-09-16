@@ -44,6 +44,8 @@ const REPORT_ARCHIVE_A = join(REPORTS_ARCHIVE_A, "older-paper.pdf.md");
 const REPORT_COMMENT = "与第 3 节消融实验对照";
 const ARCHIVE_TEXT = "Archive excerpt for the subdirectory report.";
 const OUT_OF_RANGE_TEXT = "Out-of-range excerpt: this page is beyond the document page count.";
+/** R14：notes-stat 的外部改写正文（手写常量，与既有夹具正文不重复）。 */
+const STAT_NOTE_TEXT = "external append for stat";
 /** 唯一非确定性字段的归一化（与离屏脚本逐字同一条表达式）。 */
 const STAMP_RE = /生成时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/;
 const normalizeStamp = (text) => text.replace(STAMP_RE, "生成时间：<STAMP>");
@@ -915,6 +917,143 @@ function runReportFailures() {
   );
 }
 
+/**
+ * notes-stat（R14，7 条）：只读指纹的返回面五情形 + 只读/幂等 + 不解析内容。
+ * 前置：compileAndLoad() 收尾已 clearLibraryRoot() ⇒ #1 直接断言无根；#2 起先 setLibraryRoot(WS_A)。
+ */
+function runNotesStat() {
+  const G = "notes-stat";
+  group(G);
+
+  libraryRoot.clearLibraryRoot();
+  const noRoot = notesStore.statNotesFile();
+  check(
+    G,
+    1,
+    "无根 ⇒ no-root + 逐字「尚未选择资料库根目录」+ 事实字段全零",
+    noRoot.success === false &&
+      noRoot.code === "no-root" &&
+      noRoot.error === "尚未选择资料库根目录" &&
+      noRoot.exists === false &&
+      noRoot.size === 0 &&
+      noRoot.mtimeMs === 0 &&
+      noRoot.hash === "",
+    JSON.stringify(noRoot),
+  );
+
+  libraryRoot.setLibraryRoot(WS_A);
+  rmSync(NOTES_A, { force: true });
+  const missing = notesStore.statNotesFile();
+  check(
+    G,
+    2,
+    "文件缺失 ⇒ exists:false 的成功统计（hash 空、事实字段归零）且不建文件",
+    missing.success === true &&
+      missing.exists === false &&
+      missing.hash === "" &&
+      missing.size === 0 &&
+      missing.mtimeMs === 0 &&
+      existsSync(NOTES_A) === false,
+    JSON.stringify({ result: missing, fileExists: existsSync(NOTES_A) }),
+  );
+
+  seedReportNotes(DOC_A);
+  const bytes3 = readFileSync(NOTES_A);
+  const stat3 = notesStore.statNotesFile();
+  check(
+    G,
+    3,
+    "正常文件 ⇒ exists:true + size = 真实字节数 + mtimeMs > 0 + hash = 原始字节 sha256",
+    stat3.success === true &&
+      stat3.exists === true &&
+      stat3.size === bytes3.length &&
+      stat3.mtimeMs > 0 &&
+      stat3.hash === sha256(bytes3),
+    JSON.stringify({ result: stat3, size: bytes3.length, hash: sha256(bytes3) }),
+  );
+
+  const appended = [
+    ...readFileNotes(),
+    {
+      id: "n-stat-1",
+      kind: "excerpt",
+      docPath: "sample-paper.pdf",
+      page: 1,
+      text: STAT_NOTE_TEXT,
+      comment: "",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+  ];
+  writeFileSync(NOTES_A, serialize(appended), "utf8");
+  const bytes4 = readFileSync(NOTES_A);
+  const stat4 = notesStore.statNotesFile();
+  check(
+    G,
+    4,
+    "外部改写 ⇒ hash 逐字等于新字节 sha256、与改写前不同、size 随新字节变化",
+    stat4.success === true &&
+      stat4.exists === true &&
+      stat4.hash === sha256(bytes4) &&
+      stat4.hash !== stat3.hash &&
+      stat4.size === bytes4.length &&
+      stat4.size !== stat3.size,
+    JSON.stringify({ hash: stat4.hash, hashBefore: stat3.hash, size: stat4.size, sizeBefore: stat3.size }),
+  );
+
+  const snapshot5 = () => ({
+    notesJson: sha256(readFileSync(NOTES_A)),
+    notesMd: existsSync(NOTES_MD_A) ? sha256(readFileSync(NOTES_MD_A)) : null,
+    entries: readdirSync(PIX_READ_A).sort(),
+  });
+  const before5 = snapshot5();
+  const stat5a = notesStore.statNotesFile();
+  const stat5b = notesStore.statNotesFile();
+  const after5 = snapshot5();
+  check(
+    G,
+    5,
+    "只读与幂等：连续两次 hash 相同，且 notes.json / notes.md（若存在）/ .pix-read 条目集合逐字不变",
+    stat5a.hash === stat5b.hash &&
+      stat5a.hash === stat4.hash &&
+      after5.notesJson === before5.notesJson &&
+      after5.notesMd === before5.notesMd &&
+      JSON.stringify(after5.entries) === JSON.stringify(before5.entries),
+    JSON.stringify({ first: stat5a, second: stat5b, before: before5, after: after5 }),
+  );
+
+  writeFileSync(NOTES_A, "not-json\n", "utf8");
+  const notJsonBytes = Buffer.from("not-json\n");
+  const stat6 = notesStore.statNotesFile();
+  check(
+    G,
+    6,
+    "内容损坏（非 JSON）⇒ 照常 success:true + exists:true + 原始字节 sha256（不返回 corrupt / version-unsupported）",
+    stat6.success === true &&
+      stat6.exists === true &&
+      stat6.hash === sha256(notJsonBytes) &&
+      stat6.size === notJsonBytes.length &&
+      stat6.code === undefined &&
+      stat6.error === undefined,
+    JSON.stringify(stat6),
+  );
+
+  rmSync(NOTES_A, { force: true });
+  const deleted = notesStore.statNotesFile();
+  check(
+    G,
+    7,
+    "删除后 ⇒ exists:false 的成功统计（hash 空、事实字段归零）且不重建文件",
+    deleted.success === true &&
+      deleted.exists === false &&
+      deleted.hash === "" &&
+      deleted.size === 0 &&
+      deleted.mtimeMs === 0 &&
+      existsSync(NOTES_A) === false,
+    JSON.stringify({ result: deleted, fileExists: existsSync(NOTES_A) }),
+  );
+}
+
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
   mkdirSync(WS_A, { recursive: true });
@@ -985,6 +1124,7 @@ function main() {
       runReportRender();
       runReportFiles();
       runReportFailures();
+      runNotesStat();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;

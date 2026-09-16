@@ -15,6 +15,7 @@ import type {
   ReaderNotesErrorCode,
   ReaderNotesMutationResult,
   ReaderNotesReportChapter,
+  ReaderNotesStatResult,
 } from "@shared/types";
 import type { PixApi } from "../../main/preload";
 import { useReaderStore } from "./reader-store";
@@ -108,6 +109,9 @@ export const useNotesStore = defineStore("notes", () => {
   /** 撤销行只存展示与时限四项；还原载荷完全由主进程槽提供（渲染层无法伪造正文）。 */
   const pendingUndo = ref<PendingUndo | null>(null);
 
+  /** 外部改动标记：只在 store 内部改写；唯一渲染条件 = 面板提示行的 v-if。 */
+  const externalChange = ref(false);
+
   /**
    * 章节过滤：视图状态，非消费式（持续生效直到显式清除或文档作用域失效）；
    * label 只接受 buildChapterRanges 的产出，不在本文件拼第二份页码文本。
@@ -129,6 +133,10 @@ export const useNotesStore = defineStore("notes", () => {
   let undoScope = 0;
   /** 报告作用域令牌：与 undoScope 同处同语义（跨工作区/跨文档的在途报告一律丢弃）。 */
   let reportScope = 0;
+  /** 指纹请求序号（R14）：响应落地时序号已变即丢弃（resetNotes() 递增 ⇒ 跨工作区在途作废）。 */
+  let notesFileSeq = 0;
+  /** 指纹基线（R14）：null = 尚未捕获（比对时按捕获处理）；"" = 文件缺失；其余 = sha256 十六进制。 */
+  let notesFingerprint: string | null = null;
 
   const totalCount = computed(() => notes.value.length);
   const hasNotes = computed(() => notes.value.length > 0);
@@ -181,6 +189,39 @@ export const useNotesStore = defineStore("notes", () => {
       errorCode.value = null;
       errorDetail.value = "";
     }
+    externalChange.value = false;
+    void syncNotesFile("capture");
+  }
+
+  /**
+   * 指纹同步（唯一入口）：capture = 重新对标；compare = 置 / 清 externalChange。
+   * 失败静默：IPC reject、success !== true、非字符串 hash 三种情形一律 return（保持现状：不置位、不清除、不弹错、不写日志）。
+   */
+  async function syncNotesFile(mode: "capture" | "compare"): Promise<void> {
+    const seq = ++notesFileSeq;
+    let result: ReaderNotesStatResult;
+    try {
+      result = await bridge().notesStat();
+    } catch {
+      return;
+    }
+    if (seq !== notesFileSeq) return;
+    if (!result || result.success !== true || typeof result.hash !== "string") return;
+    const fingerprint = result.exists ? result.hash : "";
+    if (mode === "capture") {
+      notesFingerprint = fingerprint;
+      return;
+    }
+    if (notesFingerprint === null) {
+      notesFingerprint = fingerprint;
+      return;
+    }
+    externalChange.value = fingerprint !== notesFingerprint;
+  }
+
+  /** 检测入口（面板焦点监听唯一调用点）。 */
+  async function checkNotesFile(): Promise<void> {
+    await syncNotesFile("compare");
   }
 
   async function loadNotes(): Promise<void> {
@@ -201,6 +242,8 @@ export const useNotesStore = defineStore("notes", () => {
         status.value = "ready";
         errorCode.value = null;
         errorDetail.value = "";
+        externalChange.value = false;
+        void syncNotesFile("capture");
         return;
       }
       status.value = "error";
@@ -345,6 +388,8 @@ export const useNotesStore = defineStore("notes", () => {
       status.value = "ready";
       errorCode.value = null;
       errorDetail.value = "";
+      externalChange.value = false;
+      void syncNotesFile("capture");
       return { ok: true };
     } catch (err) {
       return { ok: false, message: rejectMessage(err) };
@@ -356,6 +401,9 @@ export const useNotesStore = defineStore("notes", () => {
     loadSeq += 1;
     undoScope += 1;
     reportScope += 1;
+    notesFileSeq += 1;
+    notesFingerprint = null;
+    externalChange.value = false;
     notes.value = [];
     status.value = "idle";
     errorCode.value = null;
@@ -446,6 +494,7 @@ export const useNotesStore = defineStore("notes", () => {
     searchActive,
     sortMode,
     pendingUndo,
+    externalChange,
     visibleCount,
     chapterFilter,
     chapterFocusToken,
@@ -460,6 +509,7 @@ export const useNotesStore = defineStore("notes", () => {
     groups,
     errorMessage,
     loadNotes,
+    checkNotesFile,
     addNote,
     updateNoteComment,
     removeNote,

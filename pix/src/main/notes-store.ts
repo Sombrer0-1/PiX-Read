@@ -7,8 +7,8 @@
  * 写入协议：mkdir → 写 <target>.tmp → renameSync 覆盖；失败清理 tmp、原文件不动。
  */
 
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getLibraryRoot, isLibraryFilePath, isPathInsideDirectory } from "./library-root.js";
 import type {
@@ -24,6 +24,7 @@ import type {
   ReaderNotesReportInput,
   ReaderNotesReportResult,
   ReaderNotesResetResult,
+  ReaderNotesStatResult,
 } from "../shared/types.js";
 
 const NOTES_DIR_NAME = ".pix-read";
@@ -548,4 +549,29 @@ export function resetCorruptNotes(): ReaderNotesResetResult {
   // 重建语义 = 从空库开始：把重建前删除的条目悄悄写回会让用户以为重建失败
   undoSlot = null;
   return { success: true, notes: [], backupPath };
+}
+
+/**
+ * 笔记文件指纹（R14）：只读的最小事实 —— 不解析内容、不建目录/文件、不改 mtime、永不抛错。
+ * 判定顺序：无根 → 读文件（ENOENT ⇒ exists:false 的成功统计；其余失败 ⇒ read-failed）→ sha256 原始字节。
+ */
+export function statNotesFile(): ReaderNotesStatResult {
+  const paths = notesPaths();
+  if (!paths) {
+    return { success: false, exists: false, size: 0, mtimeMs: 0, hash: "", code: "no-root", error: ERROR_MESSAGES["no-root"] };
+  }
+  try {
+    const bytes = readFileSync(paths.file);
+    const stat = statSync(paths.file);
+    return {
+      success: true,
+      exists: true,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      hash: createHash("sha256").update(bytes).digest("hex"),
+    };
+  } catch (err) {
+    if (isEnoent(err)) return { success: true, exists: false, size: 0, mtimeMs: 0, hash: "" };
+    return { success: false, exists: false, size: 0, mtimeMs: 0, hash: "", code: "read-failed", error: ERROR_MESSAGES["read-failed"] };
+  }
 }

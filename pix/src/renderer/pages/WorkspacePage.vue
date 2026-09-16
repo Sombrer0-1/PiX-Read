@@ -224,6 +224,11 @@ function onOpenNote(note: ReaderNote): void {
   }
 }
 
+/** 笔记组头跳转（组头载荷是工作区相对路径）：复用树行的打开路径，不切标签、不写盘。 */
+function onOpenNoteDoc(docPath: string): void {
+  openDocumentFromLibrary(absoluteDocPath(rootDir.value, docPath));
+}
+
 async function goHome(): Promise<void> {
   // 安全点 b：必须是第一条语句。session-stop 的 handler 末尾会 clearLibraryRoot()，
   // 之后发出的 save 只会拿到 no-root 并把最后现场静默丢掉。
@@ -288,6 +293,7 @@ async function goHome(): Promise<void> {
             :clarifying="pendingUserInput !== null"
             :document-open="readerStore.filePath !== null"
             @open-note="onOpenNote"
+            @open-note-doc="onOpenNoteDoc"
           />
         </div>
       </template>
