@@ -1228,6 +1228,13 @@ function runReaderStateStore() {
   group(G);
   libraryRoot.setLibraryRoot(WS_A);
   const STATE_A = join(PIX_READ_A, "reader-state.json");
+  // R18 夹具：会话文件为库外绝对路径（证明原样存取、不被相对化）
+  const SESS = join(TMP, "agent", "sessions", "session-a.jsonl");
+  const T = 1758000000000;
+  const SESS_B = join(TMP, "agent", "sessions", "session-b.jsonl");
+  const T_B = 1758000001000;
+  const hasOwn = (target, key) => Object.prototype.hasOwnProperty.call(target, key);
+  const writeStateA = (file) => writeFileSync(STATE_A, `${JSON.stringify(file, null, 2)}\n`, "utf8");
   const warns = [];
   const originalWarn = console.warn;
   console.warn = (...args) => {
@@ -1313,6 +1320,212 @@ function runReaderStateStore() {
       "F12-d read-failed ⇒ load degraded:true + save 拒写（code=read-failed，回归）",
       rfLoad.success === true && rfLoad.degraded === true && rfLoad.reason === "read-failed" && rfSave.success === false && rfSave.code === "read-failed",
       JSON.stringify({ rfLoad, rfSave }),
+    );
+    rmSync(STATE_A, { recursive: true, force: true });
+
+    // R18 #6：写入并回读（两键原样落盘，库外绝对路径不被相对化）
+    rmSync(STATE_A, { recursive: true, force: true });
+    warns.length = 0;
+    const savePair = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 2, scale: 1.2, lastSessionPath: SESS, lastSessionAt: T });
+    const savedEntry = savePair.state.documents["sample-paper.pdf"];
+    const diskPair = JSON.parse(readFileSync(STATE_A, "utf8")).documents["sample-paper.pdf"];
+    check(
+      G,
+      6,
+      "R18 #6 写入并回读：两键逐值相等（库外绝对路径原样）+ updatedAt 为 > 0 的有限数 + 磁盘条目同值 + warn 增量 0",
+      savePair.success === true &&
+        savedEntry.page === 2 &&
+        savedEntry.scale === 1.2 &&
+        savedEntry.lastSessionPath === SESS &&
+        savedEntry.lastSessionAt === T &&
+        Number.isFinite(savedEntry.updatedAt) &&
+        savedEntry.updatedAt > 0 &&
+        diskPair.page === 2 &&
+        diskPair.scale === 1.2 &&
+        diskPair.lastSessionPath === SESS &&
+        diskPair.lastSessionAt === T &&
+        diskPair.updatedAt === savedEntry.updatedAt &&
+        warns.length === 0,
+      JSON.stringify({ result: savePair.success, savedEntry, diskPair, warns }),
+    );
+
+    // R18 #7：未携带 ⇒ 保留既有对；其它条目一字不动
+    writeStateA({
+      version: 1,
+      lastDocPath: "sample-paper.pdf",
+      documents: {
+        "sample-paper.pdf": { page: 2, scale: 1.2, updatedAt: T, lastSessionPath: SESS, lastSessionAt: T },
+        "archive/older-paper.pdf": { page: 7, scale: 1, updatedAt: T, lastSessionPath: SESS_B, lastSessionAt: T_B },
+      },
+    });
+    warns.length = 0;
+    const saveKeep = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 3, scale: 1 });
+    const docsKeep = JSON.parse(readFileSync(STATE_A, "utf8")).documents;
+    check(
+      G,
+      7,
+      "R18 #7 未携带 ⇒ 保留：目标条目 page 已更新且两键逐字仍为 seed 值；第二条目（其它文档）两键与 page/scale 逐字不变；warn 增量 0",
+      saveKeep.success === true &&
+        docsKeep["sample-paper.pdf"].page === 3 &&
+        docsKeep["sample-paper.pdf"].scale === 1 &&
+        docsKeep["sample-paper.pdf"].lastSessionPath === SESS &&
+        docsKeep["sample-paper.pdf"].lastSessionAt === T &&
+        docsKeep["archive/older-paper.pdf"].page === 7 &&
+        docsKeep["archive/older-paper.pdf"].scale === 1 &&
+        docsKeep["archive/older-paper.pdf"].lastSessionPath === SESS_B &&
+        docsKeep["archive/older-paper.pdf"].lastSessionAt === T_B &&
+        warns.length === 0,
+      JSON.stringify({ result: saveKeep.success, documents: docsKeep, warns }),
+    );
+
+    // R18 #8：旧格式（无两键）零报错零 warn 零降级；不带两键的 save 不得凭空造字段
+    writeStateA({ version: 1, lastDocPath: "sample-paper.pdf", documents: { "sample-paper.pdf": { page: 1, scale: 1, updatedAt: T } } });
+    warns.length = 0;
+    const oldLoad = readerStateStore.loadReaderState();
+    const oldEntry = oldLoad.state.documents["sample-paper.pdf"];
+    const oldDiskEntry = JSON.parse(readFileSync(STATE_A, "utf8")).documents["sample-paper.pdf"];
+    const saveOld = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 2, scale: 1 });
+    const oldReload = readerStateStore.loadReaderState();
+    const oldReloadEntry = oldReload.state.documents["sample-paper.pdf"];
+    check(
+      G,
+      8,
+      "R18 #8 旧格式：读→写→再读全程 degraded:false + reason undefined + warn 增量 0；既有字段不丢（page 2 / scale 1）且两键 hasOwnProperty 恒 false（不得造字段）",
+      oldLoad.success === true &&
+        oldLoad.degraded === false &&
+        oldLoad.reason === undefined &&
+        oldEntry.page === 1 &&
+        hasOwn(oldEntry, "lastSessionPath") === false &&
+        hasOwn(oldEntry, "lastSessionAt") === false &&
+        hasOwn(oldDiskEntry, "lastSessionPath") === false &&
+        saveOld.success === true &&
+        oldReload.success === true &&
+        oldReload.degraded === false &&
+        oldReloadEntry.page === 2 &&
+        oldReloadEntry.scale === 1 &&
+        hasOwn(oldReloadEntry, "lastSessionPath") === false &&
+        hasOwn(oldReloadEntry, "lastSessionAt") === false &&
+        warns.length === 0,
+      JSON.stringify({ oldLoad, oldEntry, saveOld: saveOld.success, oldReloadEntry, warns }),
+    );
+
+    // R18 #9：九种非法 / 半截形态 ⇒ 静默丢弃整对（保留既有对），磁盘不出现半截字段
+    const invalidPatches = [
+      ["lastSessionPath 空串", { lastSessionPath: "" }],
+      ["lastSessionPath 非字符串", { lastSessionPath: 42 }],
+      ["lastSessionPath 超长 2049", { lastSessionPath: "a".repeat(2049) }],
+      ["lastSessionPath 含 NUL", { lastSessionPath: "a\u0000b" }],
+      ["只给 lastSessionPath", { lastSessionPath: SESS_B }],
+      ["lastSessionAt 为 0", { lastSessionAt: 0 }],
+      ["lastSessionAt 为负数", { lastSessionAt: -1 }],
+      ["lastSessionAt 为 NaN", { lastSessionAt: Number.NaN }],
+      ["lastSessionAt 为字符串", { lastSessionAt: "123" }],
+    ];
+    const invalidRun = invalidPatches.map(([label, patch]) => {
+      writeStateA({ version: 1, lastDocPath: "sample-paper.pdf", documents: { "sample-paper.pdf": { page: 2, scale: 1.2, updatedAt: T, lastSessionPath: SESS, lastSessionAt: T } } });
+      warns.length = 0;
+      const result = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 2, scale: 1.2, ...patch });
+      const entry = JSON.parse(readFileSync(STATE_A, "utf8")).documents["sample-paper.pdf"];
+      const pathKey = hasOwn(entry, "lastSessionPath");
+      const atKey = hasOwn(entry, "lastSessionAt");
+      return {
+        label,
+        ok: result.success === true && entry.lastSessionPath === SESS && entry.lastSessionAt === T && pathKey === true && atKey === true && warns.length === 0,
+        entry,
+        warns: warns.slice(),
+      };
+    });
+    check(
+      G,
+      9,
+      "R18 #9 九种非法 / 半截形态：每次 save 均成功且目标条目两键逐字仍为 seed 值、磁盘无半截字段（两键 hasOwnProperty 同真）、逐条 warn 增量 0",
+      invalidRun.every((item) => item.ok),
+      JSON.stringify(invalidRun),
+    );
+
+    // R18 #10：读侧成对裁剪（A 合法对 / B 只给非法 at / C 只给 path）
+    writeStateA({
+      version: 1,
+      lastDocPath: "sample-paper.pdf",
+      documents: {
+        "sample-paper.pdf": { page: 2, scale: 1.2, updatedAt: T, lastSessionPath: SESS, lastSessionAt: T },
+        "archive/older-paper.pdf": { page: 7, scale: 1, updatedAt: T, lastSessionAt: "x" },
+        "reading-notes.md": { page: 3, scale: 2, updatedAt: T, lastSessionPath: SESS_B },
+      },
+    });
+    warns.length = 0;
+    const pairLoad = readerStateStore.loadReaderState();
+    const entryPairA = pairLoad.state.documents["sample-paper.pdf"];
+    const entryPairB = pairLoad.state.documents["archive/older-paper.pdf"];
+    const entryPairC = pairLoad.state.documents["reading-notes.md"];
+    check(
+      G,
+      10,
+      "R18 #10 读侧成对裁剪：合法对逐值保留；只给一侧 / 非法一侧 ⇒ 两键均不存在且 page/scale 照常生效；degraded:false + warn 增量 0",
+      pairLoad.success === true &&
+        pairLoad.degraded === false &&
+        entryPairA.lastSessionPath === SESS &&
+        entryPairA.lastSessionAt === T &&
+        entryPairB.page === 7 &&
+        entryPairB.scale === 1 &&
+        hasOwn(entryPairB, "lastSessionPath") === false &&
+        hasOwn(entryPairB, "lastSessionAt") === false &&
+        entryPairC.page === 3 &&
+        entryPairC.scale === 2 &&
+        hasOwn(entryPairC, "lastSessionPath") === false &&
+        hasOwn(entryPairC, "lastSessionAt") === false &&
+        warns.length === 0,
+      JSON.stringify({ pairLoad, entryPairA, entryPairB, entryPairC, warns }),
+    );
+
+    // R18 #11 (a)：带两键的 corrupt ⇒ load 降级恰 1 条 warn；save copy-first 备份（增量恰 1）后重建且无两键
+    const pairSeed = { version: 1, lastDocPath: "sample-paper.pdf", documents: { "sample-paper.pdf": { page: 2, scale: 1.2, updatedAt: T, lastSessionPath: SESS, lastSessionAt: T } } };
+    const pairText = `${JSON.stringify(pairSeed, null, 2)}\n`;
+    writeFileSync(STATE_A, pairText.slice(0, Math.floor(pairText.length / 2)), "utf8");
+    const backupsBefore = readdirSync(PIX_READ_A).filter((name) => name.startsWith("reader-state.json.corrupt-"));
+    warns.length = 0;
+    const corruptPairLoad = readerStateStore.loadReaderState();
+    const corruptPairWarns = warns.length;
+    warns.length = 0;
+    const corruptPairSave = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 1, scale: 1 });
+    const backupDiff = readdirSync(PIX_READ_A).filter((name) => name.startsWith("reader-state.json.corrupt-") && !backupsBefore.includes(name));
+    const rebuiltEntry = JSON.parse(readFileSync(STATE_A, "utf8")).documents["sample-paper.pdf"];
+    // R18 #11 (b)：version:2 且带两键 ⇒ load 降级；save 拒写（不带 code、error 逐字）且原文件 sha256 不变
+    writeStateA({ ...pairSeed, version: 2 });
+    const v2PairBytes = readFileSync(STATE_A);
+    warns.length = 0;
+    const v2PairLoad = readerStateStore.loadReaderState();
+    const v2PairSave = readerStateStore.saveReaderState({ docFilePath: DOC_A, page: 1, scale: 1, lastSessionPath: SESS, lastSessionAt: T });
+    check(
+      G,
+      11,
+      "R18 #11 (a) 带两键的 corrupt：load degraded:true + reason corrupt + 恰 1 条 warn；save 成功、备份差集恰 1（名匹配既有正则）、重建条目无两键；(b) version:2 + 两键：load 降级、save 拒写（无 code、error 逐字）且 sha256 不变",
+      corruptPairLoad.success === true &&
+        corruptPairLoad.degraded === true &&
+        corruptPairLoad.reason === "corrupt" &&
+        corruptPairWarns === 1 &&
+        corruptPairSave.success === true &&
+        backupDiff.length === 1 &&
+        /^reader-state\.json\.corrupt-\d{8}-\d{6}(-\d+)?$/.test(backupDiff[0]) &&
+        hasOwn(rebuiltEntry, "lastSessionPath") === false &&
+        hasOwn(rebuiltEntry, "lastSessionAt") === false &&
+        v2PairLoad.success === true &&
+        v2PairLoad.degraded === true &&
+        v2PairLoad.reason === "version-unsupported" &&
+        v2PairSave.success === false &&
+        v2PairSave.code === undefined &&
+        v2PairSave.error === "阅读状态文件版本不支持（未写入）" &&
+        sha256(readFileSync(STATE_A)) === sha256(v2PairBytes),
+      JSON.stringify({
+        corruptPairLoad,
+        corruptPairWarns,
+        save: corruptPairSave.success,
+        backupDiff,
+        rebuiltEntry,
+        v2PairLoad,
+        v2PairSave,
+        v2BytesSame: sha256(readFileSync(STATE_A)) === sha256(v2PairBytes),
+      }),
     );
     rmSync(STATE_A, { recursive: true, force: true });
   } finally {

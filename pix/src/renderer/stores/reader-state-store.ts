@@ -13,13 +13,14 @@
  * 主进程返回的 state 是唯一真相，这里不拼任何存储路径。
  */
 
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import type { ReaderDocState, ReaderStateFile } from "@shared/types";
 import type { PixApi } from "../../main/preload";
 import { MAX_SCALE, MIN_SCALE, useReaderStore } from "./reader-store";
 import { useProjectStore } from "./project-store";
-import { absoluteDocPath, currentDocKey } from "../utils/notes-path";
+import { absoluteDocPath, currentDocKey, docDisplayName, docPathKey } from "../utils/notes-path";
+import { deriveSessionTitle } from "../utils/session-title";
 
 /** 尾触发去抖窗口：连续翻页/拖滚动条只写停止后的稳定值一次。 */
 const DEBOUNCE_MS = 600;
@@ -31,6 +32,24 @@ interface ReaderSnapshot {
   filePath: string;
   page: number;
   scale: number;
+}
+
+/** R18：一条讨论记录的提交载荷（渲染层内部使用，不导出）。 */
+interface DiscussionStamp {
+  path: string;
+  at: number;
+}
+
+/** R18：一篇文档的最近讨论入口的解析结果（无记录 / 会话不在列表 ⇒ null）。 */
+export interface DiscussionLink {
+  /** 会话文件绝对路径（原样来自现场记录）。 */
+  sessionPath: string;
+  /** 会话标题（deriveSessionTitle，与历史会话菜单同一规则）。 */
+  title: string;
+  /** 讨论时刻（现场记录的 lastSessionAt）。 */
+  at: number;
+  /** 当前文档显示名（docDisplayName(currentKey)）。 */
+  docName: string;
 }
 
 function bridge(): PixApi {
@@ -99,21 +118,29 @@ export const useReaderStateStore = defineStore("readerState", () => {
   }
 
   /** 乐观更新：提交瞬间就把本地模型推到新值；失败不回滚（下一个真实变化自然重写）。 */
-  function applyLocal(next: ReaderSnapshot): void {
+  function applyLocal(next: ReaderSnapshot, stamp: DiscussionStamp | null = null): void {
+    const previous = documents.value[next.key];
+    const carried = stamp
+      ? { lastSessionPath: stamp.path, lastSessionAt: stamp.at }
+      : previous && previous.lastSessionPath !== undefined && previous.lastSessionAt !== undefined
+        ? { lastSessionPath: previous.lastSessionPath, lastSessionAt: previous.lastSessionAt }
+        : {};
     documents.value = {
       ...documents.value,
-      [next.key]: { page: next.page, scale: next.scale, updatedAt: Date.now() },
+      // stamp 非空时 updatedAt 取发送时刻（与主进程写侧的 Date.now() 相差毫秒级）；未携带时保留既有对
+      [next.key]: { page: next.page, scale: next.scale, updatedAt: stamp ? stamp.at : Date.now(), ...carried },
     };
     lastDoc.value = { docPath: relativeDocPath(next.filePath, rootDir()), page: next.page, scale: next.scale };
   }
 
-  async function submit(next: ReaderSnapshot): Promise<void> {
+  async function submit(next: ReaderSnapshot, stamp: DiscussionStamp | null = null): Promise<void> {
     const epoch = saveEpoch;
     try {
       const result = await bridge().readerStateSave({
         docFilePath: next.filePath,
         page: next.page,
         scale: next.scale,
+        ...(stamp ? { lastSessionPath: stamp.path, lastSessionAt: stamp.at } : {}),
       });
       // 响应到达前已 resetState（切工作区）：上一轮的状态不得写进本轮的内存模型
       if (epoch !== saveEpoch) return;
@@ -230,6 +257,36 @@ export const useReaderStateStore = defineStore("readerState", () => {
     capture(absPath, page, scale);
   }
 
+  /**
+   * R18：发送成功后的记录动作（唯一入口）。五条守卫全过 ⇒ 立即提交（不经 DEBOUNCE_MS、
+   * 不写 snapshot / committed）；失败只允许 submit 内既有的一行 warn。
+   */
+  function noteDiscussion(absPath: string | null, page: number, scale: number, sessionPath: string | null): void {
+    if (!ready.value) return;
+    if (!absPath || !sessionPath) return;
+    if (!Number.isInteger(page) || page < 1) return;
+    if (!Number.isFinite(scale) || scale < MIN_SCALE || scale > MAX_SCALE) return;
+    const next = toSnapshot(absPath, page, scale);
+    if (!next) return;
+    const stamp: DiscussionStamp = { path: sessionPath, at: Date.now() };
+    applyLocal(next, stamp);
+    void submit(next, stamp);
+  }
+
+  /** R18：现场记录 × 会话列表 ⇒ 入口 / 标记的唯一数据源；无记录或会话不在列表 ⇒ null。 */
+  const currentDiscussion = computed<DiscussionLink | null>(() => {
+    const key = currentDocKey(readerStore.filePath, rootDir());
+    if (!key) return null;
+    const entry = documents.value[key];
+    if (!entry) return null;
+    const sessionPath = entry.lastSessionPath;
+    const sessionAt = entry.lastSessionAt;
+    if (sessionPath === undefined || sessionAt === undefined) return null;
+    const session = projectStore.sessions.find((item) => docPathKey(item.path) === docPathKey(sessionPath));
+    if (!session) return null;
+    return { sessionPath, title: deriveSessionTitle(session), at: sessionAt, docName: docDisplayName(key) };
+  });
+
   /** 安全点入口：同步捕获快照 → 去重 → 提交；返回后即可 resetState。 */
   function flush(): void {
     if (debounceTimer !== null) {
@@ -261,11 +318,13 @@ export const useReaderStateStore = defineStore("readerState", () => {
     lastDoc,
     ready,
     degraded,
+    currentDiscussion,
     loadReaderState,
     progressPageFor,
     requestRestoreFor,
     noteLanding,
     noteChange,
+    noteDiscussion,
     flush,
     resetState,
   };

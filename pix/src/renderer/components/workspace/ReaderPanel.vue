@@ -12,7 +12,8 @@ import { renderMarkdown } from "../../utils/markdown";
 import { useProjectStore } from "../../stores/project-store";
 import { useReaderStore } from "../../stores/reader-store";
 import { useReaderStateStore } from "../../stores/reader-state-store";
-import { absoluteDocPath, docDisplayName } from "../../utils/notes-path";
+import { absoluteDocPath, docDisplayName, docPathKey } from "../../utils/notes-path";
+import { formatSessionTime } from "../../utils/session-title";
 import {
   failureFromIpcError,
   libraryReadFailureMessage,
@@ -34,6 +35,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "open-document": [path: string];
+  "open-session": [path: string];
 }>();
 
 const readerStore = useReaderStore();
@@ -71,6 +73,19 @@ const resumeEntry = computed(() => {
     page: last.page,
   };
 });
+
+/** R18：入口载荷（四闸全过才有值）；记录会话即当前活动会话 ⇒ 隐藏（避免死路点击）。 */
+const discussEntry = computed(() => {
+  const link = readerStateStore.currentDiscussion;
+  if (!link) return null;
+  if (docPathKey(link.sessionPath) === docPathKey(projectStore.currentSession?.path ?? "")) return null;
+  return { path: link.sessionPath, title: link.title, time: formatSessionTime(link.at) };
+});
+
+/** R18：入口文本与 tooltip 的唯一复用串（文本逐字 `继续讨论：{title} · {time}`）。 */
+const discussLabel = computed(() =>
+  discussEntry.value ? `继续讨论：${discussEntry.value.title} · ${discussEntry.value.time}` : "",
+);
 
 const renderedHtml = computed(() => {
   if (!isTextFile.value || !content.value) return "";
@@ -152,6 +167,12 @@ function openResumeEntry(): void {
   emit("open-document", resumeEntry.value.path);
 }
 
+/** R18：入口点击只发一个 emit（载荷 = 会话文件绝对路径）；切换链路全部在 WorkspacePage。 */
+function openDiscussion(): void {
+  if (!discussEntry.value) return;
+  emit("open-session", discussEntry.value.path);
+}
+
 function toggleKnowledgeMap(): void {
   readerStore.setMapOpen(!readerStore.mapOpen);
 }
@@ -201,6 +222,13 @@ onBeforeUnmount(() => {
         @click="toggleKnowledgeMap"
       >
         <v-icon size="14">mdi-map-outline</v-icon>
+      </button>
+    </Teleport>
+
+    <Teleport v-if="mapToggleReady && discussEntry" to=".center-pill">
+      <button type="button" class="reader-discuss" :title="`${discussLabel}；点击打开该会话`" @click="openDiscussion">
+        <v-icon size="14">mdi-forum-outline</v-icon>
+        <span class="reader-discuss-text">{{ discussLabel }}</span>
       </button>
     </Teleport>
 
@@ -343,6 +371,35 @@ onBeforeUnmount(() => {
 .map-toggle:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.reader-discuss {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 240px;
+  margin-left: 2px;
+  padding: 1px 8px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 999px;
+  background: var(--pix-bg-elevated, #ffffff);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.reader-discuss-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reader-discuss:hover {
+  background: var(--pix-bg-hover, #eef2f6);
+  color: var(--pix-text-primary);
 }
 
 .reader-main {

@@ -473,6 +473,10 @@ export interface ReaderDocState {
   page: number;
   scale: number;
   updatedAt: number;
+  /** R18 可选字段：最近一次讨论该文档的会话文件路径（原样存储，不解析、不校验存在性） */
+  lastSessionPath?: string;
+  /** R18 可选字段：该次讨论的发送时刻（epoch ms，> 0） */
+  lastSessionAt?: number;
 }
 
 /** 状态文件内存模型。documents 以「比较键（小写 + 正斜杠）」为键；lastDocPath 保留原大小写相对路径。 */
@@ -493,6 +497,10 @@ export interface ReaderStateSaveDraft {
   docFilePath: string;
   page: number;
   scale: number;
+  /** R18 可选字段：最近一次讨论该文档的会话文件路径（原样存储，不解析、不校验存在性） */
+  lastSessionPath?: string;
+  /** R18 可选字段：该次讨论的发送时刻（epoch ms，> 0） */
+  lastSessionAt?: number;
 }
 
 /** success 仅在「无工作区根」时为 false；state 在降级时为空状态。 */

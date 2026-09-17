@@ -125,6 +125,9 @@ const SEL = {
   // N97-4 追加 2 项（设计档「追加设计」§3.1）
   contextChip: ".context-chip",
   contextChipRemove: ".context-chip-remove",
+  // R18 新增 2 项（设计档 §1.5.2）
+  readerDiscuss: ".reader-discuss",
+  sessionDocMark: ".session-doc-mark",
 };
 
 // ---------------------------------------------------------------------------
@@ -501,6 +504,10 @@ let agentEventRegisterCount = 0;
 let agentEventUnregisterCount = 0;
 // F16 判据：agent_start 是否仍然触发工作区同步（syncWorkspaceState → listSessions）
 let listSessionsCalls = 0;
+// R18：会话列表种入（未种入 ⇒ listSessions 恒返回 []，与既有行为等价）
+let sessionsSeed = [];
+let sessionsSeedRoot = CONFIG.root;
+const switchCalls = [];
 // onUserInputRequest 的保留回调（与 onAgentEvent 同形）：emitUserInputRequest 逐个投递
 let userInputHandlers = [];
 let stubMessages = [];
@@ -682,7 +689,21 @@ function handleCommand(command) {
   if (type === "get_commands") return { success: true, data: { commands: [] } };
   if (type === "get_session_stats") return { success: true, data: SESSION_STATS };
   if (type === "get_messages") return { success: true, data: stubMessages };
-  if (type === "new_session" || type === "switch_session" || type === "clone" || type === "fork") {
+  if (type === "switch_session") {
+    const target = typeof command.sessionPath === "string" ? command.sessionPath : null;
+    if (target) {
+      switchCalls.push({ path: target });
+      if (switchCalls.length > 8) switchCalls.shift();
+      const mirror = sessionsSeed.find(function (item) { return normalizePath(item.path) === normalizePath(target); });
+      if (mirror) {
+        SESSION_STATE.sessionFile = mirror.path;
+        SESSION_STATE.sessionId = mirror.id;
+        SESSION_STATE.sessionName = mirror.name;
+      }
+    }
+    return { success: true, data: { cancelled: false } };
+  }
+  if (type === "new_session" || type === "clone" || type === "fork") {
     return { success: true, data: { cancelled: false } };
   }
   return { success: true, data: {} };
@@ -700,6 +721,8 @@ const STATE_DIR = ".pix-read";
 const STATE_FILE_NAME = "reader-state.json";
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
+// R18：与 src/main/reader-state-store.ts 同值同谓词（stub 无法 import TS 源，刻意重复）
+const MAX_SESSION_PATH_LENGTH = 2048;
 
 // startSession(dir) 记录；stopSession 不清（与真实主进程的已知差异，已在开发档声明）
 let activeRoot = CONFIG.root;
@@ -743,10 +766,23 @@ function isValidScale(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= MIN_SCALE && value <= MAX_SCALE;
 }
 
+function isValidSessionPath(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_SESSION_PATH_LENGTH &&
+    value.indexOf(String.fromCharCode(0)) < 0;
+}
+
+function isValidSessionAt(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 function parseDocState(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (!isValidPage(value.page) || !isValidScale(value.scale)) return null;
   const updatedAt = typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) ? value.updatedAt : 0;
+  // R18：合法对 ⇒ 成对带回；任一非法 ⇒ 两键都不追加（读侧不产生 warn、不改写文件）
+  if (isValidSessionPath(value.lastSessionPath) && isValidSessionAt(value.lastSessionAt)) {
+    return { page: value.page, scale: value.scale, updatedAt: updatedAt, lastSessionPath: value.lastSessionPath, lastSessionAt: value.lastSessionAt };
+  }
   return { page: value.page, scale: value.scale, updatedAt: updatedAt };
 }
 
@@ -892,7 +928,11 @@ const api = {
     };
   },
 
-  listSessions: async function () { listSessionsCalls += 1; return []; },
+  listSessions: async function (dir) {
+    listSessionsCalls += 1;
+    if (normalizePath(dir) !== normalizePath(sessionsSeedRoot)) return [];
+    return sessionsSeed.map(function (item) { return Object.assign({}, item); });
+  },
   deleteSession: async function () { return { success: true }; },
 
   libraryList: async function (dir) { return libraryList(dir); },
@@ -1146,7 +1186,13 @@ const api = {
   },
   readerStateSave: async function (draft) {
     const docFilePath = draft && typeof draft.docFilePath === "string" ? draft.docFilePath : "";
-    readerStateCalls.push({ docFilePath: docFilePath, page: draft ? draft.page : null, scale: draft ? draft.scale : null });
+    readerStateCalls.push({
+      docFilePath: docFilePath,
+      page: draft ? draft.page : null,
+      scale: draft ? draft.scale : null,
+      lastSessionPath: draft ? draft.lastSessionPath : undefined,
+      lastSessionAt: draft ? draft.lastSessionAt : undefined,
+    });
     if (stateSaveFailure) {
       return { success: false, state: emptyState(), code: stateSaveFailure, error: stateSaveFailure };
     }
@@ -1160,7 +1206,14 @@ const api = {
     const relative = full.toLowerCase().indexOf(prefix) === 0 ? full.slice(prefix.length) : full;
     const key = docPathKey(relative);
     const documents = Object.assign({}, current.documents);
-    documents[key] = { page: draft.page, scale: draft.scale, updatedAt: Date.now() };
+    const previous = current.documents[key];
+    // R18：有效对 ⇒ 覆盖；否则 ⇒ 保留目标条目既有对；其它条目一字不动（与主进程同规则）
+    const carried = isValidSessionPath(draft.lastSessionPath) && isValidSessionAt(draft.lastSessionAt)
+      ? { lastSessionPath: draft.lastSessionPath, lastSessionAt: draft.lastSessionAt }
+      : previous && previous.lastSessionPath !== undefined && previous.lastSessionAt !== undefined
+        ? { lastSessionPath: previous.lastSessionPath, lastSessionAt: previous.lastSessionAt }
+        : {};
+    documents[key] = Object.assign({ page: draft.page, scale: draft.scale, updatedAt: Date.now() }, carried);
     const next = { version: 1, lastDocPath: relative, documents: documents };
     writeStateFile(next);
     return { success: true, state: next };
@@ -1256,6 +1309,12 @@ contextBridge.exposeInMainWorld("__pixStub", {
   setReaderStateFailure: function (code) { stateSaveFailure = code || null; },
   readerStateSaveCalls: function () { return { count: readerStateCalls.length, payloads: readerStateCalls.slice(-8) }; },
   readerStateFilePath: function () { return stateFilePath(); },
+  setSessions: function (list, root) {
+    sessionsSeed = Array.isArray(list) ? list.map(function (item) { return Object.assign({}, item); }) : [];
+    sessionsSeedRoot = root || CONFIG.root;
+    return sessionsSeed.length;
+  },
+  switchSessionCalls: function () { return { count: switchCalls.length, paths: switchCalls.map(function (item) { return item.path; }) }; },
 });
 `;
 }
@@ -1630,6 +1689,18 @@ async function runReaderStateScenarios(win, log) {
   const stateBytes = (file) => readFileSync(file);
   const readState = (file) => JSON.parse(readFileSync(file, "utf8"));
   const writeState = (file, state) => writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  /** R18：现场投影（忽略讨论记录两键与 updatedAt）：发送成功会按设计改写这三项，其余必须逐字不变。 */
+  const stateProjection = (file) => {
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8"));
+      const documents = Object.fromEntries(
+        Object.entries(parsed.documents || {}).map(([key, entry]) => [key, { page: entry.page, scale: entry.scale }]),
+      );
+      return JSON.stringify({ version: parsed.version, lastDocPath: parsed.lastDocPath ?? null, documents });
+    } catch (err) {
+      return null;
+    }
+  };
   const removeState = (file) => {
     try {
       rmSync(file, { force: true });
@@ -2385,6 +2456,22 @@ async function runReaderStateScenarios(win, log) {
   // 资源顺序：36 末段的 rmSync(archive/older-paper.pdf) 是该文件的最后一次使用；
   // 30–36 里所有打开或断言它的步骤都在 rmSync 之前。
   // -------------------------------------------------------------------------
+
+  /** R18（52-inject 与 r18-* 共用）：等现场文件达到谓词（waitFor 在渲染层求值，无法轮询文件）。 */
+  const waitState = async (file, predicate, label, timeoutMs = 20000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let ok = false;
+      try {
+        ok = Boolean(predicate(readState(file)));
+      } catch (err) {
+        ok = false;
+      }
+      if (ok) return;
+      if (Date.now() > deadline) throw new Error(`等待超时：${label}（现场文件未达判据）`);
+      await sleep(120);
+    }
+  };
 
   const NOTES_FILE = join(LIBRARY_DIR, ".pix-read", "notes.json");
   const readNotes = () => JSON.parse(readFileSync(NOTES_FILE, "utf8")).notes;
@@ -5006,6 +5093,11 @@ async function runReaderStateScenarios(win, log) {
   })()`);
   await waitFor("已选 2 条", `(() => { const el = document.querySelector(".notes-selection-count"); return !!el && el.textContent.includes("已选 2 条"); })()`);
   const stateHash52i = fileHash(STATE_FILE_A);
+  // R18：发送成功会按设计写入讨论记录（两键 + updatedAt）⇒ 不能再用字节比较；
+  // 过滤 / 选择 / 发送除该记录外仍须逐字不变（点徽标的字节断言见 52 相位，不受影响）
+  // 落点写盘是 600ms 去抖：先等目标条目在场再取基线，否则基线是「文件尚不存在」
+  await waitState(STATE_FILE_A, (state) => state.documents["sample-paper.pdf"], "52-inject 落点写盘");
+  const stateBefore52i = stateProjection(STATE_FILE_A);
   await clickMapBadge("1. Abstract");
   await waitChapterFilter("章节：1. Abstract · 第 1 页", 1);
   await typeAndSend("52-inject：过滤后仍按选择集注入。");
@@ -5023,14 +5115,17 @@ async function runReaderStateScenarios(win, log) {
       chip: chips52i.notesLabel,
       notesCount: notesCount52i,
       hasReaderNotes: !!send52i && send52i.message.includes("reader_notes:"),
-      stateBytesSame: fileHash(STATE_FILE_A) === stateHash52i,
+      stateBytesChanged: fileHash(STATE_FILE_A) !== stateHash52i,
+      stateSameExceptRecord: stateProjection(STATE_FILE_A) === stateBefore52i,
+      stateBefore: stateBefore52i,
+      stateAfter: stateProjection(STATE_FILE_A),
     },
     [
       ...(selection52i.countText === "已选 2 条" ? [] : [`选择集异常：${selection52i.countText}`]),
       ...(chips52i.notesLabel === "摘录 2 条" ? [] : [`chip 异常：${chips52i.notesLabel}`]),
       ...(notesCount52i === 2 ? [] : [`注入条数异常：${notesCount52i}`]),
       ...(send52i && send52i.message.includes("reader_notes:") ? [] : ["发送载荷缺少 reader_notes"]),
-      ...(fileHash(STATE_FILE_A) === stateHash52i ? [] : ["发送不得改写 reader-state.json"]),
+      ...(stateProjection(STATE_FILE_A) === stateBefore52i ? [] : ["过滤 / 选择 / 发送不得改写阅读现场（R18 讨论记录除外）"]),
     ],
   );
 
@@ -11529,6 +11624,705 @@ async function runReaderStateScenarios(win, log) {
     ],
   );
   await restoreStandardSeed();
+
+  // =========================================================================
+  // R18：对话锚定（N100–N103）——入口 / 标注 / 隔离（r18-1 … r18-5）
+  //
+  // 会话夹具 SESSIONS_A 两条（第一条与 SESSION_STATE.sessionFile 同路径同 id）；
+  // 时间夹具 PAST_AT（26 小时前 ⇒ formatSessionTime 恒「昨天」）与 SEED_AT（落点写盘防空基线）。
+  // 入口与标记都只读现场文件 × 会话列表：列表变化只经既有切换链路刷新（不新增刷新入口）；
+  // 「已活动会话的点击是 no-op」⇒ 需要真刷新列表的相位一律点非活动行。
+  // 每个场景以自己的 restoreStandardSeed() + setSendFailure(null) + setSessions([]) 收尾。
+  // =========================================================================
+
+  const SESSIONS_A = [
+    {
+      path: join(LIBRARY_DIR, ".pix-read", "session-demo.jsonl"),
+      id: "sess-demo",
+      cwd: LIBRARY_DIR,
+      name: "摘录与笔记走查",
+      created: new Date(Date.now() - 60 * MINUTE).toISOString(),
+      modified: new Date(Date.now() - 30 * MINUTE).toISOString(),
+      messageCount: 4,
+      firstMessage: "",
+    },
+    {
+      path: join(LIBRARY_DIR, ".pix-read", "session-older.jsonl"),
+      id: "sess-older",
+      cwd: LIBRARY_DIR,
+      name: "消融实验对照",
+      created: new Date(Date.now() - 3 * HOUR).toISOString(),
+      modified: new Date(Date.now() - 2 * HOUR).toISOString(),
+      messageCount: 2,
+      firstMessage: "",
+    },
+  ];
+  const SESSIONS_GHOST = SESSIONS_A.concat([
+    {
+      path: join(LIBRARY_DIR, ".pix-read", "session-gone.jsonl"),
+      id: "sess-gone",
+      cwd: LIBRARY_DIR,
+      name: "丢失后恢复的会话",
+      created: new Date(Date.now() - 50 * HOUR).toISOString(),
+      modified: new Date(Date.now() - 49 * HOUR).toISOString(),
+      messageCount: 1,
+      firstMessage: "",
+    },
+  ]);
+  const PAST_AT = Date.now() - 26 * HOUR;
+  const SEED_AT = Date.now() - MINUTE;
+  const SESSION_B_PATH = join(LIBRARY_DIR, ".pix-read", "session-b.jsonl");
+  const SESSION_GONE_PATH = join(LIBRARY_DIR, ".pix-read", "session-gone.jsonl");
+
+  /** r18 场景统一前置：复位注入 → 回首页 → 清 A 现场 → 写现场夹具 → 进工作区 → 等树行 → 注入笔记种子。 */
+  const enterWorkspaceWithState = async (state, rows = 4) => {
+    await js("window.__pixStub.setMessages([]), true");
+    await setSendFailure(null);
+    await js("window.__pixStub.setNotesAddFailure(null), true");
+    await setNotesDeleteFailure(null);
+    await goHome();
+    await clearStateA();
+    writeState(STATE_FILE_A, state);
+    await enterWorkspace(LIBRARY_NAME);
+    await waitTreeRows(rows);
+    await js(`window.__pixStub.seedNotes(${JSON.stringify(seedNotes())}), true`);
+  };
+
+  // 会话菜单的在场判定：VOverlay 用 v-show 关闭（内容 DOM 首次打开后常驻），
+  // 所以「列表不在场」不能判存在性，必须判可见性（getClientRects 为空 = display:none）。
+  const menuOpenExpr = `(() => {
+    const list = document.querySelector(".v-overlay-container .v-list");
+    return !!list && list.getClientRects().length > 0;
+  })()`;
+
+  /** 打开会话菜单：点 pill 并等列表可见。 */
+  const openSessionMenu = async () => {
+    await js(`document.querySelector(".pill-session").click(), true`);
+    await waitFor("会话菜单打开", menuOpenExpr);
+  };
+
+  /** 关闭会话菜单：列表不可见 ⇒ 立即返回（幂等）；否则派发 Esc 并等不可见。 */
+  const closeSessionMenu = async () => {
+    if (!(await js(menuOpenExpr))) return;
+    await js(`document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })), true`);
+    await waitFor("会话菜单关闭", `!(${menuOpenExpr})`);
+  };
+
+  /** 菜单逐行探针：标题 / 副标题 / 活动 / 标记 / 标记 tooltip / 删除按钮。 */
+  const sessionMenuProbe = () => js(`(() => {
+    const rows = Array.from(document.querySelectorAll(".v-overlay-container .v-list .v-list-item")).filter((el) => el.getClientRects().length > 0);
+    const t = (el, selector) => { const node = el.querySelector(selector); return node ? node.textContent.replace(/\\s+/g, " ").trim() : null; };
+    return {
+      open: ${menuOpenExpr},
+      items: rows.map((el) => {
+        const mark = el.querySelector(${JSON.stringify(SEL.sessionDocMark)});
+        return {
+          title: t(el, ".v-list-item-title"),
+          subtitle: t(el, ".v-list-item-subtitle"),
+          active: el.classList.contains("v-list-item--active"),
+          marked: !!mark,
+          markTitle: mark ? mark.getAttribute("title") : null,
+          hasDeleteBtn: !!el.querySelector(".session-delete-btn"),
+          appendCount: el.querySelectorAll(".v-list-item__append").length,
+          appendWidth: (() => { const node = el.querySelector(".v-list-item__append"); return node ? Math.round(node.getBoundingClientRect().width) : null; })(),
+        };
+      }),
+    };
+  })()`);
+
+  /** 菜单行定位：标题逐字相等（空白归一化后）。 */
+  const menuItem = (probe, title) => probe.items.find((item) => item.title === title) ?? null;
+
+  /** 按标题文本点会话行（对已是活动会话的行是幂等 no-op；点击后等菜单消失，两条路径都能过）。 */
+  const clickSessionItem = async (title) => {
+    await js(`(() => {
+      const rows = Array.from(document.querySelectorAll(".v-overlay-container .v-list .v-list-item"));
+      const row = rows.find((el) => { const node = el.querySelector(".v-list-item-title"); return !!node && node.textContent.replace(/\\s+/g, " ").trim() === ${JSON.stringify(title)}; });
+      if (!row) throw new Error("session item not found: " + ${JSON.stringify(title)});
+      row.click();
+      return true;
+    })()`);
+    await closeSessionMenu();
+  };
+
+  /** 等入口文本前缀命中（时间后缀不逐字钉；确定档位下用全串调用即等价逐字相等）。 */
+  const waitDiscussText = (prefix) =>
+    waitFor(`讨论入口文本前缀「${prefix}」`, `(() => {
+      const el = document.querySelector(${JSON.stringify(SEL.readerDiscuss)});
+      if (!el) return false;
+      return el.textContent.replace(/\\s+/g, " ").trim().indexOf(${JSON.stringify(prefix)}) === 0;
+    })()`);
+
+  /** 时间档位的运行时允许集：`刚刚` ∪ {N 分钟}（N ∈ {floor(Δ/60000), +1}）。 */
+  const discussTimeAllowSet = (lastSessionAt, now = Date.now()) => {
+    const minutes = Math.floor(Math.max(0, now - lastSessionAt) / 60000);
+    return new Set(["刚刚", `${minutes} 分钟`, `${minutes + 1} 分钟`]);
+  };
+
+  const hasOwn = (target, key) => Object.prototype.hasOwnProperty.call(target, key);
+  const entryTextOf = () => textOf(SEL.readerDiscuss);
+  const entryTitleOf = () => js(`(() => { const el = document.querySelector(${JSON.stringify(SEL.readerDiscuss)}); return el ? el.getAttribute("title") : null; })()`);
+  const deleteTitleOf = () => js(`(() => { const el = document.querySelector(".v-overlay-container .session-delete-btn"); return el ? el.getAttribute("title") : null; })()`);
+  const switchCallsNow = () => js("window.__pixStub.switchSessionCalls()");
+  const waitPillSession = (title) =>
+    waitFor(`会话 pill 显示「${title}」`, `(() => { const el = document.querySelector(".pill-session .pill-label"); return !!el && el.textContent.replace(/\\s+/g, " ").trim() === ${JSON.stringify(title)}; })()`);
+
+  // --- r18-1 入口：发送记录 / 入口出现与点击 / 发送失败不改写（组 r18-discuss-entry）---
+  log("r18-1 发送成功记录讨论会话；活动会话 = 记录会话 ⇒ 入口隐藏");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}), true`);
+  await enterWorkspaceWithState({
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: {
+      "sample-paper.pdf": { page: 1, scale: 1, updatedAt: SEED_AT },
+      "archive/older-paper.pdf": { page: 1, scale: 1, updatedAt: 1758000001000, lastSessionPath: SESSION_B_PATH, lastSessionAt: 1758000001000 },
+    },
+  });
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openSessionMenu();
+  await clickSessionItem("摘录与笔记走查");
+  await closeSessionMenu();
+  const warnBase18a = warnCount();
+  const entryBefore18a = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await clearSendCalls();
+  await typeAndSend("R18：这篇的消融结论怎么复现？");
+  await waitSendCalls(1);
+  await waitState(STATE_FILE_A, (state) => state.documents["sample-paper.pdf"] && state.documents["sample-paper.pdf"].lastSessionPath, "发送后目标条目带讨论记录");
+  const entryAfter18a = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  const otherAfter18a = readState(STATE_FILE_A).documents["archive/older-paper.pdf"];
+  const payload18a = await lastPayload();
+  const entryCount18a = await countOf(SEL.readerDiscuss);
+  await capturePage(win, "r18-1-send-records.png");
+  record(
+    "r18-discuss-entry",
+    {
+      phase: "send-records",
+      file: entryAfter18a,
+      payload: payload18a,
+      page: entryAfter18a.page,
+      scaleBefore: entryBefore18a.scale,
+      scaleAfter: entryAfter18a.scale,
+      otherEntry: otherAfter18a,
+      entryCount: entryCount18a,
+      warnDelta: warnCount() - warnBase18a,
+      pairKeyBefore: hasOwn(entryBefore18a, "lastSessionPath"),
+    },
+    [
+      ...(hasOwn(entryBefore18a, "lastSessionPath") === false ? [] : ["前置失败：夹具条目本不应带讨论记录"]),
+      ...(entryAfter18a.lastSessionPath === SESSIONS_A[0].path ? [] : [`记录会话路径不符：${JSON.stringify(entryAfter18a.lastSessionPath)}`]),
+      ...(typeof entryAfter18a.lastSessionAt === "number" && Number.isFinite(entryAfter18a.lastSessionAt) && Date.now() - entryAfter18a.lastSessionAt < 60000
+        ? []
+        : [`记录时刻不符：${JSON.stringify(entryAfter18a.lastSessionAt)}`]),
+      ...(entryAfter18a.page === 1 && entryAfter18a.scale === 1 ? [] : [`发送不得改变既有字段：${JSON.stringify({ page: entryAfter18a.page, scale: entryAfter18a.scale })}`]),
+      ...(otherAfter18a.lastSessionPath === SESSION_B_PATH && otherAfter18a.lastSessionAt === 1758000001000 ? [] : [`其它条目被波及：${JSON.stringify(otherAfter18a)}`]),
+      ...(payload18a && payload18a.lastSessionPath === SESSIONS_A[0].path && payload18a.lastSessionAt === entryAfter18a.lastSessionAt ? [] : [`末条 payload 未携带两键：${JSON.stringify(payload18a)}`]),
+      ...(entryCount18a === 0 ? [] : [`活动会话 = 记录会话 ⇒ 入口应隐藏：${entryCount18a}`]),
+      ...(warnCount() - warnBase18a === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18a}`]),
+    ],
+  );
+
+  log("r18-1 切到非记录会话 ⇒ 入口出现；点入口切回记录会话（零写入）");
+  await openSessionMenu();
+  await clickSessionItem("消融实验对照");
+  await closeSessionMenu();
+  await waitDiscussText("继续讨论：摘录与笔记走查 · ");
+  const entryText18a2 = await entryTextOf();
+  const entryTitle18a2 = await entryTitleOf();
+  const entryShape18a2 = await js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.readerDiscuss)});
+    if (!el) return null;
+    const icon = el.querySelector(".v-icon");
+    const docLabel = document.querySelector(${JSON.stringify(SEL.centerDocLabel)});
+    return {
+      count: document.querySelectorAll(${JSON.stringify(SEL.readerDiscuss)}).length,
+      tag: el.tagName,
+      iconClass: icon ? icon.className : null,
+      mapToggle: !!document.querySelector(${JSON.stringify(SEL.mapToggle)}),
+      docLabel: docLabel ? docLabel.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+  const pageBefore18a = await pageLabel();
+  const zoomBefore18a = await zoomLabel();
+  const pillBefore18a = await textOf(".pill-session .pill-label");
+  const allow18a = discussTimeAllowSet(entryAfter18a.lastSessionAt);
+  const suffix18a = entryText18a2 ? entryText18a2.slice("继续讨论：摘录与笔记走查 · ".length) : null;
+  await capturePage(win, "r18-1b-discuss-entry.png", await rectOfSelector(".center-pill", 12));
+  const switchBase18a = await switchCallsNow();
+  const shaBefore18a = fileHash(STATE_FILE_A);
+  const saveBefore18a = (await saveCalls()).count;
+  await js(`document.querySelector(${JSON.stringify(SEL.readerDiscuss)}).click(), true`);
+  await waitFor("入口点击后的会话切换", `window.__pixStub.switchSessionCalls().count >= ${switchBase18a.count + 1}`);
+  await waitPillSession("摘录与笔记走查");
+  // 终态信号：活动会话 = 记录会话 ⇒ 入口从 DOM 中消失（不用中间态断言）
+  await waitFor("入口隐藏（活动会话 = 记录会话）", `!document.querySelector(${JSON.stringify(SEL.readerDiscuss)})`);
+  const switchAfter18a = await switchCallsNow();
+  const pillAfter18a = await textOf(".pill-session .pill-label");
+  const pageAfter18a = await pageLabel();
+  const zoomAfter18a = await zoomLabel();
+  const entryCountAfter18a = await countOf(SEL.readerDiscuss);
+  await openSessionMenu();
+  const probe18a = await sessionMenuProbe();
+  await closeSessionMenu();
+  const activeRow18a = menuItem(probe18a, "摘录与笔记走查");
+  await capturePage(win, "r18-1c-discuss-switched.png");
+  record(
+    "r18-discuss-entry",
+    {
+      phase: "entry-visible-and-click",
+      entry: entryText18a2,
+      entryTitle: entryTitle18a2,
+      switchCalls: switchAfter18a,
+      pillBefore: pillBefore18a,
+      pillAfter: pillAfter18a,
+      activeRow: activeRow18a,
+      shaSame: fileHash(STATE_FILE_A) === shaBefore18a,
+      saveDelta: (await saveCalls()).count - saveBefore18a,
+      page: { before: pageBefore18a, after: pageAfter18a },
+      zoom: { before: zoomBefore18a, after: zoomAfter18a },
+      entryAfter: entryCountAfter18a,
+    },
+    [
+      ...(entryText18a2 !== null && entryText18a2.indexOf("继续讨论：摘录与笔记走查 · ") === 0 ? [] : [`入口文本前缀不符：${JSON.stringify(entryText18a2)}`]),
+      ...(suffix18a !== null && allow18a.has(suffix18a) ? [] : [`入口时间档位超出允许集：${JSON.stringify({ text: entryText18a2, allow: [...allow18a] })}`]),
+      ...(entryText18a2 !== null && entryTitle18a2 === `${entryText18a2}；点击打开该会话` ? [] : [`tooltip 不符：${JSON.stringify(entryTitle18a2)}`]),
+      ...(entryShape18a2 && entryShape18a2.count === 1 && entryShape18a2.tag === "BUTTON" && String(entryShape18a2.iconClass).includes("mdi-forum-outline")
+        ? []
+        : [`入口形态不符：${JSON.stringify(entryShape18a2)}`]),
+      ...(entryShape18a2 && entryShape18a2.docLabel === "sample-paper.pdf" && entryShape18a2.mapToggle === true ? [] : [`pill 既有子元素被破坏：${JSON.stringify(entryShape18a2)}`]),
+      ...(switchAfter18a.paths.slice(-1)[0] === SESSIONS_A[0].path ? [] : [`switch_session 载荷不符：${JSON.stringify(switchAfter18a)}`]),
+      ...(pillAfter18a === "摘录与笔记走查" && activeRow18a && activeRow18a.active === true ? [] : [`活动行不符：${JSON.stringify({ pillAfter: pillAfter18a, activeRow: activeRow18a })}`]),
+      ...(fileHash(STATE_FILE_A) === shaBefore18a ? [] : ["点入口不得写盘"]),
+      ...((await saveCalls()).count - saveBefore18a === 0 ? [] : [`点入口不得发 IPC：${(await saveCalls()).count - saveBefore18a}`]),
+      ...(pageAfter18a === pageBefore18a && zoomAfter18a === zoomBefore18a ? [] : [`点击不得切页 / 改缩放：${JSON.stringify({ page: { before: pageBefore18a, after: pageAfter18a }, zoom: { before: zoomBefore18a, after: zoomAfter18a } })}`]),
+      ...(entryCountAfter18a === 0 ? [] : [`点击后活动会话 = 记录会话 ⇒ 入口应隐藏：${entryCountAfter18a}`]),
+    ],
+  );
+
+  log("r18-1 发送失败：不记录，现场记录与入口文本逐字不变");
+  await openSessionMenu();
+  await clickSessionItem("消融实验对照");
+  await closeSessionMenu();
+  await waitDiscussText("继续讨论：摘录与笔记走查 · ");
+  const pairBefore18a3 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  const entryTextBefore18a3 = await entryTextOf();
+  const errorBase18a = await countOf(".error-block");
+  await clearSendCalls();
+  await setSendFailure("fail");
+  await typeAndSend("R18：这条应当发不出去。");
+  await waitFor("发送失败错误块", `document.querySelectorAll(".error-block").length > ${errorBase18a}`);
+  const errorText18a3 = await lastErrorText();
+  const pairAfter18a3 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  const entryTextAfter18a3 = await entryTextOf();
+  const sendCount18a3 = (await sendCalls()).count;
+  await setSendFailure(null);
+  await capturePage(win, "r18-1d-send-failed.png");
+  record(
+    "r18-discuss-entry",
+    {
+      phase: "send-failed",
+      errorText: errorText18a3,
+      pairBefore: pairBefore18a3,
+      pairAfter: pairAfter18a3,
+      entryText: entryTextAfter18a3,
+      sendCount: sendCount18a3,
+    },
+    [
+      ...(errorText18a3 !== null ? [] : ["发送被拒应有错误块"]),
+      ...(pairAfter18a3.lastSessionPath === pairBefore18a3.lastSessionPath && pairAfter18a3.lastSessionAt === pairBefore18a3.lastSessionAt
+        ? []
+        : [`失败发送不得改写记录：${JSON.stringify({ before: pairBefore18a3, after: pairAfter18a3 })}`]),
+      ...(entryTextAfter18a3 !== null && entryTextAfter18a3 === entryTextBefore18a3 ? [] : [`失败后入口文本应逐字不变：${JSON.stringify({ before: entryTextBefore18a3, after: entryTextAfter18a3 })}`]),
+      ...(pairAfter18a3.lastSessionAt === entryAfter18a.lastSessionAt ? [] : [`现场文件时间被改写：${JSON.stringify({ record: entryAfter18a.lastSessionAt, now: pairAfter18a3.lastSessionAt })}`]),
+      ...(sendCount18a3 === 1 ? [] : [`发送计数异常：${sendCount18a3}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  await setSendFailure(null);
+  await js("window.__pixStub.setSessions([]), true");
+
+  // --- r18-2 旧格式现场文件：零占位；打开 / 翻页 / 切换都不写记录（组 r18-old-format）---
+  log("r18-2 旧格式：续读入口在场、讨论入口零占位、读侧不造字段");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}), true`);
+  await enterWorkspaceWithState({
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: { "sample-paper.pdf": { page: 2, scale: 1, updatedAt: SEED_AT } },
+  });
+  await waitResumeEntry();
+  const warnBase18b = warnCount();
+  const resumeText18b = await textOf(".reader-resume");
+  const entryCount18b = await countOf(SEL.readerDiscuss);
+  const pairKey18b = hasOwn(readState(STATE_FILE_A).documents["sample-paper.pdf"], "lastSessionPath");
+  await capturePage(win, "r18-2-old-format.png");
+  record(
+    "r18-old-format",
+    {
+      phase: "old-format-silent",
+      resumeText: resumeText18b,
+      entryCount: entryCount18b,
+      warnDelta: warnCount() - warnBase18b,
+      hasPairKey: pairKey18b,
+    },
+    [
+      ...(resumeText18b === "继续阅读：sample-paper.pdf · 第 2 页" ? [] : [`续读入口文案不符：${JSON.stringify(resumeText18b)}`]),
+      ...(entryCount18b === 0 ? [] : [`无记录应零占位：${entryCount18b}`]),
+      ...(warnCount() - warnBase18b === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18b}`]),
+      ...(pairKey18b === false ? [] : ["读侧不得凭空造键"]),
+    ],
+  );
+
+  log("r18-2 打开文档 + 翻页：落点写盘只保留三字段，不新增记录键");
+  await js(`document.querySelector(".reader-resume").click(), true`);
+  await waitPdfLoaded();
+  await waitPage(2, 3);
+  await clickNext();
+  await waitPage(3, 3);
+  await waitState(STATE_FILE_A, (state) => state.documents["sample-paper.pdf"] && state.documents["sample-paper.pdf"].page === 3 && state.documents["sample-paper.pdf"].updatedAt > SEED_AT, "翻页后的落点写盘");
+  const entry18b2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  const entryCount18b2 = await countOf(SEL.readerDiscuss);
+  await openSessionMenu();
+  await clickSessionItem("消融实验对照");
+  await closeSessionMenu();
+  const pairKeyAfterSwitch18b = hasOwn(readState(STATE_FILE_A).documents["sample-paper.pdf"], "lastSessionPath");
+  const entryCount18b3 = await countOf(SEL.readerDiscuss);
+  await capturePage(win, "r18-2b-open-switch.png");
+  record(
+    "r18-old-format",
+    {
+      phase: "open-switch-no-write",
+      page: entry18b2.page,
+      pairKeyAfterOpen: hasOwn(entry18b2, "lastSessionPath"),
+      pairKeyAfterSwitch: pairKeyAfterSwitch18b,
+      entryCount: entryCount18b3,
+      entryCountAfterOpen: entryCount18b2,
+      warnDelta: warnCount() - warnBase18b,
+    },
+    [
+      ...(entry18b2.page === 3 && entry18b2.scale === 1 && entry18b2.updatedAt > SEED_AT ? [] : [`落点写盘不符：${JSON.stringify(entry18b2)}`]),
+      ...(hasOwn(entry18b2, "lastSessionPath") === false ? [] : ["打开 / 翻页不得写记录"]),
+      ...(pairKeyAfterSwitch18b === false ? [] : ["切换会话不得写记录"]),
+      ...(entryCount18b2 === 0 && entryCount18b3 === 0 ? [] : [`打开文档后仍应零占位：${JSON.stringify({ afterOpen: entryCount18b2, afterSwitch: entryCount18b3 })}`]),
+      ...(warnCount() - warnBase18b === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18b}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  await setSendFailure(null);
+  await js("window.__pixStub.setSessions([]), true");
+
+  // --- r18-3 记录会话不在列表：静默隐藏；列表恢复后入口与标记出现（组 r18-session-missing）---
+  log("r18-3 记录会话不在列表：入口与标记静默隐藏，现场记录原样保留");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}), true`);
+  await enterWorkspaceWithState({
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: {
+      "sample-paper.pdf": { page: 1, scale: 1, updatedAt: PAST_AT, lastSessionPath: SESSION_GONE_PATH, lastSessionAt: PAST_AT },
+    },
+  });
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const warnBase18c = warnCount();
+  const entryCount18c = await countOf(SEL.readerDiscuss);
+  const noticeContainers18c = { centerPill: await countOf(".center-pill .reader-discuss"), chatPanel: await countOf(".chat-panel .session-doc-mark") };
+  const pairBefore18c = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await openSessionMenu();
+  const markCount18c = await countOf(SEL.sessionDocMark);
+  await closeSessionMenu();
+  await capturePage(win, "r18-3-session-gone.png");
+  record(
+    "r18-session-missing",
+    {
+      phase: "session-gone",
+      entryCount: entryCount18c,
+      noticeContainers: noticeContainers18c,
+      warnDelta: warnCount() - warnBase18c,
+      pair: pairBefore18c,
+      markCount: markCount18c,
+    },
+    [
+      ...(entryCount18c === 0 ? [] : [`会话不在列表 ⇒ 入口应隐藏：${entryCount18c}`]),
+      ...(noticeContainers18c.centerPill === 0 && noticeContainers18c.chatPanel === 0 ? [] : [`不得出现异常容器内的元素：${JSON.stringify(noticeContainers18c)}`]),
+      ...(warnCount() - warnBase18c === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18c}`]),
+      ...(pairBefore18c.lastSessionPath === SESSION_GONE_PATH && pairBefore18c.lastSessionAt === PAST_AT ? [] : [`读侧不得改写记录：${JSON.stringify(pairBefore18c)}`]),
+      ...(markCount18c === 0 ? [] : [`会话不在列表 ⇒ 标注应隐藏：${markCount18c}`]),
+    ],
+  );
+
+  log("r18-3 恢复列表：入口与标记出现；列表刷新不改写现场文件");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_GHOST)}), true`);
+  const entryCountPre18c2 = await countOf(SEL.readerDiscuss);
+  // 自确定（不依赖前序场景遗留的 SESSION_STATE 镜像）：先读菜单行，把活动会话显式钉为
+  // 「摘录与笔记走查」（该行已是活动会话时点击是幂等 no-op：ChatPanel.onSelectSession early-return）。
+  await openSessionMenu();
+  const probePre18c2 = await sessionMenuProbe();
+  const activePre18c2 = probePre18c2.items.find((item) => item.active) ?? null;
+  const activeTitlePre18c2 = activePre18c2 ? activePre18c2.title : null;
+  const pinClicked18c2 = activeTitlePre18c2 !== "摘录与笔记走查";
+  if (pinClicked18c2) {
+    await clickSessionItem("摘录与笔记走查");
+    await waitPillSession("摘录与笔记走查");
+    await openSessionMenu();
+  }
+  // 冻结字面（设计档 §1.5.5）：此刻「消融实验对照」必然是非活动行 ⇒ 真实 switch_session
+  // （活动行会被 onSelectSession early-return ⇒ 不刷新列表、入口判据必超时）。
+  const switchBase18c2 = await switchCallsNow();
+  await clickSessionItem("消融实验对照");
+  await closeSessionMenu();
+  await waitDiscussText("继续讨论：丢失后恢复的会话 · 昨天");
+  const switchAfter18c2 = await switchCallsNow();
+  const entryText18c2 = await entryTextOf();
+  const entryTitle18c2 = await entryTitleOf();
+  const pairBefore18c2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await openSessionMenu();
+  const probe18c2 = await sessionMenuProbe();
+  await closeSessionMenu();
+  const marked18c2 = probe18c2.items.filter((item) => item.marked);
+  const activeAfter18c2 = menuItem(probe18c2, "消融实验对照");
+  const pairAfter18c2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await capturePage(win, "r18-3b-session-restored.png", await rectOfSelector(".center-pill", 12));
+  record(
+    "r18-session-missing",
+    {
+      phase: "session-restored",
+      entryText: entryText18c2,
+      entryTitle: entryTitle18c2,
+      entryCountBefore: entryCountPre18c2,
+      switchBase: switchBase18c2,
+      switchCalls: switchAfter18c2,
+      pinClicked: pinClicked18c2,
+      activeBefore: activeTitlePre18c2,
+      activeAfter: activeAfter18c2 ? activeAfter18c2.active : null,
+      markCount: marked18c2.length,
+      markTitle: marked18c2[0] ? marked18c2[0].markTitle : null,
+      pairBefore: pairBefore18c2,
+      pairAfter: pairAfter18c2,
+      page: pairAfter18c2.page,
+    },
+    [
+      ...(entryCountPre18c2 === 0 ? [] : [`切换前入口应隐藏（记录会话不在列表）：${entryCountPre18c2}`]),
+      ...(switchAfter18c2.count > switchBase18c2.count && switchAfter18c2.paths.slice(-1)[0] === SESSIONS_A[1].path
+        ? []
+        : [`真实会话切换链不符：${JSON.stringify({ base: switchBase18c2, after: switchAfter18c2 })}`]),
+      ...(activeAfter18c2 && activeAfter18c2.active === true ? [] : [`切换后活动行不符：${JSON.stringify(activeAfter18c2)}`]),
+      ...(entryText18c2 === "继续讨论：丢失后恢复的会话 · 昨天" ? [] : [`恢复后入口文本不符：${JSON.stringify(entryText18c2)}`]),
+      ...(entryTitle18c2 === `${entryText18c2}；点击打开该会话` ? [] : [`tooltip 不符：${JSON.stringify(entryTitle18c2)}`]),
+      ...(marked18c2.length === 1 && marked18c2[0].markTitle === "最近讨论：sample-paper.pdf" ? [] : [`标记不符：${JSON.stringify(marked18c2)}`]),
+      ...(pairAfter18c2.lastSessionPath === SESSION_GONE_PATH && pairAfter18c2.lastSessionAt === PAST_AT && pairAfter18c2.page === 1
+        ? []
+        : [`现场记录被改写：${JSON.stringify(pairAfter18c2)}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  await setSendFailure(null);
+  await js("window.__pixStub.setSessions([]), true");
+
+  // --- r18-4 跨工作区隔离：B 侧不见 A 的记录，A 文件不被 B 触碰（组 r18-workspace-isolation）---
+  log("r18-4 A 工作区前置：记录会话 ≠ 活动会话 ⇒ 入口在场");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}), true`);
+  await enterWorkspaceWithState({
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: {
+      "sample-paper.pdf": { page: 1, scale: 1, updatedAt: PAST_AT, lastSessionPath: SESSIONS_A[0].path, lastSessionAt: PAST_AT },
+    },
+  });
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openSessionMenu();
+  await clickSessionItem("消融实验对照");
+  await closeSessionMenu();
+  await waitDiscussText("继续讨论：摘录与笔记走查 · 昨天");
+  const entryCountA18d = await countOf(SEL.readerDiscuss);
+  const pairA18d = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+
+  log("r18-4 B 工作区：按 B 根种入会话列表，仍无入口 / 无标记；A 文件 sha 不变");
+  const shaA18d = fileHash(STATE_FILE_A);
+  const warnBase18d = warnCount();
+  await goHome();
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}, ${JSON.stringify(LIBRARY_B_DIR)}), true`);
+  await enterWorkspace(LIBRARY_B_NAME);
+  await waitTreeRows(1);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitState(STATE_FILE_B, (state) => state.documents["sample-paper.pdf"] && state.documents["sample-paper.pdf"].page === 1, "B 落点写盘");
+  await openSessionMenu();
+  const probeB18d = await sessionMenuProbe();
+  await closeSessionMenu();
+  const entryCountB18d = await countOf(SEL.readerDiscuss);
+  const bActiveRow = probeB18d.items.filter((item) => item.title === "消融实验对照")[0] ?? null;
+  const bEntry18d = readState(STATE_FILE_B).documents["sample-paper.pdf"];
+  await capturePage(win, "r18-4-workspace-b.png");
+  record(
+    "r18-workspace-isolation",
+    {
+      phase: "workspace-b",
+      entryCount: entryCountB18d,
+      entryCountA: entryCountA18d,
+      bState: bEntry18d,
+      menuRowCount: probeB18d.items.length,
+      menuRows: probeB18d.items.map((item) => ({ title: item.title, active: item.active, marked: item.marked, hasDeleteBtn: item.hasDeleteBtn, appendCount: item.appendCount, appendWidth: item.appendWidth })),
+      menuHasBoth: probeB18d.items.some((item) => item.title === "摘录与笔记走查") && probeB18d.items.some((item) => item.title === "消融实验对照"),
+      markCount: probeB18d.items.filter((item) => item.marked).length,
+      aShaSame: fileHash(STATE_FILE_A) === shaA18d,
+      warnDelta: warnCount() - warnBase18d,
+    },
+    [
+      ...(entryCountA18d === 1 ? [] : [`A 前置失败：入口应在场（记录会话 ≠ 活动会话）：${entryCountA18d}`]),
+      ...(entryCountB18d === 0 ? [] : [`B 列表非空但无有效对 ⇒ 入口应隐藏：${entryCountB18d}`]),
+      ...(hasOwn(bEntry18d, "lastSessionPath") === false ? [] : [`B 现场条目不得带记录键：${JSON.stringify(bEntry18d)}`]),
+      ...(probeB18d.items.some((item) => item.title === "摘录与笔记走查") && probeB18d.items.some((item) => item.title === "消融实验对照")
+        ? []
+        : [`B 列表未按 B 根种入：${JSON.stringify(probeB18d.items)}`]),
+      ...(probeB18d.items.filter((item) => item.marked).length === 0 ? [] : [`B 侧不得出现标记：${JSON.stringify(probeB18d.items)}`]),
+      // MF10 实测口径：空 append 容器（B 侧活动行 = 无标记且无删除按钮）零宽 ⇒ 视觉零位移
+      ...(bActiveRow && bActiveRow.appendCount === 1 && bActiveRow.appendWidth === 0 && bActiveRow.hasDeleteBtn === false
+        ? []
+        : [`空 append 容器应为零宽：${JSON.stringify(probeB18d.items.map((item) => ({ title: item.title, appendCount: item.appendCount, appendWidth: item.appendWidth, hasDeleteBtn: item.hasDeleteBtn })))}`]),
+      ...(fileHash(STATE_FILE_A) === shaA18d ? [] : ["B 侧操作不得触碰 A 文件"]),
+      ...(warnCount() - warnBase18d === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18d}`]),
+    ],
+  );
+
+  log("r18-4 回 A：入口恢复，现场记录不丢不重写");
+  await goHome();
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}, ${JSON.stringify(LIBRARY_DIR)}), true`);
+  await enterWorkspace(LIBRARY_NAME);
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitDiscussText("继续讨论：摘录与笔记走查 · 昨天");
+  const entryText18d2 = await entryTextOf();
+  const entryTitle18d2 = await entryTitleOf();
+  const pairAfter18d2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await capturePage(win, "r18-4b-back-to-a.png", await rectOfSelector(".center-pill", 12));
+  record(
+    "r18-workspace-isolation",
+    {
+      phase: "back-to-a",
+      entryText: entryText18d2,
+      entryTitle: entryTitle18d2,
+      pairSame: pairAfter18d2.lastSessionPath === pairA18d.lastSessionPath && pairAfter18d2.lastSessionAt === pairA18d.lastSessionAt,
+      pair: pairAfter18d2,
+    },
+    [
+      ...(entryText18d2 === "继续讨论：摘录与笔记走查 · 昨天" ? [] : [`回 A 后入口文本不符：${JSON.stringify(entryText18d2)}`]),
+      ...(entryTitle18d2 === `${entryText18d2}；点击打开该会话` ? [] : [`tooltip 不符：${JSON.stringify(entryTitle18d2)}`]),
+      ...(pairAfter18d2.lastSessionPath === pairA18d.lastSessionPath && pairAfter18d2.lastSessionAt === pairA18d.lastSessionAt
+        ? []
+        : [`回切不得丢记录 / 重复写：${JSON.stringify({ before: pairA18d, after: pairAfter18d2 })}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  await setSendFailure(null);
+  await js("window.__pixStub.setSessions([]), true");
+
+  // --- r18-5 会话列表标注：与当前文档相关的行恰一枚（组 r18-session-mark）---
+  log("r18-5 标记：当前文档相关行恰一枚，活动行同样显示");
+  await js(`window.__pixStub.setSessions(${JSON.stringify(SESSIONS_A)}), true`);
+  await enterWorkspaceWithState({
+    version: 1,
+    lastDocPath: "sample-paper.pdf",
+    documents: {
+      "sample-paper.pdf": { page: 1, scale: 1, updatedAt: PAST_AT, lastSessionPath: SESSIONS_A[0].path, lastSessionAt: PAST_AT },
+    },
+  });
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const warnBase18e = warnCount();
+  await openSessionMenu();
+  await clickSessionItem("摘录与笔记走查");
+  await closeSessionMenu();
+  await waitPillSession("摘录与笔记走查");
+  await waitFor("入口隐藏（活动会话 = 记录会话）", `!document.querySelector(${JSON.stringify(SEL.readerDiscuss)})`);
+  const entryCount18e = await countOf(SEL.readerDiscuss);
+  await openSessionMenu();
+  const probe18e = await sessionMenuProbe();
+  const deleteBtnCount18e = await countOf(".v-overlay-container .session-delete-btn");
+  const deleteTitle18e = await deleteTitleOf();
+  const menuText18e = await textOf(".v-overlay-container .v-list");
+  const activeRow18e = menuItem(probe18e, "摘录与笔记走查");
+  const otherRow18e = menuItem(probe18e, "消融实验对照");
+  await capturePage(win, "r18-5-session-mark.png");
+  await closeSessionMenu();
+  record(
+    "r18-session-mark",
+    {
+      phase: "mark-visible",
+      items: probe18e.items,
+      markCount: probe18e.items.filter((item) => item.marked).length,
+      markTitle: activeRow18e ? activeRow18e.markTitle : null,
+      deleteCount: deleteBtnCount18e,
+      deleteTitle: deleteTitle18e,
+      menuText: menuText18e,
+      entryCount: entryCount18e,
+    },
+    [
+      ...(activeRow18e && activeRow18e.marked === true && activeRow18e.markTitle === "最近讨论：sample-paper.pdf" && probe18e.items.filter((item) => item.marked).length === 1
+        ? []
+        : [`标记不符：${JSON.stringify(probe18e.items)}`]),
+      ...(otherRow18e && otherRow18e.marked === false ? [] : [`非记录会话行不应有标记：${JSON.stringify(otherRow18e)}`]),
+      ...(deleteBtnCount18e === 1 && deleteTitle18e === "删除该对话" ? [] : [`删除按钮不符：${JSON.stringify({ count: deleteBtnCount18e, title: deleteTitle18e })}`]),
+      // MF10 实测口径：会话行恒一枚容器（第 3 列）；命令行无该容器。容器内容 = 标记 / 删除按钮（两者都有时同行）
+      ...(probe18e.items.filter((item) => item.appendCount === 1).length === 2 &&
+      probe18e.items.filter((item) => item.appendCount === 0).length === 2 &&
+      activeRow18e && activeRow18e.hasDeleteBtn === false &&
+      otherRow18e && otherRow18e.hasDeleteBtn === true
+        ? []
+        : [`append 容器事实不符：${JSON.stringify(probe18e.items.map((item) => ({ title: item.title, appendCount: item.appendCount, appendWidth: item.appendWidth })))}`]),
+      ...(menuText18e && ["新对话", "重命名当前对话", "历史对话"].every((text) => menuText18e.includes(text)) ? [] : [`菜单既有文案缺失：${JSON.stringify(menuText18e)}`]),
+      ...(entryCount18e === 0 ? [] : [`活动会话 = 记录会话 ⇒ 入口应隐藏：${entryCount18e}`]),
+    ],
+  );
+
+  log("r18-5 无记录文档：标记与入口都不在；切回后标记恢复且现场记录不丢");
+  const pairBefore18e2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  await openRow("long-book.pdf");
+  await waitFor("long-book 页盒 60 页", `document.querySelectorAll(".pdf-page").length === 60`);
+  await openSessionMenu();
+  const probeAbsent18e = await sessionMenuProbe();
+  const entryCountAbsent18e = await countOf(SEL.readerDiscuss);
+  await capturePage(win, "r18-5b-mark-absent.png");
+  await closeSessionMenu();
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await openSessionMenu();
+  const probeRestored18e = await sessionMenuProbe();
+  const entryCountRestored18e = await countOf(SEL.readerDiscuss);
+  await closeSessionMenu();
+  const pairAfter18e2 = readState(STATE_FILE_A).documents["sample-paper.pdf"];
+  record(
+    "r18-session-mark",
+    {
+      phase: "mark-absent",
+      markCount: probeAbsent18e.items.filter((item) => item.marked).length,
+      entryCount: entryCountAbsent18e,
+      restoredMark: (probeRestored18e.items.find((item) => item.marked) || {}).markTitle ?? null,
+      restoredEntryCount: entryCountRestored18e,
+      pairSame: pairAfter18e2.lastSessionPath === pairBefore18e2.lastSessionPath && pairAfter18e2.lastSessionAt === pairBefore18e2.lastSessionAt,
+      warnDelta: warnCount() - warnBase18e,
+    },
+    [
+      ...(probeAbsent18e.items.filter((item) => item.marked).length === 0 && entryCountAbsent18e === 0
+        ? []
+        : [`无记录文档不得有标记与入口：${JSON.stringify({ marks: probeAbsent18e.items.filter((item) => item.marked).length, entryCount: entryCountAbsent18e })}`]),
+      ...((probeRestored18e.items.find((item) => item.marked) || {}).markTitle === "最近讨论：sample-paper.pdf" ? [] : [`切回后标记应恢复：${JSON.stringify(probeRestored18e.items)}`]),
+      ...(entryCountRestored18e === 0 ? [] : [`活动会话仍是记录会话 ⇒ 入口应隐藏：${entryCountRestored18e}`]),
+      ...(pairAfter18e2.lastSessionPath === pairBefore18e2.lastSessionPath && pairAfter18e2.lastSessionAt === pairBefore18e2.lastSessionAt
+        ? []
+        : [`读-改-写不得丢对：${JSON.stringify({ before: pairBefore18e2, after: pairAfter18e2 })}`]),
+      ...(warnCount() - warnBase18e === 0 ? [] : [`不得产生警告：${warnCount() - warnBase18e}`]),
+    ],
+  );
+  await restoreStandardSeed();
+  await setSendFailure(null);
+  await js("window.__pixStub.setSessions([]), true");
 }
 
 // ---------------------------------------------------------------------------

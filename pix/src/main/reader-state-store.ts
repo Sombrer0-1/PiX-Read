@@ -29,6 +29,8 @@ const SCHEMA_VERSION = 1;
 /** 与渲染层 reader-store 的 MIN_SCALE/MAX_SCALE 同域：主进程独立判，渲染层不做第二套校验。 */
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
+/** R18：会话文件路径的长度上限（与渲染层 reader-state store 同域，仅主进程判）。 */
+const MAX_SESSION_PATH_LENGTH = 2048;
 
 const ERROR_MESSAGES: Record<ReaderStateErrorCode, string> = {
   "no-root": "尚未选择资料库根目录",
@@ -102,6 +104,16 @@ function isValidScale(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= MIN_SCALE && value <= MAX_SCALE;
 }
 
+/** R18：会话文件路径原样存储（不解析、不校验存在性），只做非空 / 长度 / NUL 三项值域判定。 */
+function isValidSessionPath(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_SESSION_PATH_LENGTH && !value.includes("\u0000");
+}
+
+/** R18：讨论时刻（epoch ms，写入方时钟，不做钳制），只接受 > 0 的有限数。 */
+function isValidSessionAt(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 /** 草稿的绝对路径 → 工作区相对正斜杠路径；越界或落在根上返回 null。 */
 function toRelativeDocPath(filePath: string, root: string): string | null {
   const resolved = resolve(filePath);
@@ -117,6 +129,10 @@ function parseDocState(value: unknown): ReaderDocState | null {
   if (!isValidPage(value.page) || !isValidScale(value.scale)) return null;
   // updatedAt 非关键字段：读不出就记 0，不因它丢现场
   const updatedAt = typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) ? value.updatedAt : 0;
+  // R18：合法对 ⇒ 成对带回；任一非法 ⇒ 两键都不追加（读侧不产生 warn、不改写文件）
+  if (isValidSessionPath(value.lastSessionPath) && isValidSessionAt(value.lastSessionAt)) {
+    return { page: value.page, scale: value.scale, updatedAt, lastSessionPath: value.lastSessionPath, lastSessionAt: value.lastSessionAt };
+  }
   return { page: value.page, scale: value.scale, updatedAt };
 }
 
@@ -280,11 +296,18 @@ export function saveReaderState(draft: ReaderStateSaveDraft): ReaderStateSaveRes
   const current = read.ok ? read.file : emptyState();
 
   const key = docPathKey(docPath);
+  const previous = current.documents[key];
+  // R18：有效对 ⇒ 覆盖；否则 ⇒ 保留目标条目既有对（含「本来就没有」）；其它条目一字不动
+  const carried = isValidSessionPath(draft.lastSessionPath) && isValidSessionAt(draft.lastSessionAt)
+    ? { lastSessionPath: draft.lastSessionPath, lastSessionAt: draft.lastSessionAt }
+    : previous && previous.lastSessionPath !== undefined && previous.lastSessionAt !== undefined
+      ? { lastSessionPath: previous.lastSessionPath, lastSessionAt: previous.lastSessionAt }
+      : {};
   const next: ReaderStateFile = {
     version: SCHEMA_VERSION,
     lastDocPath: docPath,
     // 键顺序沿用读入顺序：已有键原位覆盖，新条目追加在末尾
-    documents: { ...current.documents, [key]: { page: draft.page, scale: draft.scale, updatedAt: Date.now() } },
+    documents: { ...current.documents, [key]: { page: draft.page, scale: draft.scale, updatedAt: Date.now(), ...carried } },
   };
 
   const write = writeFileAtomic(filePath, serializeState(next));

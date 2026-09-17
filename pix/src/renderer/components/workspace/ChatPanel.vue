@@ -15,6 +15,7 @@ import { EXPLAIN_TEMPLATE, TRANSLATE_TEMPLATE, resolveTemplateDraft, templateFor
 import { registerRegionCaptureConsumer } from "../../composables/useRegionCapture";
 import { useNotesStore } from "../../stores/notes-store";
 import { useReaderStore } from "../../stores/reader-store";
+import { useReaderStateStore } from "../../stores/reader-state-store";
 import { useSessionStore } from "../../stores/session-store";
 import { MAX_CONTEXT_NOTES_CHARS, buildReadingUserMessage, selectNotesForContext } from "../../utils/reading-context";
 import { renderMarkdown } from "../../utils/markdown";
@@ -23,6 +24,7 @@ import type { RequestUserInputRequest } from "@/types/rpc";
 import type { DisplayBlock, SessionInfo } from "@/types/session";
 import type { ReadingAnchor } from "@shared/types";
 import { deriveSessionTitle, formatSessionTime } from "../../utils/session-title";
+import { docPathKey } from "../../utils/notes-path";
 import MessageBlock from "../session/MessageBlock.vue";
 import ToolExecutionBlock from "../session/ToolExecutionBlock.vue";
 import ErrorBlock from "../session/ErrorBlock.vue";
@@ -50,6 +52,7 @@ const rpc = useRpc();
 const sessionStore = useSessionStore();
 const notesStore = useNotesStore();
 const readerStore = useReaderStore();
+const readerStateStore = useReaderStateStore();
 const router = useRouter();
 
 const THINKING_LEVEL_LABELS: Record<string, string> = {
@@ -208,6 +211,21 @@ const currentThinkingLabel = computed(() => {
 });
 const paneTitle = computed(() => props.sessionTitle || rpc.sessionState.value?.sessionName || "新对话");
 const historySessions = computed(() => props.sessions ?? []);
+
+/** R18：会话列表标注的两个派生 + 谓词（只读现场 store 的唯一派生点；与活动会话无关）。 */
+const docRelatedPath = computed<string | null>(() => {
+  const link = readerStateStore.currentDiscussion;
+  return link ? docPathKey(link.sessionPath) : null;
+});
+
+const docRelatedTitle = computed(() => {
+  const link = readerStateStore.currentDiscussion;
+  return link ? `最近讨论：${link.docName}` : "";
+});
+
+function isDocRelatedSession(session: SessionInfo): boolean {
+  return docRelatedPath.value !== null && docPathKey(session.path) === docRelatedPath.value;
+}
 
 // Composer usage meta is a pure computed; sessionStats refresh is owned by
 // useRpc (agent lifecycle events) — no polling here.
@@ -391,6 +409,9 @@ async function send(): Promise<void> {
   // 锚点与实参共用同一份快照对象：快照里 filePath / page 两个字段各只赋值一次（判定口径见设计档 §7.5 no.2）。
   const readFilePath = readerStore.filePath;
   const readPage = readerStore.page;
+  // R18：讨论记录的两份快照（缩放 + 发送瞬间的会话文件）与上面同段读取，各只读一次
+  const readScale = readerStore.scale;
+  const sendingSessionPath = rpc.sessionState.value?.sessionFile ?? null;
   // 发送瞬间的笔记选择集快照（派生结果，新数组）；发送在途的清单/选择变化只影响下一回合，不回溯本次载荷
   // 与「选中文本」同范式：chip 被移除只停用本次注入，不动选择集（设计档 §4 第 3 行）
   const notesSnapshot = excluded.has("notes") ? [] : [...notesStore.selectedNotes];
@@ -425,9 +446,11 @@ async function send(): Promise<void> {
     // While the agent is running, Enter queues a steer instead of a duplicate prompt.
     if (isStreaming.value) {
       await rpc.sendSteer(message, filePaths, sendImages, text);
-      return;
+    } else {
+      await rpc.sendPrompt(message, filePaths, sendImages, text);
     }
-    await rpc.sendPrompt(message, filePaths, sendImages, text);
+    // R18：发送成功返回后的唯一记录点；失败路径（catch）不得记录
+    readerStateStore.noteDiscussion(readFilePath, readPage, readScale, sendingSessionPath);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     sessionStore.failOptimisticUserMessage(optimisticBlockId.value, errorMessage);
@@ -957,8 +980,12 @@ onUnmounted(() => {
               prepend-icon="mdi-comment-text-outline"
               @click="onSelectSession(session)"
             >
-              <template v-if="!isActiveSession(session) && !isStreaming" #append>
+              <template #append>
+                <span v-if="isDocRelatedSession(session)" class="session-doc-mark" :title="docRelatedTitle">
+                  <v-icon size="14">mdi-file-link-outline</v-icon>
+                </span>
                 <button
+                  v-if="!isActiveSession(session) && !isStreaming"
                   type="button"
                   class="session-delete-btn"
                   :class="{ armed: deleteArmedPath === session.path }"
@@ -1348,6 +1375,13 @@ onUnmounted(() => {
 .session-delete-btn.armed {
   background: var(--pix-bg-hover, #eef2f6);
   color: var(--pix-error, #b75a55);
+}
+
+.session-doc-mark {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  color: var(--pix-text-muted);
 }
 
 .chat-messages {

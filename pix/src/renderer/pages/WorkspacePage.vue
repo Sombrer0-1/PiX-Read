@@ -175,6 +175,15 @@ async function onSwitchSession(session: SessionInfo): Promise<void> {
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
 }
 
+/** R18：入口 → 会话切换（复用既有 onSwitchSession；两条 no-op 守卫）。 */
+function onOpenDiscussionSession(sessionPath: string): void {
+  const key = docPathKey(sessionPath);
+  const session = projectStore.sessions.find((item) => docPathKey(item.path) === key);
+  if (!session) return;
+  if (docPathKey(session.path) === docPathKey(currentSessionPath.value ?? "")) return;
+  void onSwitchSession(session);
+}
+
 async function onDeleteSession(session: SessionInfo): Promise<void> {
   // The active conversation's file belongs to the running session; only
   // history entries expose the delete action, so this is a belt-and-braces guard.
@@ -333,6 +342,7 @@ async function goHome(): Promise<void> {
             class="pane-body reader-under-pill"
             :file-path="selectedFilePath"
             @open-document="openDocumentFromLibrary"
+            @open-session="onOpenDiscussionSession"
           />
         </div>
       </template>
