@@ -912,7 +912,10 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl = `${variant.basePath}/v1`;
 				}
 
-				if (variant.provider === "opencode" && modelId === "grok-build-0.1") {
+				// Only the OpenAI-compatible /v1/chat/completions path exists for OpenAICompletionsCompat fields.
+				// models.dev can flip this model to @ai-sdk/openai (responses API); attaching a
+				// completions-only compat then produces an invalid generated entry (TS2353).
+				if (variant.provider === "opencode" && modelId === "grok-build-0.1" && api === "openai-completions") {
 					compat = { ...(compat ?? {}), supportsReasoningEffort: false };
 				}
 
