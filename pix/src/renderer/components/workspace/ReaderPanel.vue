@@ -23,6 +23,7 @@ import type { LibraryReadFailure } from "../../utils/reading-context";
 import PdfViewer from "./PdfViewer.vue";
 import KnowledgeMap from "./KnowledgeMap.vue";
 import PdfSelectionQuickAsk from "./PdfSelectionQuickAsk.vue";
+import ShortcutOverview from "./ShortcutOverview.vue";
 
 /** Knowledge map needs this much stage width, otherwise the page column loses it. */
 const MIN_STAGE_WIDTH_FOR_MAP = 620;
@@ -256,6 +257,7 @@ onBeforeUnmount(() => {
     </div>
 
     <PdfSelectionQuickAsk />
+    <ShortcutOverview />
   </div>
 </template>
 

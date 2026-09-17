@@ -140,6 +140,8 @@ let outlineNotes = null;
 let readingContext = null;
 let notesPath = null;
 let pageAnchor = null;
+let shortcutHelp = null;
+let quickAskTemplates = null;
 
 function group(name) {
   console.log(`== 组 ${name} ==`);
@@ -760,6 +762,222 @@ function runExcerptMatch() {
   );
 }
 
+// ── 组 shortcut-table（R17 N96；12 条）：键位总览数据源（3 组 / 18 行，逐字） ──────
+
+/** 手写期望常量（不由被测数据生成）：3 个组标题 + 18 行 { keys, desc } + 说明行。 */
+const SHORTCUT_EXPECT_TITLES = ["阅读区（打开文档后）", "输入框", "工作区"];
+const SHORTCUT_EXPECT_ROWS_READER = [
+  { keys: ["/"], desc: "打开文档搜索" },
+  { keys: ["Ctrl+F"], desc: "打开文档搜索" },
+  { keys: ["PageUp", "←"], desc: "上一页" },
+  { keys: ["PageDown", "→"], desc: "下一页" },
+  { keys: ["Home"], desc: "跳到第一页" },
+  { keys: ["End"], desc: "跳到最后一页" },
+  { keys: ["["], desc: "上一节" },
+  { keys: ["]"], desc: "下一节" },
+  { keys: ["Esc"], desc: "退出框选模式或关闭文档搜索" },
+];
+const SHORTCUT_EXPECT_ROWS_INPUT = [
+  { keys: ["Enter"], desc: "发送消息（对话输入框）" },
+  { keys: ["Shift+Enter"], desc: "换行（对话输入框）" },
+  { keys: ["Enter"], desc: "下一处（文档搜索框）" },
+  { keys: ["Shift+Enter"], desc: "上一处（文档搜索框）" },
+  { keys: ["Enter"], desc: "跳转到该页（页码输入框）" },
+  { keys: ["Esc"], desc: "取消页码输入（页码输入框）" },
+  { keys: ["Esc"], desc: "清空搜索并移出焦点（笔记搜索框）" },
+  { keys: ["Enter"], desc: "提交重命名（对话名称输入框）" },
+];
+const SHORTCUT_EXPECT_ROWS_WORKSPACE = [{ keys: ["?"], desc: "打开或关闭本总览" }];
+const SHORTCUT_EXPECT_NOTE = "选区浮层（选中文本后出现，无键位）：问 AI / 解释 / 翻译 / 摘录";
+
+function runShortcutTable() {
+  const G = "shortcut-table";
+  group(G);
+  const sections = shortcutHelp.SHORTCUT_SECTIONS;
+
+  check(G, 1, "组数 === 3", sections.length === 3, String(sections.length));
+
+  const titles = sections.map((section) => section.title);
+  check(
+    G,
+    2,
+    "三个组标题逐字（顺序敏感）",
+    JSON.stringify(titles) === JSON.stringify(SHORTCUT_EXPECT_TITLES),
+    JSON.stringify(titles),
+  );
+
+  const totalRows = sections.reduce((sum, section) => sum + section.rows.length, 0);
+  check(G, 3, "总行数 === 18（9 + 8 + 1）", totalRows === 18, String(totalRows));
+
+  check(
+    G,
+    4,
+    "第 1 组 9 行逐字深等（含 PageUp / ← 与两行重复文案「打开文档搜索」）",
+    JSON.stringify(sections[0]?.rows) === JSON.stringify(SHORTCUT_EXPECT_ROWS_READER),
+    JSON.stringify(sections[0]?.rows),
+  );
+
+  check(
+    G,
+    5,
+    "第 2 组 8 行逐字深等（含「提交重命名（对话名称输入框）」）",
+    JSON.stringify(sections[1]?.rows) === JSON.stringify(SHORTCUT_EXPECT_ROWS_INPUT),
+    JSON.stringify(sections[1]?.rows),
+  );
+
+  check(
+    G,
+    6,
+    "第 3 组 1 行逐字深等（[\"?\"] / 打开或关闭本总览）",
+    JSON.stringify(sections[2]?.rows) === JSON.stringify(SHORTCUT_EXPECT_ROWS_WORKSPACE),
+    JSON.stringify(sections[2]?.rows),
+  );
+
+  const allRows = sections.flatMap((section) => section.rows);
+  const keysAllNonEmpty = allRows.every(
+    (row) => Array.isArray(row.keys) && row.keys.length > 0 && row.keys.every((key) => typeof key === "string" && key.length > 0),
+  );
+  const combos = allRows.map((row) => row.keys.join(shortcutHelp.SHORTCUT_KEY_JOIN) + row.desc);
+  const combosUnique = new Set(combos).size === combos.length;
+  check(
+    G,
+    7,
+    "全表 keys 元素均为非空字符串；keys.join(JOIN) + desc 组合无重复",
+    keysAllNonEmpty && combosUnique,
+    JSON.stringify({ keysAllNonEmpty, combosUnique, duplicates: combos.filter((combo, index) => combos.indexOf(combo) !== index) }),
+  );
+
+  check(G, 8, "SHORTCUT_KEY_JOIN 逐字 \" / \"", shortcutHelp.SHORTCUT_KEY_JOIN === " / ", JSON.stringify(shortcutHelp.SHORTCUT_KEY_JOIN));
+
+  check(
+    G,
+    9,
+    "SHORTCUT_NOTE 逐字等于冻结串且含「摘录」",
+    shortcutHelp.SHORTCUT_NOTE === SHORTCUT_EXPECT_NOTE && shortcutHelp.SHORTCUT_NOTE.includes("摘录"),
+    JSON.stringify(shortcutHelp.SHORTCUT_NOTE),
+  );
+
+  const serialized = JSON.stringify(sections);
+  check(
+    G,
+    10,
+    "全表不含 ArrowUp / ArrowDown",
+    !serialized.includes("ArrowUp") && !serialized.includes("ArrowDown"),
+    JSON.stringify({ arrowUp: serialized.includes("ArrowUp"), arrowDown: serialized.includes("ArrowDown") }),
+  );
+
+  const ctrlHits = serialized.split("Ctrl+").length - 1;
+  check(
+    G,
+    11,
+    "修饰键白名单：Ctrl+ 恰 1 次（Ctrl+F），且不含 Ctrl+Shift / Alt+ / Meta+",
+    ctrlHits === 1 && !serialized.includes("Ctrl+Shift") && !serialized.includes("Alt+") && !serialized.includes("Meta+"),
+    JSON.stringify({ ctrlHits, ctrlShift: serialized.includes("Ctrl+Shift"), alt: serialized.includes("Alt+"), meta: serialized.includes("Meta+") }),
+  );
+
+  const groupsWellFormed = sections.every(
+    (section) => typeof section.title === "string" && section.title.length > 0 && section.rows.length > 0,
+  );
+  check(
+    G,
+    12,
+    "每组 title 为非空字符串且 rows.length > 0（防空断言防护）",
+    groupsWellFormed,
+    JSON.stringify(sections.map((section) => ({ title: section.title, rows: section.rows.length }))),
+  );
+}
+
+// ── 组 template-draft（R17 N97；11 条）：选区模板动作纯函数（逐字 / 三分支） ──────
+
+/** 手写期望常量（不由被测函数生成）：两个新模板 + 两个既有模板 + 可替换集合。 */
+const QUICK_ASK = "请解释选中的这段话：";
+const NOTES_ASK = "请结合我选中的摘录回答：";
+const EXPLAIN = "请解释选中的这段话在论文中的含义与作用：";
+const TRANSLATE = "请把选中的这段话翻译成中文：";
+const KNOWN = [QUICK_ASK, EXPLAIN, TRANSLATE];
+
+function runTemplateDraft() {
+  const G = "template-draft";
+  group(G);
+  const templates = quickAskTemplates;
+
+  check(G, 1, "EXPLAIN_TEMPLATE 逐字", templates.EXPLAIN_TEMPLATE === EXPLAIN, JSON.stringify(templates.EXPLAIN_TEMPLATE));
+
+  check(G, 2, "TRANSLATE_TEMPLATE 逐字", templates.TRANSLATE_TEMPLATE === TRANSLATE, JSON.stringify(templates.TRANSLATE_TEMPLATE));
+
+  check(
+    G,
+    3,
+    "templateForAction：explain ⇒ EXPLAIN_TEMPLATE、translate ⇒ TRANSLATE_TEMPLATE",
+    templates.templateForAction("explain") === EXPLAIN && templates.templateForAction("translate") === TRANSLATE,
+    JSON.stringify({ explain: templates.templateForAction("explain"), translate: templates.templateForAction("translate") }),
+  );
+
+  check(
+    G,
+    4,
+    "空草稿 ⇒ 返回 template",
+    templates.resolveTemplateDraft("", EXPLAIN, KNOWN) === EXPLAIN,
+    JSON.stringify(templates.resolveTemplateDraft("", EXPLAIN, KNOWN)),
+  );
+
+  check(
+    G,
+    5,
+    "纯空白草稿 ⇒ 按空处理",
+    templates.resolveTemplateDraft("   ", TRANSLATE, KNOWN) === TRANSLATE,
+    JSON.stringify(templates.resolveTemplateDraft("   ", TRANSLATE, KNOWN)),
+  );
+
+  check(
+    G,
+    6,
+    "既有模板（问 AI 的草稿）可被替换",
+    templates.resolveTemplateDraft(QUICK_ASK, EXPLAIN, KNOWN) === EXPLAIN,
+    JSON.stringify(templates.resolveTemplateDraft(QUICK_ASK, EXPLAIN, KNOWN)),
+  );
+
+  check(
+    G,
+    7,
+    "模板互替：EXPLAIN ⇒ TRANSLATE",
+    templates.resolveTemplateDraft(EXPLAIN, TRANSLATE, KNOWN) === TRANSLATE,
+    JSON.stringify(templates.resolveTemplateDraft(EXPLAIN, TRANSLATE, KNOWN)),
+  );
+
+  check(
+    G,
+    8,
+    "自定义草稿 ⇒ null（一字不改）",
+    templates.resolveTemplateDraft("我的问题", EXPLAIN, KNOWN) === null,
+    JSON.stringify(templates.resolveTemplateDraft("我的问题", EXPLAIN, KNOWN)),
+  );
+
+  check(
+    G,
+    9,
+    "笔记模板不在替换集合 ⇒ null",
+    templates.resolveTemplateDraft(NOTES_ASK, EXPLAIN, KNOWN) === null,
+    JSON.stringify(templates.resolveTemplateDraft(NOTES_ASK, EXPLAIN, KNOWN)),
+  );
+
+  check(
+    G,
+    10,
+    "两模板互不相等、且都不等于既有模板（期望值手写）",
+    EXPLAIN !== TRANSLATE && EXPLAIN !== QUICK_ASK && TRANSLATE !== QUICK_ASK,
+    JSON.stringify({ explainVsTranslate: EXPLAIN !== TRANSLATE, explainVsQuickAsk: EXPLAIN !== QUICK_ASK, translateVsQuickAsk: TRANSLATE !== QUICK_ASK }),
+  );
+
+  check(
+    G,
+    11,
+    "首尾空白差异即不匹配（\" \" + EXPLAIN ⇒ null）",
+    templates.resolveTemplateDraft(" " + EXPLAIN, TRANSLATE, KNOWN) === null,
+    JSON.stringify(templates.resolveTemplateDraft(" " + EXPLAIN, TRANSLATE, KNOWN)),
+  );
+}
+
 /** 编译仓库内三个源文件到 %TEMP%（不复制源码），校验产物集合后加载。 */
 function compileAndLoad() {
   mkdirSync(TMP, { recursive: true });
@@ -782,6 +1000,8 @@ function compileAndLoad() {
       join(REPO_DIR, "pix", "src", "renderer", "utils", "notes-path.ts"),
       join(REPO_DIR, "pix", "src", "renderer", "utils", "reading-context.ts"),
       join(REPO_DIR, "pix", "src", "renderer", "utils", "page-anchor.ts"),
+      join(REPO_DIR, "pix", "src", "renderer", "utils", "shortcut-help.ts"),
+      join(REPO_DIR, "pix", "src", "renderer", "utils", "quick-ask-templates.ts"),
       WINDOW_SHIM,
     ],
   };
@@ -796,7 +1016,7 @@ function compileAndLoad() {
     return false;
   }
 
-  const required = ["renderer/utils/outline-notes.js", "renderer/utils/notes-path.js", "renderer/utils/reading-context.js", "renderer/utils/page-anchor.js"];
+  const required = ["renderer/utils/outline-notes.js", "renderer/utils/notes-path.js", "renderer/utils/reading-context.js", "renderer/utils/page-anchor.js", "renderer/utils/shortcut-help.js", "renderer/utils/quick-ask-templates.js"];
   const allowed = new Set([...required, "shared/types.js"]);
   let emitted = [];
   try {
@@ -819,6 +1039,8 @@ function compileAndLoad() {
   readingContext = require(join(OUT_DIR, "renderer", "utils", "reading-context.js"));
   notesPath = require(join(OUT_DIR, "renderer", "utils", "notes-path.js"));
   pageAnchor = require(join(OUT_DIR, "renderer", "utils", "page-anchor.js"));
+  shortcutHelp = require(join(OUT_DIR, "renderer", "utils", "shortcut-help.js"));
+  quickAskTemplates = require(join(OUT_DIR, "renderer", "utils", "quick-ask-templates.js"));
   return true;
 }
 
@@ -834,6 +1056,8 @@ function main() {
       runBadgeCounts();
       runNotesByPage();
       runExcerptMatch();
+      runShortcutTable();
+      runTemplateDraft();
     }
     console.log(`通过 ${passed} / 失败 ${failed}`);
     if (failed > 0) process.exitCode = 1;

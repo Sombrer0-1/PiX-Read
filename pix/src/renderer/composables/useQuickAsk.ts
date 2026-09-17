@@ -7,7 +7,9 @@
  * selection in the store, then emits a bare trigger (R8 design §1.4).
  */
 
-export type QuickAskHandler = (text: string) => void;
+export type QuickAskAction = "ask" | "explain" | "translate";
+
+export type QuickAskHandler = (text: string, action: QuickAskAction) => void;
 
 let currentHandler: QuickAskHandler | null = null;
 
@@ -15,8 +17,8 @@ export function registerQuickAskConsumer(handler: QuickAskHandler | null): void 
   currentHandler = handler;
 }
 
-export function emitQuickAsk(text: string): void {
-  currentHandler?.(text);
+export function emitQuickAsk(text: string, action: QuickAskAction = "ask"): void {
+  currentHandler?.(text, action);
 }
 
 export type NotesAskHandler = () => void;

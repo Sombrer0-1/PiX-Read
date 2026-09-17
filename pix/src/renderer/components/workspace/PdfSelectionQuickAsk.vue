@@ -10,6 +10,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { emitQuickAsk } from "../../composables/useQuickAsk";
+import type { TemplateAction } from "../../utils/quick-ask-templates";
 import { useNotesStore } from "../../stores/notes-store";
 import { useReaderStore } from "../../stores/reader-store";
 import { resolveSelectionPage } from "../../utils/note-capture";
@@ -151,6 +152,12 @@ function onButtonClick(): void {
   if (text) emitQuickAsk(text);
 }
 
+function onTemplateClick(action: TemplateAction): void {
+  const text = cachedText;
+  hide();
+  if (text) emitQuickAsk(text, action);
+}
+
 async function onExcerptClick(): Promise<void> {
   const page = selectionPage.value;
   const docFilePath = readerStore.filePath;
@@ -205,6 +212,14 @@ onBeforeUnmount(() => {
       <button type="button" class="quick-ask-btn" :disabled="pending" @click="onButtonClick">
         <v-icon size="12">mdi-comment-question-outline</v-icon>
         问 AI
+      </button>
+      <button type="button" class="quick-ask-btn" :disabled="pending" @click="onTemplateClick('explain')">
+        <v-icon size="12">mdi-lightbulb-on-outline</v-icon>
+        解释
+      </button>
+      <button type="button" class="quick-ask-btn" :disabled="pending" @click="onTemplateClick('translate')">
+        <v-icon size="12">mdi-translate</v-icon>
+        翻译
       </button>
       <button
         v-if="canExcerpt"

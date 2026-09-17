@@ -10,6 +10,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { registerNotesAskConsumer, registerQuickAskConsumer } from "../../composables/useQuickAsk";
+import type { QuickAskAction } from "../../composables/useQuickAsk";
+import { EXPLAIN_TEMPLATE, TRANSLATE_TEMPLATE, resolveTemplateDraft, templateForAction } from "../../utils/quick-ask-templates";
 import { registerRegionCaptureConsumer } from "../../composables/useRegionCapture";
 import { useNotesStore } from "../../stores/notes-store";
 import { useReaderStore } from "../../stores/reader-store";
@@ -82,6 +84,7 @@ const SELECTED_TEXT_PREVIEW_MAX = 24;
 const excludedContexts = ref<ReadonlySet<ContextChipKind>>(new Set());
 
 function excludeContext(kind: ContextChipKind): void {
+  if (kind === "selection") pendingSelection.value = ""; // N97-4 C③：移除后不得复活
   const next = new Set(excludedContexts.value);
   next.add(kind);
   excludedContexts.value = next;
@@ -99,8 +102,14 @@ const documentChip = computed<ContextChip | null>(() => {
   return { kind: "document", icon: "mdi-file-pdf-outline", label: `当前文档：${name}${pageLabel}` };
 });
 
+// --- 选区快照（N97-4 追加）：点击侧选动作时用户看到的那段文本 ---
+const pendingSelection = ref("");
+
+/** 「选中文本」chip 与 <reading_context> 的 selectedText 实参的唯一来源（冻结语义 B）。 */
+const effectiveSelectedText = computed(() => pendingSelection.value || readerStore.selectedText);
+
 const selectionChip = computed<ContextChip | null>(() => {
-  const selected = readerStore.selectedText.trim();
+  const selected = effectiveSelectedText.value.trim();
   if (!selected) return null;
   const preview = selected.length > SELECTED_TEXT_PREVIEW_MAX
     ? `${selected.slice(0, SELECTED_TEXT_PREVIEW_MAX)}…`
@@ -148,6 +157,21 @@ watch(
   () => sessionStore.displayBlocks.length === 0,
   (empty) => {
     if (empty) resetExcludedContexts();
+  },
+);
+// N97-4 C①：出现新的非空选区且与快照不同 ⇒ 快照失效（以新选区为准）。
+watch(
+  () => readerStore.selectedText,
+  (next) => {
+    const trimmed = next.trim();
+    if (trimmed && trimmed !== pendingSelection.value.trim()) pendingSelection.value = "";
+  },
+);
+// N97-4 C②：文档切换（含关闭文档 ⇒ null）⇒ 清空。
+watch(
+  () => readerStore.filePath,
+  () => {
+    pendingSelection.value = "";
   },
 );
 
@@ -302,9 +326,17 @@ function updateDraft(value: string): void {
 // --- Quick ask: floating button over the PDF selection (useQuickAsk seam) ---
 
 const QUICK_ASK_TEMPLATE = "请解释选中的这段话：";
+const QUICK_TEMPLATE_REPLACEABLE: readonly string[] = [QUICK_ASK_TEMPLATE, EXPLAIN_TEMPLATE, TRANSLATE_TEMPLATE];
 
-function onQuickAsk(): void {
+function onQuickAsk(text: string, action: QuickAskAction = "ask"): void {
+  if (text) pendingSelection.value = text; // 冻结语义 A：任何 action 都记录
   // 原文已由「选中文本」chip 注入发送链路，这里只补模板文案并聚焦，不覆盖输入。
+  if (action !== "ask") {
+    const next = resolveTemplateDraft(draft.value, templateForAction(action), QUICK_TEMPLATE_REPLACEABLE);
+    if (next !== null) draft.value = next;
+    composerInput.value?.focus();
+    return;
+  }
   if (!draft.value) draft.value = QUICK_ASK_TEMPLATE;
   composerInput.value?.focus();
 }
@@ -366,7 +398,7 @@ async function send(): Promise<void> {
     filePath: readFilePath,
     page: readPage,
     pageCount: readerStore.pageCount,
-    selectedText: excluded.has("selection") ? "" : readerStore.selectedText,
+    selectedText: excluded.has("selection") ? "" : effectiveSelectedText.value,
     notes: notesSnapshot,
     outline: readerStore.outline,
   };

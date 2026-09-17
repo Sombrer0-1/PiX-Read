@@ -115,6 +115,16 @@ const SEL = {
   noteRowAnchored: ".note-row.is-anchored",
   pageBoxOne: '.pdf-page[data-page="1"]',
   notePageBadge: ".note-page-badge",
+  // R17 新增 6 项（设计档 §5.4.1）
+  shortcutToggle: ".shortcut-toggle",
+  shortcutOverview: ".shortcut-overview",
+  shortcutRow: ".shortcut-row",
+  shortcutKey: ".shortcut-key",
+  shortcutNote: ".shortcut-note",
+  composerBox: ".composer-box",
+  // N97-4 追加 2 项（设计档「追加设计」§3.1）
+  contextChip: ".context-chip",
+  contextChipRemove: ".context-chip-remove",
 };
 
 // ---------------------------------------------------------------------------
@@ -5515,7 +5525,7 @@ async function runReaderStateScenarios(win, log) {
         state.display !== null &&
         state.display !== "none" &&
         state.feedbackClass === null &&
-        state.btnCount === 2 &&
+        state.btnCount === 4 &&
         selection.collapsed === false &&
         selection.anchorInStage === true &&
         selection.text === spanText;
@@ -6984,7 +6994,7 @@ async function runReaderStateScenarios(win, log) {
       ...(goneP4.probe.feedbackClass === null && feedbackGoneAtMsP4 >= 2500 - 600 && feedbackGoneAtMsP4 <= dispatchAtMsP4 + 2500 - 300
         ? [] : [`反馈计时被重置或提前清除：goneAt=${feedbackGoneAtMsP4} dispatchAt=${dispatchAtMsP4} probe=${JSON.stringify(goneP4.probe)}`]),
       // B5 到期后回落 actions 态且浮层仍在；数据不变
-      ...(goneP4.probe.feedbackClass === null && goneP4.probe.btnCount === 2 && goneP4.probe.display !== "none" && fileCountP4 === 2 && notesHash() === hashAfterExcerpt11c4
+      ...(goneP4.probe.feedbackClass === null && goneP4.probe.btnCount === 4 && goneP4.probe.display !== "none" && fileCountP4 === 2 && notesHash() === hashAfterExcerpt11c4
         ? [] : [`到期后应回落 actions 态：${JSON.stringify(goneP4.probe)} fileCount=${fileCountP4}`]),
     ],
   );
@@ -7056,7 +7066,7 @@ async function runReaderStateScenarios(win, log) {
       ...(afterDifferentTextP5.feedbackClass === null && afterDifferentTextP5.feedbackText === null
         ? [] : [`不同文本应重置反馈：${JSON.stringify(afterDifferentTextP5)}`]),
       // C3 复采：浮层仍可见且回到 actions 态
-      ...(afterDifferentTextP5b.display !== "none" && afterDifferentTextP5b.btnCount === 2
+      ...(afterDifferentTextP5b.display !== "none" && afterDifferentTextP5b.btnCount === 4
         ? [] : [`不同文本后应回到 actions 态：${JSON.stringify(afterDifferentTextP5b)}`]),
       // C4 选区与数据现场
       ...(selectionAfterP5.text === spanText2P5 && selectionAfterP5.collapsed === false && selectionAfterP5.anchorInStage === true
@@ -10229,6 +10239,1293 @@ async function runReaderStateScenarios(win, log) {
         ? []
         : ["刷新必须只读"]),
       ...(refreshNotice16e === null ? [] : [`不得残留提示：${JSON.stringify(refreshNotice16e)}`]),
+    ],
+  );
+  await restoreStandardSeed();
+
+  // =========================================================================
+  // R17：操作可达性（N96–N99）——快捷键总览（r17-1 / r17-1b）与选区模板动作（r17-2 / r17-2b）
+  //
+  // 就绪纪律：选区类断言一律先 selectPageSpan() 再用既有 ensureQuickAskExcerptReady() 复核
+  //   （R15 修复轮的既有 helper，零改写：内含「有界滚动静默 + 可摘录态复核 + 有界重取」）；
+  // 几何纪律：矩形一律 rectOfSelector(sel, 0)（0 内缩 ⇒ 原始视口矩形，供 intersects 使用）；
+  // 插值纪律：进入页面上下文的字符串一律 JSON.stringify 插值；期望值全部手写在本块内；
+  // helper 配额：只新增设计档 §0.9 第 6 条冻结的 5 个名字（不新增第 6 个）；
+  // N97-4 追加：第 6 个 helper = typeIntoComposer（「追加设计」§3.2，真实输入通道）。
+  // =========================================================================
+
+  const SHORTCUT_SECTION_TITLES = ["阅读区（打开文档后）", "输入框", "工作区"];
+  const SHORTCUT_ROWS = [
+    { key: "/", desc: "打开文档搜索" },
+    { key: "Ctrl+F", desc: "打开文档搜索" },
+    { key: "PageUp / ←", desc: "上一页" },
+    { key: "PageDown / →", desc: "下一页" },
+    { key: "Home", desc: "跳到第一页" },
+    { key: "End", desc: "跳到最后一页" },
+    { key: "[", desc: "上一节" },
+    { key: "]", desc: "下一节" },
+    { key: "Esc", desc: "退出框选模式或关闭文档搜索" },
+    { key: "Enter", desc: "发送消息（对话输入框）" },
+    { key: "Shift+Enter", desc: "换行（对话输入框）" },
+    { key: "Enter", desc: "下一处（文档搜索框）" },
+    { key: "Shift+Enter", desc: "上一处（文档搜索框）" },
+    { key: "Enter", desc: "跳转到该页（页码输入框）" },
+    { key: "Esc", desc: "取消页码输入（页码输入框）" },
+    { key: "Esc", desc: "清空搜索并移出焦点（笔记搜索框）" },
+    { key: "Enter", desc: "提交重命名（对话名称输入框）" },
+    { key: "?", desc: "打开或关闭本总览" },
+  ];
+  const SHORTCUT_NOTE_TEXT = "选区浮层（选中文本后出现，无键位）：问 AI / 解释 / 翻译 / 摘录";
+  const EXPLAIN_TEMPLATE = "请解释选中的这段话在论文中的含义与作用：";
+  const TRANSLATE_TEMPLATE = "请把选中的这段话翻译成中文：";
+  const NOTES_ASK_TEMPLATE = "请结合我选中的摘录回答：";
+  const QUICK_ASK_ACTIONS = ["问 AI", "解释", "翻译", "摘录"];
+  const QUICK_ASK_ICONS = [
+    "mdi-comment-question-outline",
+    "mdi-lightbulb-on-outline",
+    "mdi-translate",
+    "mdi-notebook-plus-outline",
+  ];
+  const RIGHT_WIDTH = "560px";
+  /** 活动焦点现场（入口 / 浮层 / body 的身份比对；常量表达式，不占 helper 配额）。 */
+  const ACTIVE_PROBE = `(() => {
+    const el = document.activeElement;
+    return {
+      tag: el ? el.tagName : null,
+      className: el ? el.className : null,
+      isPanel: el === document.querySelector(${JSON.stringify(SEL.shortcutOverview)}),
+      isToggle: el === document.querySelector(${JSON.stringify(SEL.shortcutToggle)}),
+      isBody: el === document.body,
+    };
+  })()`;
+
+  /** R17 helper 1/5（§5.4.2）：入口 + 浮层一次读回（入口 5 项 / 浮层 9 项）。 */
+  const shortcutProbe = () => js(`(() => {
+    const rect = (el) => {
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const toggle = document.querySelector(${JSON.stringify(SEL.shortcutToggle)});
+    const panel = document.querySelector(${JSON.stringify(SEL.shortcutOverview)});
+    return {
+      entry: toggle
+        ? {
+            inDom: true,
+            title: toggle.getAttribute("title"),
+            ariaLabel: toggle.getAttribute("aria-label"),
+            ariaExpanded: toggle.getAttribute("aria-expanded"),
+            rect: rect(toggle),
+          }
+        : { inDom: false, title: null, ariaLabel: null, ariaExpanded: null, rect: null },
+      panel: panel
+        ? {
+            inDom: true,
+            rect: rect(panel),
+            sectionTitles: Array.from(panel.querySelectorAll(".shortcut-section-title")).map(text),
+            rows: Array.from(panel.querySelectorAll(${JSON.stringify(SEL.shortcutRow)})).map((row) => ({
+              key: text(row.querySelector(${JSON.stringify(SEL.shortcutKey)})),
+              desc: text(row.querySelector(".shortcut-desc")),
+            })),
+            noteText: text(panel.querySelector(${JSON.stringify(SEL.shortcutNote)})),
+            closeCount: panel.querySelectorAll(".shortcut-close").length,
+            activeInsidePanel: panel.contains(document.activeElement),
+            scrollOverflow: panel.scrollWidth - panel.clientWidth,
+            focusableCount: Array.from(document.querySelectorAll("button, a[href], input, select, textarea, [tabindex]")).filter(
+              (el) => el === panel || panel.contains(el),
+            ).length,
+          }
+        : {
+            inDom: false,
+            rect: null,
+            sectionTitles: [],
+            rows: [],
+            noteText: null,
+            closeCount: 0,
+            activeInsidePanel: false,
+            scrollOverflow: null,
+            focusableCount: 0,
+          },
+    };
+  })()`);
+
+  /** R17 helper 2/5（§5.4.2）：选区浮层一次读回（display / rect / 4 按钮 / 溢出 / 计数）。 */
+  const quickAskActionsProbe = () => js(`(() => {
+    const rect = (el) => {
+      const box = el.getBoundingClientRect();
+      return { x: Math.round(box.x), y: Math.round(box.y), width: Math.round(box.width), height: Math.round(box.height) };
+    };
+    const text = (el) => (el ? el.textContent.replace(/\\s+/g, " ").trim() : null);
+    const el = document.querySelector(${JSON.stringify(SEL.quickAsk)});
+    if (!el) return { display: null, rect: null, buttons: [], scrollOverflow: null, btnCount: 0 };
+    return {
+      display: getComputedStyle(el).display,
+      rect: rect(el),
+      buttons: Array.from(el.querySelectorAll(".quick-ask-btn")).map((btn) => {
+        const icon = btn.querySelector(".v-icon");
+        const mdi = icon ? Array.from(icon.classList).filter((name) => name.indexOf("mdi-") === 0) : [];
+        return { text: text(btn), icon: mdi.length ? mdi[0] : null, rect: rect(btn), disabled: btn.disabled };
+      }),
+      scrollOverflow: el.scrollWidth - el.clientWidth,
+      btnCount: el.querySelectorAll(".quick-ask-btn").length,
+    };
+  })()`);
+
+  /** R17 helper 3/5（§5.4.2）：写 / 清 CSS 变量并重绘；返回内联值（便于落进 data）。 */
+  const layoutVar = async (name, value) => {
+    await js(`(() => {
+      const style = document.documentElement.style;
+      const next = ${JSON.stringify(value)};
+      if (next === null) style.removeProperty(${JSON.stringify(name)});
+      else style.setProperty(${JSON.stringify(name)}, next);
+      return true;
+    })()`);
+    await repaint(win);
+    return js(`document.documentElement.style.getPropertyValue(${JSON.stringify(name)})`);
+  };
+
+  /** R17 helper 4/5（§5.4.2）：矩形相交（null 一律 false；调用点必须先做存在性前置 —— 定稿 D6）。 */
+  const intersects = (a, b) =>
+    !!a && !!b && a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+
+  /** R17 helper 5/5（§5.4.2）：在真实元素上派发 keydown 并回传 dispatchEvent 布尔（false = 被 preventDefault）。 */
+  const pressKeyOnReturning = (selector, key) => js(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) throw new Error("keydown target not found: " + ${JSON.stringify(selector)});
+    return el.dispatchEvent(new KeyboardEvent("keydown", { key: ${JSON.stringify(key)}, bubbles: true }));
+  })()`);
+
+  /**
+   * N97-4 追加 helper 6/6（「追加设计」§3.2）：追加键入原语 —— **真实输入通道**。
+   * 逐字符 win.webContents.sendInputEvent({ type: "char" })：字符经真实引擎输入管线落到聚焦的
+   * `.input-area`（渲染层收到 isTrusted 的 beforeinput / input(insertText)，与程序化 setter 不同；
+   * 任务书 N97-4 要求「真实键入」形态，故不在本追加里沿用 setDraft 的原生 setter 通道）。
+   * 落值不符即抛错（不静默降级）；回传写入后的 value。
+   */
+  const typeIntoComposer = async (text) => {
+    const before = await js(`(() => {
+      const input = document.querySelector(${JSON.stringify(SEL.composerInput)});
+      if (!input) throw new Error("composer input not found");
+      return input.value;
+    })()`);
+    win.webContents.focus();
+    for (const ch of text) win.webContents.sendInputEvent({ type: "char", keyCode: ch });
+    await waitFor(
+      `真实键入落进 composer（${text.length} 字符）`,
+      `document.querySelector(${JSON.stringify(SEL.composerInput)}).value === ${JSON.stringify(before + text)}`,
+    );
+    return js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  };
+
+  // --- r17-1 快捷键总览：入口 / 开关 / 输入框守卫 / 关闭路径与焦点（组 r17-shortcut-overview）---
+  log("r17-1 入口与浮层：未开文档即可见、点击开关、18 行逐字");
+  await enterCleanWorkspace(seedNotes());
+  await waitFor("快捷键入口（未开文档）", `document.querySelector(${JSON.stringify(SEL.shortcutToggle)})`);
+  const entryBeforeDoc17a = await shortcutProbe();
+  const closedCounts17a = {
+    overview: await countOf(SEL.shortcutOverview),
+    rows: await countOf(SEL.shortcutRow),
+    keys: await countOf(SEL.shortcutKey),
+    note: await countOf(SEL.shortcutNote),
+    toggle: await countOf(SEL.shortcutToggle),
+  };
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const entryAfterDoc17a = await shortcutProbe();
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("快捷键浮层出现", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await sleep(150);
+  const panel17a = await shortcutProbe();
+  await capturePage(win, "r17-1-shortcut-overview.png");
+  await capturePage(win, "r17-1b-shortcut-overview-entry.png", await rectOfSelector(".center-pill", 12));
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("快捷键浮层关闭", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const closed17a = { probe: await shortcutProbe(), rows: await countOf(SEL.shortcutRow) };
+  record(
+    "r17-shortcut-overview",
+    {
+      phase: "open-by-click",
+      entryBeforeDoc: entryBeforeDoc17a.entry,
+      entryAfterDoc: entryAfterDoc17a.entry,
+      closedCounts: closedCounts17a,
+      panel: panel17a.panel,
+      rowCount: panel17a.panel.rows.length,
+      sectionTitles: panel17a.panel.sectionTitles,
+      closed: { inDom: closed17a.probe.panel.inDom, ariaExpanded: closed17a.probe.entry.ariaExpanded, rows: closed17a.rows },
+    },
+    [
+      ...(closedCounts17a.overview === 0 && closedCounts17a.rows === 0 && closedCounts17a.keys === 0 && closedCounts17a.note === 0 && closedCounts17a.toggle === 1
+        ? []
+        : [`首帧读数异常（不得有常驻浮层，入口恰 1）：${JSON.stringify(closedCounts17a)}`]),
+      ...(entryBeforeDoc17a.entry.inDom === true && entryBeforeDoc17a.entry.ariaExpanded === "false"
+        ? []
+        : [`未开文档时入口异常：${JSON.stringify(entryBeforeDoc17a.entry)}`]),
+      ...(entryBeforeDoc17a.entry.title === "快捷键总览（?）" && entryBeforeDoc17a.entry.ariaLabel === "快捷键总览"
+        ? []
+        : [`未开文档时 title / aria-label 异常：${JSON.stringify(entryBeforeDoc17a.entry)}`]),
+      ...(entryAfterDoc17a.entry.title === "快捷键总览（?）" && entryAfterDoc17a.entry.ariaLabel === "快捷键总览"
+        ? []
+        : [`开文档后 title / aria-label 异常：${JSON.stringify(entryAfterDoc17a.entry)}`]),
+      ...(panel17a.panel.inDom === true && panel17a.entry.ariaExpanded === "true"
+        ? []
+        : [`点击后应展开：${JSON.stringify({ panel: panel17a.panel.inDom, expanded: panel17a.entry.ariaExpanded })}`]),
+      ...(JSON.stringify(panel17a.panel.sectionTitles) === JSON.stringify(SHORTCUT_SECTION_TITLES)
+        ? []
+        : [`组标题异常：${JSON.stringify(panel17a.panel.sectionTitles)}`]),
+      ...(JSON.stringify(panel17a.panel.rows) === JSON.stringify(SHORTCUT_ROWS) ? [] : [`18 行键位表异常：${JSON.stringify(panel17a.panel.rows)}`]),
+      ...(panel17a.panel.noteText === SHORTCUT_NOTE_TEXT ? [] : [`说明行异常：${JSON.stringify(panel17a.panel.noteText)}`]),
+      ...(panel17a.panel.closeCount === 1 ? [] : [`关闭按钮数异常：${panel17a.panel.closeCount}`]),
+      ...(panel17a.panel.focusableCount === 2 ? [] : [`浮层内可聚焦控件应恰 2 个（容器 + 关闭）：${panel17a.panel.focusableCount}`]),
+      ...(panel17a.panel.activeInsidePanel === true ? [] : ["打开后焦点应在浮层容器内"]),
+      ...(closed17a.probe.panel.inDom === false && closed17a.probe.entry.ariaExpanded === "false" && closed17a.rows === 0
+        ? []
+        : [`再点击应关闭且清空 DOM：${JSON.stringify({ inDom: closed17a.probe.panel.inDom, expanded: closed17a.probe.entry.ariaExpanded, rows: closed17a.rows })}`]),
+    ],
+  );
+
+  log("r17-1 键位开关与输入框守卫：? 不吞输入、不误触 /，Esc 一次双响应");
+  await setDraft("草稿守卫");
+  await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).focus(), true`);
+  const guardReturns17b = await pressKeyOnReturning(SEL.composerInput, "?");
+  const guardPanel17b = await shortcutProbe();
+  const guardDraft17b = await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  await js("document.activeElement.blur(), true");
+  const blurSelfCheck17b = await js("document.activeElement === document.body");
+  await pressReaderKey("?");
+  await waitFor("body 上 ? 打开浮层", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const bodyOpened17b = await shortcutProbe();
+  const bodySearch17b = await has(SEL.pdfSearchPanel);
+  await pressReaderKey("?");
+  await waitFor("再按 ? 关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const bodyClosed17b = await shortcutProbe();
+  await pressReaderKey("?");
+  await waitFor("第三次 ? 再次打开", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await pressReaderKey("/");
+  await waitFor("文档搜索面板（既有 / 语义）", `document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)})`);
+  const searchOpen17b = await has(SEL.pdfSearchPanel);
+  const inputReturns17b = await pressKeyOnReturning(".pdf-search-panel .search-input", "?");
+  const inputPanel17b = await shortcutProbe();
+  await pressKeyOn(".pdf-search-panel .search-input", "Escape");
+  await waitFor(
+    "Esc 双响应：搜索面板与浮层同时离开 DOM",
+    `!document.querySelector(${JSON.stringify(SEL.pdfSearchPanel)}) && !document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`,
+  );
+  const afterEsc17b = {
+    searchPanel: await has(SEL.pdfSearchPanel),
+    overview: await countOf(SEL.shortcutOverview),
+    ariaExpanded: (await shortcutProbe()).entry.ariaExpanded,
+  };
+  record(
+    "r17-shortcut-overview",
+    {
+      phase: "key-toggle-and-typing-guard",
+      textareaGuard: { returns: guardReturns17b, inDom: guardPanel17b.panel.inDom, value: guardDraft17b },
+      blurSelfCheck: blurSelfCheck17b,
+      opened: bodyOpened17b.panel.inDom,
+      bodyGuard: { opened: bodyOpened17b.panel.inDom, searchPanel: bodySearch17b },
+      closed: bodyClosed17b.panel.inDom,
+      searchOpen: searchOpen17b,
+      inputGuard: { returns: inputReturns17b, stillOpen: inputPanel17b.panel.inDom },
+      afterEsc: afterEsc17b,
+    },
+    [
+      ...(guardReturns17b === true ? [] : ["TEXTAREA 内 ? 不得被 preventDefault"]),
+      ...(guardPanel17b.panel.inDom === false ? [] : ["TEXTAREA 内 ? 不得打开浮层"]),
+      ...(guardDraft17b === "草稿守卫" ? [] : [`TEXTAREA 内容不得变化：${JSON.stringify(guardDraft17b)}`]),
+      ...(blurSelfCheck17b ? [] : "前置失败：blur 后 activeElement 不是 document.body"),
+      ...(bodyOpened17b.panel.inDom === true && bodySearch17b === false
+        ? []
+        : [`body 上 ? 应打开浮层且不得触发 / 语义：${JSON.stringify({ panel: bodyOpened17b.panel.inDom, search: bodySearch17b })}`]),
+      ...(bodyClosed17b.panel.inDom === false ? [] : ["第二次 ? 应关闭浮层（toggle 语义）"]),
+      ...(searchOpen17b === true ? [] : ["/ 应打开文档搜索（既有键位不得被劫持）"]),
+      ...(inputReturns17b === true ? [] : ["INPUT 内 ? 不得被 preventDefault"]),
+      ...(inputPanel17b.panel.inDom === true ? [] : ["INPUT 内 ? 不得切换浮层"]),
+      ...(afterEsc17b.searchPanel === false && afterEsc17b.overview === 0 && afterEsc17b.ariaExpanded === "false"
+        ? []
+        : [`一次 Esc 应同时关闭搜索与浮层：${JSON.stringify(afterEsc17b)}`]),
+    ],
+  );
+
+  log("r17-1 三条关闭路径与两种焦点归还：Esc / 外部点击 / 关闭按钮");
+  const quietBefore17c = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  const writesBase17c = {
+    send: (await sendCalls()).count,
+    notesAdd: (await notesAddCalls()).count,
+    stateSave: (await saveCalls()).count,
+  };
+  // 关闭路径①：Esc（打开后焦点应落在浮层容器）
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（Esc 路径）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await sleep(120);
+  const escOpened17c = await js(ACTIVE_PROBE);
+  await pressKeyOn(SEL.shortcutOverview, "Escape");
+  await waitFor("Esc 关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const escClosed17c = {
+    gone: !(await has(SEL.shortcutOverview)),
+    rows: await countOf(SEL.shortcutRow),
+    expanded: (await shortcutProbe()).entry.ariaExpanded,
+    active: await js(ACTIVE_PROBE),
+  };
+  // 关闭路径②：点击浮层与入口之外（document 上的 pointerdown）
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（外部点击路径）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await js(`document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })), true`);
+  await waitFor("外部点击关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const outsideClosed17c = {
+    gone: !(await has(SEL.shortcutOverview)),
+    rows: await countOf(SEL.shortcutRow),
+    expanded: (await shortcutProbe()).entry.ariaExpanded,
+  };
+  // 关闭路径③：关闭按钮
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（关闭按钮路径）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await clickEl(".shortcut-close");
+  await waitFor("关闭按钮关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const closeBtnClosed17c = {
+    gone: !(await has(SEL.shortcutOverview)),
+    rows: await countOf(SEL.shortcutRow),
+    expanded: (await shortcutProbe()).entry.ariaExpanded,
+  };
+  // 焦点归还（入口分支；定稿 D2）：程序化 click 不移动焦点 ⇒ 必须先 focus() 入口并自检
+  const entryFocusSelfCheck17c = await js(`(() => {
+    const el = document.querySelector(${JSON.stringify(SEL.shortcutToggle)});
+    el.focus();
+    return document.activeElement === el;
+  })()`);
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（入口焦点分支）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await pressKeyOn(SEL.shortcutOverview, "Escape");
+  await waitFor("入口分支关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const focusByEntry17c = await js(ACTIVE_PROBE);
+  // 焦点归还（body 分支）：blur 前置 + 自检
+  await js("document.activeElement.blur(), true");
+  const bodyFocusSelfCheck17c = await js("document.activeElement === document.body");
+  await pressReaderKey("?");
+  await waitFor("浮层打开（body 焦点分支）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await pressKeyOn(SEL.shortcutOverview, "Escape");
+  await waitFor("body 分支关闭浮层", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const focusByBody17c = await js(ACTIVE_PROBE);
+  const writesAfter17c = {
+    send: (await sendCalls()).count,
+    notesAdd: (await notesAddCalls()).count,
+    stateSave: (await saveCalls()).count,
+  };
+  const quietAfter17c = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  record(
+    "r17-shortcut-overview",
+    {
+      phase: "close-paths-and-focus-return",
+      esc: escClosed17c,
+      outside: outsideClosed17c,
+      closeBtn: closeBtnClosed17c,
+      openedActive: escOpened17c,
+      focusReturn: { byEntry: focusByEntry17c, byBody: focusByBody17c },
+      selfChecks: { entryFocus: entryFocusSelfCheck17c, bodyFocus: bodyFocusSelfCheck17c },
+      writes: {
+        send: writesAfter17c.send - writesBase17c.send,
+        notesAdd: writesAfter17c.notesAdd - writesBase17c.notesAdd,
+        stateSave: writesAfter17c.stateSave - writesBase17c.stateSave,
+      },
+      quiet: { scrollTop: { before: quietBefore17c.scrollTop, after: quietAfter17c.scrollTop }, pageBox: { before: quietBefore17c.pageBox, after: quietAfter17c.pageBox } },
+    },
+    [
+      ...(escOpened17c.isPanel === true ? [] : [`打开后焦点应在浮层容器（tabindex="-1"）：${JSON.stringify(escOpened17c)}`]),
+      ...(escClosed17c.gone && escClosed17c.rows === 0 && escClosed17c.expanded === "false" ? [] : [`Esc 关闭异常：${JSON.stringify(escClosed17c)}`]),
+      ...(outsideClosed17c.gone && outsideClosed17c.rows === 0 && outsideClosed17c.expanded === "false"
+        ? []
+        : [`外部点击关闭异常：${JSON.stringify(outsideClosed17c)}`]),
+      ...(closeBtnClosed17c.gone && closeBtnClosed17c.rows === 0 && closeBtnClosed17c.expanded === "false"
+        ? []
+        : [`关闭按钮关闭异常：${JSON.stringify(closeBtnClosed17c)}`]),
+      ...(entryFocusSelfCheck17c ? [] : "前置失败：入口 focus() 自检不成立（程序化 click 不移动焦点，定稿 D2）"),
+      ...(focusByEntry17c.isToggle === true ? [] : [`入口分支关闭后焦点应回到入口：${JSON.stringify(focusByEntry17c)}`]),
+      ...(bodyFocusSelfCheck17c ? [] : "前置失败：blur 后 activeElement 不是 document.body"),
+      ...(focusByBody17c.isBody === true ? [] : [`body 分支关闭后焦点应留在 body：${JSON.stringify(focusByBody17c)}`]),
+      ...(writesAfter17c.send - writesBase17c.send === 0 && writesAfter17c.notesAdd - writesBase17c.notesAdd === 0 && writesAfter17c.stateSave - writesBase17c.stateSave === 0
+        ? []
+        : [`开关浮层不得产生任何写入：${JSON.stringify({ base: writesBase17c, after: writesAfter17c })}`]),
+      ...(quietBefore17c.scrollTop === quietAfter17c.scrollTop && JSON.stringify(quietBefore17c.pageBox) === JSON.stringify(quietAfter17c.pageBox)
+        ? []
+        : [`开关浮层不得扰动阅读现场：${JSON.stringify({ before: quietBefore17c, after: quietAfter17c })}`]),
+    ],
+  );
+
+  // --- r17-1b 浮动总览几何：默认宽度 / 窄栏（组 r17-shortcut-geometry）----------------
+  log("r17-1b 浮层几何：中间栏内、与既有控件零相交（默认宽度）");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await waitFor("快捷键入口（几何场景）", `document.querySelector(${JSON.stringify(SEL.shortcutToggle)})`);
+  const mapSlotInDom17d = await has(SEL.mapSlot);
+  const quietBefore17d = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（默认宽度）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await sleep(150);
+  const probe17d = await shortcutProbe();
+  const rects17d = {
+    panel: probe17d.panel.rect,
+    entry: probe17d.entry.rect,
+    readerPanel: await rectOfSelector(".reader-panel", 0),
+    toolbar: await rectOfSelector(".pdf-toolbar", 0),
+    indicator: await rectOfSelector(SEL.pageIndicator, 0),
+    section: await rectOfSelector(SEL.readerSection, 0),
+    fab: await rectOfSelector(".pdf-capture-fab", 0),
+    pill: await rectOfSelector(".center-pill", 0),
+    composer: await rectOfSelector(SEL.composerBox, 0),
+  };
+  const rectsPresent17d = Object.fromEntries(Object.entries(rects17d).map(([key, value]) => [key, value !== null]));
+  const intersect17d = {
+    composer: intersects(rects17d.panel, rects17d.composer),
+    toolbar: intersects(rects17d.panel, rects17d.toolbar),
+    indicator: intersects(rects17d.panel, rects17d.indicator),
+    section: intersects(rects17d.panel, rects17d.section),
+    fab: intersects(rects17d.panel, rects17d.fab),
+    pill: intersects(rects17d.panel, rects17d.pill),
+  };
+  const insideReaderPanel17d =
+    !!rects17d.panel &&
+    !!rects17d.readerPanel &&
+    rects17d.panel.x >= rects17d.readerPanel.x &&
+    rects17d.panel.y >= rects17d.readerPanel.y &&
+    rects17d.panel.x + rects17d.panel.width <= rects17d.readerPanel.x + rects17d.readerPanel.width &&
+    rects17d.panel.y + rects17d.panel.height <= rects17d.readerPanel.y + rects17d.readerPanel.height;
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层关闭（默认宽度）", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const quietAfter17d = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  record(
+    "r17-shortcut-geometry",
+    {
+      phase: "default",
+      mapSlotInDom: mapSlotInDom17d,
+      rectsPresent: rectsPresent17d,
+      panel: rects17d.panel,
+      entry: rects17d.entry,
+      controls: { toolbar: rects17d.toolbar, indicator: rects17d.indicator, section: rects17d.section, fab: rects17d.fab },
+      composer: rects17d.composer,
+      pill: rects17d.pill,
+      intersect: intersect17d,
+      insideReaderPanel: insideReaderPanel17d,
+      quiet: { scrollTop: { before: quietBefore17d.scrollTop, after: quietAfter17d.scrollTop }, pageBox: { before: quietBefore17d.pageBox, after: quietAfter17d.pageBox } },
+    },
+    [
+      ...(mapSlotInDom17d === false ? [] : ["前置失败：知识地图未关闭（.knowledge-map-slot 仍在 DOM）"]),
+      ...(Object.values(rectsPresent17d).every(Boolean) ? [] : [`rect 缺失（零相交断言的存在性前置，定稿 D6）：${JSON.stringify(rectsPresent17d)}`]),
+      ...(insideReaderPanel17d ? [] : [`浮层应落在 .reader-panel 内：${JSON.stringify({ panel: rects17d.panel, readerPanel: rects17d.readerPanel })}`]),
+      ...(JSON.stringify(intersect17d) === JSON.stringify({ composer: false, toolbar: false, indicator: false, section: false, fab: false, pill: false })
+        ? []
+        : [`浮层与既有控件相交：${JSON.stringify(intersect17d)}`]),
+      ...(rects17d.panel && rects17d.panel.width === 320 ? [] : [`浮层宽度应为 320：${JSON.stringify(rects17d.panel)}`]),
+      ...(rects17d.entry && rects17d.entry.width === 20 && rects17d.entry.height === 20 ? [] : [`入口应为 20x20：${JSON.stringify(rects17d.entry)}`]),
+      ...(quietBefore17d.scrollTop === quietAfter17d.scrollTop && JSON.stringify(quietBefore17d.pageBox) === JSON.stringify(quietAfter17d.pageBox)
+        ? []
+        : [`浮层不得扰动阅读现场：${JSON.stringify({ before: quietBefore17d, after: quietAfter17d })}`]),
+    ],
+  );
+
+  log("r17-1b 浮层几何：窄栏（--pix-right-width: 560px）仍完整且零相交");
+  const rightVarNarrow17e = await layoutVar("--pix-right-width", RIGHT_WIDTH);
+  const rightWidthNarrow17e = await js(`Math.round(document.querySelector(".layout-right").getBoundingClientRect().width)`);
+  const quietBefore17e = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层打开（窄栏）", `document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  await sleep(150);
+  const probe17e = await shortcutProbe();
+  const rects17e = {
+    panel: probe17e.panel.rect,
+    entry: probe17e.entry.rect,
+    readerPanel: await rectOfSelector(".reader-panel", 0),
+    toolbar: await rectOfSelector(".pdf-toolbar", 0),
+    indicator: await rectOfSelector(SEL.pageIndicator, 0),
+    section: await rectOfSelector(SEL.readerSection, 0),
+    fab: await rectOfSelector(".pdf-capture-fab", 0),
+    pill: await rectOfSelector(".center-pill", 0),
+    composer: await rectOfSelector(SEL.composerBox, 0),
+  };
+  const mapSlotInDom17e = await has(SEL.mapSlot);
+  const rectsPresent17e = Object.fromEntries(Object.entries(rects17e).map(([key, value]) => [key, value !== null]));
+  const intersect17e = {
+    composer: intersects(rects17e.panel, rects17e.composer),
+    toolbar: intersects(rects17e.panel, rects17e.toolbar),
+    indicator: intersects(rects17e.panel, rects17e.indicator),
+    section: intersects(rects17e.panel, rects17e.section),
+    fab: intersects(rects17e.panel, rects17e.fab),
+    pill: intersects(rects17e.panel, rects17e.pill),
+  };
+  const insideReaderPanel17e =
+    !!rects17e.panel &&
+    !!rects17e.readerPanel &&
+    rects17e.panel.x >= rects17e.readerPanel.x &&
+    rects17e.panel.y >= rects17e.readerPanel.y &&
+    rects17e.panel.x + rects17e.panel.width <= rects17e.readerPanel.x + rects17e.readerPanel.width &&
+    rects17e.panel.y + rects17e.panel.height <= rects17e.readerPanel.y + rects17e.readerPanel.height;
+  await capturePage(win, "r17-1c-shortcut-overview-narrow.png", await rectOfSelector(SEL.shortcutOverview, 12));
+  await clickEl(SEL.shortcutToggle);
+  await waitFor("浮层关闭（窄栏）", `!document.querySelector(${JSON.stringify(SEL.shortcutOverview)})`);
+  const quietAfter17e = {
+    scrollTop: await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollTop`),
+    pageBox: await rectOfSelector(SEL.pageBoxOne, 0),
+  };
+  const rightVarRestored17e = await layoutVar("--pix-right-width", null);
+  const restoredRightWidth17e = await js(`Math.round(document.querySelector(".layout-right").getBoundingClientRect().width)`);
+  record(
+    "r17-shortcut-geometry",
+    {
+      phase: "narrow",
+      rightWidth: rightWidthNarrow17e,
+      rightVar: rightVarNarrow17e,
+      mapSlotInDom: mapSlotInDom17e,
+      rectsPresent: rectsPresent17e,
+      panel: rects17e.panel,
+      entry: rects17e.entry,
+      controls: { toolbar: rects17e.toolbar, indicator: rects17e.indicator, section: rects17e.section, fab: rects17e.fab },
+      composer: rects17e.composer,
+      pill: rects17e.pill,
+      intersect: intersect17e,
+      insideReaderPanel: insideReaderPanel17e,
+      quiet: { scrollTop: { before: quietBefore17e.scrollTop, after: quietAfter17e.scrollTop }, pageBox: { before: quietBefore17e.pageBox, after: quietAfter17e.pageBox } },
+      restoredRightWidth: restoredRightWidth17e,
+      restoredVar: rightVarRestored17e,
+    },
+    [
+      ...(Math.abs(rightWidthNarrow17e - 560) <= 2 ? [] : [`窄栏未生效（空断言防护）：${rightWidthNarrow17e}`]),
+      ...(rightVarNarrow17e === RIGHT_WIDTH ? [] : [`CSS 变量未写入：${JSON.stringify(rightVarNarrow17e)}`]),
+      ...(mapSlotInDom17e === false ? [] : ["前置失败：知识地图未关闭（.knowledge-map-slot 仍在 DOM）"]),
+      ...(Object.values(rectsPresent17e).every(Boolean) ? [] : [`rect 缺失（零相交断言的存在性前置，定稿 D6）：${JSON.stringify(rectsPresent17e)}`]),
+      ...(insideReaderPanel17e ? [] : [`窄栏下浮层应仍落在 .reader-panel 内：${JSON.stringify({ panel: rects17e.panel, readerPanel: rects17e.readerPanel })}`]),
+      ...(JSON.stringify(intersect17e) === JSON.stringify({ composer: false, toolbar: false, indicator: false, section: false, fab: false, pill: false })
+        ? []
+        : [`窄栏下浮层与既有控件相交：${JSON.stringify(intersect17e)}`]),
+      ...(rects17e.panel && rects17e.panel.width === 320 ? [] : [`窄栏下浮层宽度应为 320：${JSON.stringify(rects17e.panel)}`]),
+      ...(quietBefore17e.scrollTop === quietAfter17e.scrollTop && JSON.stringify(quietBefore17e.pageBox) === JSON.stringify(quietAfter17e.pageBox)
+        ? []
+        : [`窄栏下浮层不得扰动阅读现场：${JSON.stringify({ before: quietBefore17e, after: quietAfter17e })}`]),
+      ...(Math.abs(restoredRightWidth17e - 380) <= 2 ? [] : [`右栏宽度未复位：${restoredRightWidth17e}`]),
+      ...(rightVarRestored17e === "" ? [] : [`CSS 变量未清除：${JSON.stringify(rightVarRestored17e)}`]),
+    ],
+  );
+
+  // --- r17-2 选区模板动作：4 按钮 / 预填 / 替换 / 不发送（组 r17-template-actions）-----
+  log("r17-2 四个动作：DOM 顺序 / 图标 / 可聚焦 / 点「解释」预填草稿且不发送");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  const notesFileRows17f = readNotes().length;
+  const notesHash17f = notesHash();
+  await selectPageSpan(1);
+  const ready17f = await ensureQuickAskExcerptReady(1);
+  const spanText17f = await pageSpanText(1);
+  const actions17f = await quickAskActionsProbe();
+  const buttonsMeta17f = await js(`(() => {
+    const buttons = Array.from(document.querySelectorAll(".quick-ask-btn"));
+    const target = buttons.find((btn) => (btn.textContent || "").includes("解释"));
+    if (!target) return null;
+    target.focus();
+    return {
+      meta: buttons.map((btn) => ({ tagName: btn.tagName, tabIndex: btn.tabIndex })),
+      activeIsExplain: document.activeElement === target,
+      activeText: document.activeElement ? document.activeElement.textContent.replace(/\\s+/g, " ").trim() : null,
+    };
+  })()`);
+  await capturePage(win, "r17-2-quick-ask-four-actions.png", await rectOfSelector(SEL.quickAsk, 30));
+  await clearSendCalls();
+  const selectionBefore17f = await selectionProbe();
+  const chipsBefore17f = await chipSnapshot();
+  const blocksBefore17f = await userBlocks();
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("解释"));
+    if (!target) throw new Error("解释按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "点模板动作后浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const composer17f = await composerSnapshot();
+  const quickAskAfter17f = await quickAskStateProbe();
+  const sendDelta17f = (await sendCalls()).count;
+  const selectionAfter17f = await selectionProbe();
+  const chipsAfter17f = await chipSnapshot();
+  const blocksAfter17f = await userBlocks();
+  const notesAfter17f = { fileRows: readNotes().length, hashSame: notesHash() === notesHash17f };
+  await capturePage(win, "r17-2b-template-explain-draft.png", await rectOfSelector(SEL.composerBox, 0));
+  // 塌陷根因控制实验（增量步骤，登记）：blur → 重建页内选区 → 写模板草稿 → 聚焦 composer。
+  // 已证明（同引擎一次性探针）：focus textarea ⇒ 选区 collapsed；写值但未聚焦 ⇒ 选区完好；
+  // 隐藏被聚焦按钮（hide() 路径）⇒ 选区完好；被聚焦按钮 ⇒ 选区完好。
+  await js("document.activeElement.blur(), true");
+  await selectPageSpan(1);
+  const controlBefore17f = await selectionProbe();
+  await setDraft(EXPLAIN_TEMPLATE);
+  const controlAfterWrite17f = await selectionProbe();
+  await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).focus(), true`);
+  const controlAfterFocus17f = await selectionProbe();
+  record(
+    "r17-template-actions",
+    {
+      phase: "explain",
+      actions: actions17f,
+      buttonsMeta: buttonsMeta17f,
+      focusable: { activeIsExplain: buttonsMeta17f ? buttonsMeta17f.activeIsExplain : null, activeText: buttonsMeta17f ? buttonsMeta17f.activeText : null },
+      draft: composer17f.value,
+      focused: composer17f.activeHasInputArea,
+      quickAskAfterExplain: quickAskAfter17f,
+      quiet: {
+        send: sendDelta17f,
+        blocks: { before: blocksBefore17f, after: blocksAfter17f },
+        selection: { spanText: spanText17f, before: selectionBefore17f, after: selectionAfter17f },
+        chips: { before: chipsBefore17f, after: chipsAfter17f },
+        notes: notesAfter17f,
+      },
+      control: { before: controlBefore17f, afterWrite: controlAfterWrite17f, afterFocus: controlAfterFocus17f },
+      ready: ready17f.ok,
+    },
+    [
+      ...(ready17f.ok ? [] : [`前置失败：浮层未就绪 ${JSON.stringify(ready17f.trail)}`]),
+      ...(actions17f.btnCount === actions17f.buttons.length && actions17f.buttons.length === QUICK_ASK_ACTIONS.length && actions17f.display !== "none"
+        ? []
+        : [`4 动作形态异常：${JSON.stringify({ display: actions17f.display, btnCount: actions17f.btnCount })}`]),
+      ...(JSON.stringify(actions17f.buttons.map((btn) => btn.text)) === JSON.stringify(QUICK_ASK_ACTIONS)
+        ? []
+        : [`动作文案异常：${JSON.stringify(actions17f.buttons.map((btn) => btn.text))}`]),
+      ...(JSON.stringify(actions17f.buttons.map((btn) => btn.icon)) === JSON.stringify(QUICK_ASK_ICONS)
+        ? []
+        : [`动作图标异常：${JSON.stringify(actions17f.buttons.map((btn) => btn.icon))}`]),
+      ...(actions17f.buttons.length === 4 && actions17f.buttons.every((btn) => btn.disabled === false)
+        ? []
+        : [`动作不得处于禁用态：${JSON.stringify(actions17f.buttons.map((btn) => btn.disabled))}`]),
+      ...(!!buttonsMeta17f && buttonsMeta17f.meta.length === 4 && buttonsMeta17f.meta.every((item) => item.tagName === "BUTTON" && item.tabIndex >= 0)
+        ? []
+        : [`动作控件形态异常（tagName / tabIndex）：${JSON.stringify(buttonsMeta17f)}`]),
+      ...(!!buttonsMeta17f && buttonsMeta17f.activeIsExplain === true ? [] : [`「解释」按钮 focus() 后应成为 activeElement：${JSON.stringify(buttonsMeta17f)}`]),
+      ...(composer17f.value === EXPLAIN_TEMPLATE ? [] : [`草稿应逐字等于解释模板：${JSON.stringify(composer17f.value)}`]),
+      ...(composer17f.activeHasInputArea === true ? [] : ["模板动作后应聚焦输入框"]),
+      ...(sendDelta17f === 0 && blocksAfter17f === blocksBefore17f
+        ? []
+        : [`模板动作不得发送：${JSON.stringify({ send: sendDelta17f, before: blocksBefore17f, after: blocksAfter17f })}`]),
+      ...(selectionBefore17f.collapsed === false && selectionBefore17f.anchorInStage === true && selectionBefore17f.text === spanText17f
+        ? []
+        : [`点击时选区应完好（与页 1 首 span 逐字相等）：${JSON.stringify({ before: selectionBefore17f, spanText: spanText17f })}`]),
+      ...(composer17f.activeHasInputArea === true ? [] : ["点击后焦点应在输入框（塌陷成因）"]),
+      ...(selectionAfter17f.collapsed === true && selectionAfter17f.anchorInStage === false
+        ? []
+        : [`点击后选区应被收进输入框（既有 R8-dev D6 行为）：${JSON.stringify(selectionAfter17f)}`]),
+      ...(JSON.stringify(chipsAfter17f) === JSON.stringify(chipsBefore17f)
+        ? []
+        : [`点击后 chips 应与点击前逐字相等（含「选中文本」项）：${JSON.stringify({ before: chipsBefore17f, after: chipsAfter17f })}`]),
+      ...(controlBefore17f.collapsed === false && controlBefore17f.text === spanText17f ? [] : [`控制实验前置失败（选区未重建）：${JSON.stringify(controlBefore17f)}`]),
+      ...(controlAfterWrite17f.text === controlBefore17f.text && controlAfterWrite17f.collapsed === false
+        ? []
+        : [`写入草稿本身不得清选区：${JSON.stringify(controlAfterWrite17f)}`]),
+      ...(controlAfterFocus17f.collapsed === true && controlAfterFocus17f.anchorInStage === false
+        ? []
+        : [`控制实验应复现塌陷（focus ⇒ collapsed）：${JSON.stringify(controlAfterFocus17f)}`]),
+      ...(quickAskAfter17f.display === "none" && quickAskAfter17f.btnCount === 3
+        ? []
+        : [`点动作后浮层形态异常（M1 口径：摘录因 selectionPage=null 掉落）：${JSON.stringify(quickAskAfter17f)}`]),
+      ...(notesAfter17f.fileRows === notesFileRows17f && notesAfter17f.hashSame ? [] : [`模板动作不得写盘：${JSON.stringify(notesAfter17f)}`]),
+    ],
+  );
+
+  log("r17-2 模板替换：解释模板 → 翻译、空草稿 → 翻译");
+  await clearSendCalls();
+  await selectPageSpan(1);
+  const ready17g1 = await ensureQuickAskExcerptReady(1);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("翻译"));
+    if (!target) throw new Error("翻译按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "翻译后浮层隐藏（替换相位）",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const afterReplace17g = await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  const focusedReplace17g = await js(`document.activeElement === document.querySelector(${JSON.stringify(SEL.composerInput)})`);
+  await setDraft("");
+  await selectPageSpan(1);
+  const ready17g2 = await ensureQuickAskExcerptReady(1);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("翻译"));
+    if (!target) throw new Error("翻译按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "空草稿下翻译后浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const afterEmpty17g = await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  await capturePage(win, "r17-2c-template-translate-draft.png", await rectOfSelector(SEL.composerBox, 0));
+  const sendDelta17g = (await sendCalls()).count;
+  record(
+    "r17-template-actions",
+    {
+      phase: "translate-replace",
+      afterReplace: afterReplace17g,
+      afterEmpty: afterEmpty17g,
+      focused: focusedReplace17g,
+      send: sendDelta17g,
+      ready: { replace: ready17g1.ok, empty: ready17g2.ok },
+    },
+    [
+      ...(ready17g1.ok ? [] : [`前置失败（替换相位）：${JSON.stringify(ready17g1.trail)}`]),
+      ...(ready17g2.ok ? [] : [`前置失败（空草稿相位）：${JSON.stringify(ready17g2.trail)}`]),
+      ...(afterReplace17g === TRANSLATE_TEMPLATE ? [] : [`机器模板应被替换：${JSON.stringify(afterReplace17g)}`]),
+      ...(afterEmpty17g === TRANSLATE_TEMPLATE ? [] : [`空草稿应填入翻译模板：${JSON.stringify(afterEmpty17g)}`]),
+      ...(focusedReplace17g === true ? [] : ["替换后应聚焦输入框"]),
+      ...(sendDelta17g === 0 ? [] : [`替换相位不得发送：${sendDelta17g}`]),
+    ],
+  );
+
+  log("r17-2 自定义草稿与笔记模板：一字不改");
+  await clearSendCalls();
+  await setDraft("我的问题：请给出结论");
+  await selectPageSpan(1);
+  const ready17h1 = await ensureQuickAskExcerptReady(1);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("解释"));
+    if (!target) throw new Error("解释按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "自定义草稿下浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const customKept17h = await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  const focusedCustom17h = await js(`document.activeElement === document.querySelector(${JSON.stringify(SEL.composerInput)})`);
+  await setDraft(NOTES_ASK_TEMPLATE);
+  await selectPageSpan(1);
+  const ready17h2 = await ensureQuickAskExcerptReady(1);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("翻译"));
+    if (!target) throw new Error("翻译按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "笔记模板下浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const notesTemplateKept17h = await js(`document.querySelector(${JSON.stringify(SEL.composerInput)}).value`);
+  const sendDelta17h = (await sendCalls()).count;
+  record(
+    "r17-template-actions",
+    {
+      phase: "custom-draft-kept",
+      customKept: customKept17h,
+      notesTemplateKept: notesTemplateKept17h,
+      focused: focusedCustom17h,
+      send: sendDelta17h,
+      ready: { custom: ready17h1.ok, notes: ready17h2.ok },
+    },
+    [
+      ...(ready17h1.ok ? [] : [`前置失败（自定义草稿相位）：${JSON.stringify(ready17h1.trail)}`]),
+      ...(ready17h2.ok ? [] : [`前置失败（笔记模板相位）：${JSON.stringify(ready17h2.trail)}`]),
+      ...(customKept17h === "我的问题：请给出结论" ? [] : [`自定义草稿不得被覆盖：${JSON.stringify(customKept17h)}`]),
+      ...(notesTemplateKept17h === NOTES_ASK_TEMPLATE ? [] : [`笔记模板不参与替换：${JSON.stringify(notesTemplateKept17h)}`]),
+      ...(focusedCustom17h === true ? [] : ["模板动作后应聚焦输入框（含一字不改分支）"]),
+      ...(sendDelta17h === 0 ? [] : [`自定义草稿相位不得发送：${sendDelta17h}`]),
+    ],
+  );
+
+  // --- r17-2b 4 按钮几何：默认 / 窄栏 / 窄栏 + 200%（组 r17-template-geometry）--------
+  log("r17-2b 4 按钮几何：默认宽度下同一行、浮层在 stage 内、零相交");
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  await selectPageSpan(1);
+  const ready17i1 = await ensureQuickAskExcerptReady(1);
+  const actions17i1 = await quickAskActionsProbe();
+  const stage17i1 = await rectOfSelector(".reader-stage", 0);
+  const composer17i1 = await rectOfSelector(SEL.composerBox, 0);
+  const section17i1 = await rectOfSelector(SEL.readerSection, 0);
+  const indicator17i1 = await rectOfSelector(SEL.pageIndicator, 0);
+  const insideStage17i1 =
+    !!actions17i1.rect &&
+    !!stage17i1 &&
+    actions17i1.rect.x >= stage17i1.x + 4 - 1 &&
+    actions17i1.rect.y >= stage17i1.y + 4 - 1 &&
+    actions17i1.rect.x + actions17i1.rect.width <= stage17i1.x + stage17i1.width - 4 + 1 &&
+    actions17i1.rect.y + actions17i1.rect.height <= stage17i1.y + stage17i1.height - 4 + 1;
+  record(
+    "r17-template-geometry",
+    {
+      phase: "four-buttons-default",
+      stage: stage17i1,
+      float: actions17i1.rect,
+      buttons: actions17i1.buttons,
+      scrollOverflow: actions17i1.scrollOverflow,
+      insideStage: insideStage17i1,
+      ready: ready17i1.ok,
+      intersect: {
+        composer: intersects(actions17i1.rect, composer17i1),
+        section: intersects(actions17i1.rect, section17i1),
+        indicator: intersects(actions17i1.rect, indicator17i1),
+      },
+    },
+    [
+      ...(ready17i1.ok ? [] : [`前置失败（默认宽度相位）：${JSON.stringify(ready17i1.trail)}`]),
+      ...(!!actions17i1.rect && !!stage17i1 && !!composer17i1 && !!section17i1 && !!indicator17i1 ? [] : ["rect 缺失（几何断言前置）"]),
+      ...(insideStage17i1 ? [] : [`浮层应钳制在 .reader-stage 内（STAGE_PADDING=4）：${JSON.stringify({ float: actions17i1.rect, stage: stage17i1 })}`]),
+      ...(actions17i1.scrollOverflow !== null && actions17i1.scrollOverflow <= 1 ? [] : [`浮层横向不得溢出：${actions17i1.scrollOverflow}`]),
+      ...(actions17i1.buttons.length === 4 &&
+      actions17i1.buttons.every((btn, index, list) => btn.rect.width > 0 && (index === 0 || btn.rect.x > list[index - 1].rect.x)) &&
+      Math.max(...actions17i1.buttons.map((btn) => btn.rect.y)) - Math.min(...actions17i1.buttons.map((btn) => btn.rect.y)) <= 1 &&
+      actions17i1.buttons.every((btn, index, list) => list.every((other, otherIndex) => otherIndex <= index || !intersects(btn.rect, other.rect)))
+        ? []
+        : [`4 按钮应单行递增且两两不相交：${JSON.stringify(actions17i1.buttons)}`]),
+      ...(JSON.stringify(actions17i1.buttons.map((btn) => btn.text)) === JSON.stringify(QUICK_ASK_ACTIONS) ? [] : [`动作文案异常：${JSON.stringify(actions17i1.buttons.map((btn) => btn.text))}`]),
+      ...(!intersects(actions17i1.rect, composer17i1) && !intersects(actions17i1.rect, section17i1) && !intersects(actions17i1.rect, indicator17i1)
+        ? []
+        : [`浮层与既有控件相交：${JSON.stringify({ composer: intersects(actions17i1.rect, composer17i1), section: intersects(actions17i1.rect, section17i1), indicator: intersects(actions17i1.rect, indicator17i1) })}`]),
+    ],
+  );
+
+  log("r17-2b 4 按钮几何：窄栏（--pix-right-width: 560px）");
+  const rightVarNarrow17i2 = await layoutVar("--pix-right-width", RIGHT_WIDTH);
+  await selectPageSpan(1);
+  const ready17i2 = await ensureQuickAskExcerptReady(1);
+  const actions17i2 = await quickAskActionsProbe();
+  const stage17i2 = await rectOfSelector(".reader-stage", 0);
+  const composer17i2 = await rectOfSelector(SEL.composerBox, 0);
+  const section17i2 = await rectOfSelector(SEL.readerSection, 0);
+  const indicator17i2 = await rectOfSelector(SEL.pageIndicator, 0);
+  const insideStage17i2 =
+    !!actions17i2.rect &&
+    !!stage17i2 &&
+    actions17i2.rect.x >= stage17i2.x + 4 - 1 &&
+    actions17i2.rect.y >= stage17i2.y + 4 - 1 &&
+    actions17i2.rect.x + actions17i2.rect.width <= stage17i2.x + stage17i2.width - 4 + 1 &&
+    actions17i2.rect.y + actions17i2.rect.height <= stage17i2.y + stage17i2.height - 4 + 1;
+  const rightVarRestored17i2 = await layoutVar("--pix-right-width", null);
+  const restoredRightWidth17i2 = await js(`Math.round(document.querySelector(".layout-right").getBoundingClientRect().width)`);
+  record(
+    "r17-template-geometry",
+    {
+      phase: "four-buttons-narrow",
+      stage: stage17i2,
+      float: actions17i2.rect,
+      buttons: actions17i2.buttons,
+      scrollOverflow: actions17i2.scrollOverflow,
+      insideStage: insideStage17i2,
+      ready: ready17i2.ok,
+      rightVar: rightVarNarrow17i2,
+      restoredRightWidth: restoredRightWidth17i2,
+      restoredVar: rightVarRestored17i2,
+      intersect: {
+        composer: intersects(actions17i2.rect, composer17i2),
+        section: intersects(actions17i2.rect, section17i2),
+        indicator: intersects(actions17i2.rect, indicator17i2),
+      },
+    },
+    [
+      ...(ready17i2.ok ? [] : [`前置失败（窄栏相位）：${JSON.stringify(ready17i2.trail)}`]),
+      ...(rightVarNarrow17i2 === RIGHT_WIDTH ? [] : [`CSS 变量未写入：${JSON.stringify(rightVarNarrow17i2)}`]),
+      ...(!!actions17i2.rect && !!stage17i2 && !!composer17i2 && !!section17i2 && !!indicator17i2 ? [] : ["rect 缺失（几何断言前置）"]),
+      ...(insideStage17i2 ? [] : [`窄栏下浮层应仍钳制在 .reader-stage 内：${JSON.stringify({ float: actions17i2.rect, stage: stage17i2 })}`]),
+      ...(actions17i2.scrollOverflow !== null && actions17i2.scrollOverflow <= 1 ? [] : [`窄栏下浮层横向不得溢出：${actions17i2.scrollOverflow}`]),
+      ...(actions17i2.buttons.length === 4 &&
+      actions17i2.buttons.every((btn, index, list) => btn.rect.width > 0 && (index === 0 || btn.rect.x > list[index - 1].rect.x)) &&
+      Math.max(...actions17i2.buttons.map((btn) => btn.rect.y)) - Math.min(...actions17i2.buttons.map((btn) => btn.rect.y)) <= 1 &&
+      actions17i2.buttons.every((btn, index, list) => list.every((other, otherIndex) => otherIndex <= index || !intersects(btn.rect, other.rect)))
+        ? []
+        : [`窄栏下 4 按钮应单行递增且两两不相交：${JSON.stringify(actions17i2.buttons)}`]),
+      ...(JSON.stringify(actions17i2.buttons.map((btn) => btn.text)) === JSON.stringify(QUICK_ASK_ACTIONS) ? [] : [`动作文案异常：${JSON.stringify(actions17i2.buttons.map((btn) => btn.text))}`]),
+      ...(!intersects(actions17i2.rect, composer17i2) && !intersects(actions17i2.rect, section17i2) && !intersects(actions17i2.rect, indicator17i2)
+        ? []
+        : [`窄栏下浮层与既有控件相交：${JSON.stringify({ composer: intersects(actions17i2.rect, composer17i2), section: intersects(actions17i2.rect, section17i2), indicator: intersects(actions17i2.rect, indicator17i2) })}`]),
+      ...(Math.abs(restoredRightWidth17i2 - 380) <= 2 ? [] : [`右栏宽度未复位：${restoredRightWidth17i2}`]),
+      ...(rightVarRestored17i2 === "" ? [] : [`CSS 变量未清除：${JSON.stringify(rightVarRestored17i2)}`]),
+    ],
+  );
+
+  log("r17-2b 4 按钮几何：窄栏 + 200% 缩放（右缘钳制生效）");
+  await layoutVar("--pix-right-width", RIGHT_WIDTH);
+  for (let index = 0; index < 10; index += 1) await clickEl(SEL.zoomInBtn);
+  await waitFor("缩放 200%", `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "200%"`);
+  await js(`document.querySelector(${JSON.stringify(SEL.pdfScroll)}).scrollLeft = 0, true`);
+  await sleep(400);
+  await selectPageSpan(1);
+  const ready17i3 = await ensureQuickAskExcerptReady(1);
+  const actions17i3 = await quickAskActionsProbe();
+  const stage17i3 = await rectOfSelector(".reader-stage", 0);
+  const zoom17i3 = await zoomLabel();
+  const clampGap17i3 = actions17i3.rect && stage17i3 ? Math.round((stage17i3.x + stage17i3.width - 4 - (actions17i3.rect.x + actions17i3.rect.width)) * 10) / 10 : null;
+  const insideStage17i3 =
+    !!actions17i3.rect &&
+    !!stage17i3 &&
+    actions17i3.rect.x >= stage17i3.x + 4 - 1 &&
+    actions17i3.rect.y >= stage17i3.y + 4 - 1 &&
+    actions17i3.rect.x + actions17i3.rect.width <= stage17i3.x + stage17i3.width - 4 + 1 &&
+    actions17i3.rect.y + actions17i3.rect.height <= stage17i3.y + stage17i3.height - 4 + 1;
+  await capturePage(win, "r17-2d-quick-ask-four-buttons-zoom.png", await rectOfSelector(SEL.pdfViewer, 0));
+  for (let index = 0; index < 10; index += 1) await clickEl('.pdf-toolbar button[title="缩小"]');
+  await waitFor("缩放回 100%", `document.querySelector(".zoom-label").textContent.replace(/\\s+/g, " ").trim() === "100%"`);
+  await layoutVar("--pix-right-width", null);
+  const restoredRightWidth17i3 = await js(`Math.round(document.querySelector(".layout-right").getBoundingClientRect().width)`);
+  record(
+    "r17-template-geometry",
+    {
+      phase: "four-buttons-zoom-clamp",
+      zoom: zoom17i3,
+      stage: stage17i3,
+      stageRight: stage17i3 ? stage17i3.x + stage17i3.width : null,
+      float: actions17i3.rect,
+      floatRight: actions17i3.rect ? actions17i3.rect.x + actions17i3.rect.width : null,
+      clampGap: clampGap17i3,
+      buttons: actions17i3.buttons,
+      scrollOverflow: actions17i3.scrollOverflow,
+      insideStage: insideStage17i3,
+      ready: ready17i3.ok,
+      restored: { zoom: await zoomLabel(), rightWidth: restoredRightWidth17i3 },
+    },
+    [
+      ...(ready17i3.ok ? [] : [`前置失败（缩放相位）：${JSON.stringify(ready17i3.trail)}`]),
+      ...(zoom17i3 === "200%" ? [] : [`缩放未到 200%：${zoom17i3}`]),
+      ...(clampGap17i3 !== null && Math.abs(clampGap17i3) <= 1.5 ? [] : [`右缘钳制未生效（float.right 应等于 stage.right - 4）：${JSON.stringify({ clampGap: clampGap17i3, float: actions17i3.rect, stage: stage17i3 })}`]),
+      ...(insideStage17i3 ? [] : [`200% 下浮层应仍钳制在 .reader-stage 内：${JSON.stringify({ float: actions17i3.rect, stage: stage17i3 })}`]),
+      ...(actions17i3.scrollOverflow !== null && actions17i3.scrollOverflow <= 1 ? [] : [`200% 下浮层横向不得溢出：${actions17i3.scrollOverflow}`]),
+      ...(actions17i3.buttons.length === 4 &&
+      actions17i3.buttons.every((btn, index, list) => btn.rect.width > 0 && (index === 0 || btn.rect.x > list[index - 1].rect.x)) &&
+      Math.max(...actions17i3.buttons.map((btn) => btn.rect.y)) - Math.min(...actions17i3.buttons.map((btn) => btn.rect.y)) <= 1 &&
+      actions17i3.buttons.every((btn, index, list) => list.every((other, otherIndex) => otherIndex <= index || !intersects(btn.rect, other.rect)))
+        ? []
+        : [`200% 下 4 按钮应单行递增且两两不相交：${JSON.stringify(actions17i3.buttons)}`]),
+      ...((await zoomLabel()) === "100%" && Math.abs(restoredRightWidth17i3 - 380) <= 2
+        ? []
+        : [`收尾复位异常：${JSON.stringify({ zoom: await zoomLabel(), rightWidth: restoredRightWidth17i3 })}`]),
+    ],
+  );
+  // --- r17-3 选区快照（N97-4 追加）：点击模板动作 → 真实键入 ⇒ chip / 草稿 / 载荷仍带选区 -------
+  // 判别性：本场景的两条来源必须同时被验证 —— 相位 snapshot-survives-typing 构造「store 已空、
+  //   chip 仍在」（快照来源），相位 new-selection 构造「store 非空且与快照不同、chip 换成新文本」
+  //   （新选区优先）；两者合起来排除「chip 只看 store」与「chip 只看快照」两种错实现。
+  // 键入通道：typeIntoComposer 走真实输入通道（sendInputEvent char），非程序化 setter。
+  log("r17-3 选区快照：点「解释」→ 真实键入 ⇒ 选中文本 chip 与载荷不丢");
+  const TYPED17J = "（追问）它在第二节的作用是什么？";
+  await enterCleanWorkspace(seedNotes());
+  await openRow("sample-paper.pdf");
+  await waitPdfLoaded();
+  await waitPage(1, 3);
+  // 选区步护栏（N97-4 收口 mustFix ②）：迟到的阅读区滚动会按既有语义隐藏浮层 ⇒ selectPageSpan
+  // 内部的「摘录浮层」等待可能超时抛错。先用既有 waitStageScrollQuiet() 做有界静默等待，把环境性
+  // 滚动吸收掉；判据与断言零改动，护栏读数落进 data.scrollGuard。
+  const scrollGuard17j1 = await waitStageScrollQuiet();
+  await selectPageSpan(1);
+  const ready17j = await ensureQuickAskExcerptReady(1);
+  await clearSendCalls();
+  const selectionBefore17j = await selectionProbe();
+  const spanText17j = await pageSpanText(1);
+  const selectionText17j = await js("document.getSelection().toString().trim()");
+  const chipsBefore17j = await chipSnapshot();
+  const labelBefore17j = (chipsBefore17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const blocksBefore17j = await userBlocks();
+  // 真实键入证据：监听 .input-area 的 input 事件（isTrusted + inputType），证明字符经真实输入管线到达
+  await js(`(() => {
+    const input = document.querySelector(${JSON.stringify(SEL.composerInput)});
+    if (!input) throw new Error("composer input not found");
+    window.__pixTypingLog17j = [];
+    input.addEventListener("input", (event) => {
+      window.__pixTypingLog17j.push({ trusted: event.isTrusted, inputType: event.inputType, data: event.data });
+    });
+    return true;
+  })()`);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("解释"));
+    if (!target) throw new Error("解释按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "点「解释」后浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const quickAskAfter17j = await quickAskStateProbe();
+  const composerAfterClick17j = await composerSnapshot();
+  const typedValue17j = await typeIntoComposer(TYPED17J);
+  const typingLog17j = await js("window.__pixTypingLog17j");
+  const composerAfterTyping17j = await composerSnapshot();
+  const chipsAfterTyping17j = await chipSnapshot();
+  const labelAfterTyping17j = (chipsAfterTyping17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const selectionAfterTyping17j = await selectionProbe();
+  const blocksAfterTyping17j = await userBlocks();
+  const sendDelta17j = (await sendCalls()).count;
+  // 裁切容器（N97-4 收口 mustFix ①）：`.composer` 是 `.context-row`（chip 行）与 `.composer-box`
+  // 的共同父容器（ChatPanel.vue:1122 / :1134 / :1155）⇒ chip 行 + 草稿同框；`.composer-box` 自身
+  // 不含 chip 行（`.context-row` 是其前一个兄弟）。
+  await capturePage(win, "r17-3-snapshot-survives-typing.png", await rectOfSelector(".composer", 0));
+  record(
+    "r17-selection-snapshot",
+    {
+      phase: "snapshot-survives-typing",
+      ready: ready17j.ok,
+      scrollGuard: scrollGuard17j1,
+      selectionText: selectionText17j,
+      selectionBefore: selectionBefore17j,
+      spanText: spanText17j,
+      chipsBefore: chipsBefore17j,
+      quickAskAfterExplain: quickAskAfter17j,
+      composerAfterClick: composerAfterClick17j,
+      typed: { text: TYPED17J, value: typedValue17j, log: typingLog17j },
+      composerAfterTyping: composerAfterTyping17j,
+      chipsAfterTyping: chipsAfterTyping17j,
+      selectionAfterTyping: selectionAfterTyping17j,
+      quiet: { send: sendDelta17j, blocks: { before: blocksBefore17j, after: blocksAfterTyping17j } },
+    },
+    [
+      ...(ready17j.ok ? [] : [`前置失败：浮层未就绪 ${JSON.stringify(ready17j.trail)}`]),
+      ...(selectionBefore17j.collapsed === false && selectionBefore17j.anchorInStage === true && selectionBefore17j.text === spanText17j
+        ? []
+        : [`点击时选区应完好：${JSON.stringify({ selectionBefore: selectionBefore17j, spanText: spanText17j })}`]),
+      ...(quickAskAfter17j.display === "none" ? [] : [`点击后浮层应沿用既有 hide() 形态（display: none）：${JSON.stringify(quickAskAfter17j)}`]),
+      ...(composerAfterClick17j.activeHasInputArea === true ? [] : ["键入前焦点应在 composer 内（真实键入路径的必要条件）"]),
+      ...(labelAfterTyping17j !== null ? [] : [`键入后「选中文本」chip 应仍在：${JSON.stringify(chipsAfterTyping17j)}`]),
+      ...(labelAfterTyping17j !== null && labelAfterTyping17j === labelBefore17j
+        ? []
+        : [`chip 文本应逐字等于点击时刻：${JSON.stringify({ before: labelBefore17j, after: labelAfterTyping17j })}`]),
+      ...(composerAfterTyping17j.value === EXPLAIN_TEMPLATE + TYPED17J &&
+      typedValue17j === EXPLAIN_TEMPLATE + TYPED17J &&
+      typingLog17j.length === TYPED17J.length &&
+      typingLog17j.every((entry) => entry.trusted === true && entry.inputType === "insertText" && typeof entry.data === "string")
+        ? []
+        : [`草稿应逐字等于解释模板 + 键入内容，且键入须走真实输入通道：${JSON.stringify({ value: composerAfterTyping17j.value, typedValue: typedValue17j, log: typingLog17j })}`]),
+      ...(sendDelta17j === 0 && blocksAfterTyping17j === blocksBefore17j
+        ? []
+        : [`模板动作与键入都不得发送：${JSON.stringify({ send: sendDelta17j, before: blocksBefore17j, after: blocksAfterTyping17j })}`]),
+      ...(selectionAfterTyping17j.collapsed === true && selectionAfterTyping17j.anchorInStage === false
+        ? []
+        : [`非真空证据：键入后 document 选区应已被收进输入框：${JSON.stringify(selectionAfterTyping17j)}`]),
+    ],
+  );
+
+  log("r17-3 载荷：发送后 <reading_context> 含点击时刻的 selectedText");
+  await clearSendCalls();
+  await js(`document.querySelector(".composer-send").click(), true`);
+  await waitSendCalls(1);
+  const payload17j = await lastSend();
+  const lines17j = String(payload17j.message).split("\n");
+  const selectedIndex17j = lines17j.indexOf("selectedText:");
+  const sendCount17j = (await sendCalls()).count;
+  const draft17j = EXPLAIN_TEMPLATE + TYPED17J;
+  const skeleton17j = {
+    head: lines17j[0] === "<reading_context>",
+    path: lines17j.some((line) => line.startsWith("path: ") && line.endsWith("sample-paper.pdf")),
+    pages: lines17j.includes("page: 1") && lines17j.includes("pageCount: 3"),
+    tail: selectedIndex17j >= 0 && lines17j.indexOf("</reading_context>") === selectedIndex17j + 2,
+  };
+  record(
+    "r17-selection-snapshot",
+    {
+      phase: "send-payload",
+      sendCount: sendCount17j,
+      displayText: payload17j.displayText,
+      selectedIndex: selectedIndex17j,
+      selectedTextLine: selectedIndex17j >= 0 ? lines17j[selectedIndex17j + 1] : null,
+      expectedSelectionText: selectionText17j,
+      skeleton: skeleton17j,
+      lines: lines17j,
+      tailMatches: String(payload17j.message).endsWith("\n\n" + draft17j),
+    },
+    [
+      ...(sendCount17j === 1 ? [] : [`发送次数应为 1：${sendCount17j}`]),
+      ...(payload17j.displayText === draft17j ? [] : [`气泡文案应逐字等于键入后的草稿：${JSON.stringify(payload17j.displayText)}`]),
+      ...(selectedIndex17j >= 0 ? [] : [`载荷应含 selectedText: 行：${JSON.stringify(lines17j)}`]),
+      ...(selectedIndex17j >= 0 && lines17j[selectedIndex17j + 1] === selectionText17j
+        ? []
+        : [`selectedText: 的下一行应逐字等于点击时刻的选区文本：${JSON.stringify({ expected: selectionText17j, actual: selectedIndex17j >= 0 ? lines17j[selectedIndex17j + 1] : null })}`]),
+      ...(skeleton17j.head && skeleton17j.path && skeleton17j.pages && skeleton17j.tail
+        ? []
+        : [`载荷骨架行缺失或顺序异常：${JSON.stringify({ skeleton: skeleton17j, lines: lines17j })}`]),
+      ...(String(payload17j.message).endsWith("\n\n" + draft17j) ? [] : ["载荷尾部应为空行 + 草稿逐字"]),
+    ],
+  );
+
+  log("r17-3 新选区：chip 立即改为新选区文本（旧快照失效）");
+  await clickNext();
+  await waitPage(2, 3);
+  const scrollGuard17j2 = await waitStageScrollQuiet();
+  await selectPageSpan(2);
+  const ready17j2 = await ensureQuickAskExcerptReady(2);
+  const spanText17j2 = await pageSpanText(2);
+  const chips17j2 = await chipSnapshot();
+  const label17j2 = (chips17j2.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const expectedLabel17j2 =
+    !!spanText17j2 && spanText17j2.length > 24 ? `选中文本：${spanText17j2.slice(0, 24)}…` : `选中文本：${spanText17j2}`;
+  record(
+    "r17-selection-snapshot",
+    {
+      phase: "new-selection",
+      ready: ready17j2.ok,
+      scrollGuard: scrollGuard17j2,
+      spanText: spanText17j2,
+      expectedLabel: expectedLabel17j2,
+      label: label17j2,
+      previousLabel: labelBefore17j,
+      labels: chips17j2.labels,
+    },
+    [
+      ...(ready17j2.ok && !!spanText17j2 && spanText17j2 !== selectionText17j ? [] : [`前置失败：新选区应就绪且与旧选区不同 ${JSON.stringify({ ready: ready17j2.ok, spanText: spanText17j2, previous: selectionText17j })}`]),
+      ...(label17j2 !== null && label17j2 === expectedLabel17j2 ? [] : [`新选区应覆盖旧快照：${JSON.stringify({ expected: expectedLabel17j2, actual: label17j2 })}`]),
+      ...(label17j2 !== null && label17j2 !== labelBefore17j ? [] : [`chip 不得仍显示旧快照文本：${JSON.stringify({ previous: labelBefore17j, actual: label17j2 })}`]),
+    ],
+  );
+
+  log("r17-3 移除 chip：不复活（既有 resetExcludedContexts 触发后仍无「选中文本」项）");
+  const scrollGuard17j3 = await waitStageScrollQuiet();
+  await selectPageSpan(2);
+  const ready17j3 = await ensureQuickAskExcerptReady(2);
+  await js(`(() => {
+    const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("问 AI"));
+    if (!target) throw new Error("问 AI 按钮不存在");
+    target.click();
+    return true;
+  })()`);
+  await waitFor(
+    "点「问 AI」后浮层隐藏",
+    `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+  );
+  const selectionAfterAsk17j = await selectionProbe();
+  const chipsBeforeRemove17j = await chipSnapshot();
+  const labelBeforeRemove17j = (chipsBeforeRemove17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const blocksBeforeReset17j = await userBlocks();
+  const composerBeforeRemove17j = await composerSnapshot();
+  await js(`(() => {
+    const chip = Array.from(document.querySelectorAll(${JSON.stringify(SEL.contextChip)})).find((el) => {
+      const label = el.querySelector(".context-chip-label");
+      return !!label && label.textContent.replace(/\\s+/g, " ").trim().indexOf("选中文本：") === 0;
+    });
+    if (!chip) throw new Error("选中文本 chip 不存在");
+    const remove = chip.querySelector(${JSON.stringify(SEL.contextChipRemove)});
+    if (!remove) throw new Error("chip 移除按钮不存在");
+    remove.click();
+    return true;
+  })()`);
+  const chipsAfterRemove17j = await chipSnapshot();
+  const labelAfterRemove17j = (chipsAfterRemove17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const composerAfterRemove17j = await composerSnapshot();
+  // 触发既有 resetExcludedContexts()：走真实发送路径（send() 的 finally 调用该函数；同函数的另一触发点
+  // —— displayBlocks → 0 —— 在本夹具不可达：stub 的 setMessages([]) 只改 stub 侧，不动渲染层 store）。
+  await waitFor("移除 chip 后发送按钮可点", `(() => { const b = document.querySelector(".composer-send"); return !!b && !b.disabled; })()`);
+  await clearSendCalls();
+  await js(`document.querySelector(".composer-send").click(), true`);
+  await waitSendCalls(1);
+  await sleep(200);
+  const sendAfterRemove17j = (await sendCalls()).count;
+  const chipsAfterReset17j = await chipSnapshot();
+  const labelAfterReset17j = (chipsAfterReset17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const composerAfterReset17j = await composerSnapshot();
+  record(
+    "r17-selection-snapshot",
+    {
+      phase: "chip-removed",
+      ready: ready17j3.ok,
+      scrollGuard: scrollGuard17j3,
+      labelBeforeRemove: labelBeforeRemove17j,
+      selectionAfterAsk: selectionAfterAsk17j,
+      chipsAfterRemove: chipsAfterRemove17j,
+      chipsAfterReset: chipsAfterReset17j,
+      blocksBeforeReset: blocksBeforeReset17j,
+      sendAfterRemove: sendAfterRemove17j,
+      composer: { before: composerBeforeRemove17j.value, afterRemove: composerAfterRemove17j.value, afterReset: composerAfterReset17j.value },
+    },
+    [
+      ...(ready17j3.ok && labelBeforeRemove17j !== null && selectionAfterAsk17j.collapsed === true
+        ? []
+        : [`移除前前置失败：chip 应由快照支撑且选区已收进输入框 ${JSON.stringify({ ready: ready17j3.ok, label: labelBeforeRemove17j, selection: selectionAfterAsk17j })}`]),
+      ...(labelAfterRemove17j === null && chipsAfterRemove17j.count === chipsBeforeRemove17j.count - 1
+        ? []
+        : [`移除后「选中文本」项应消失：${JSON.stringify({ before: chipsBeforeRemove17j, after: chipsAfterRemove17j })}`]),
+      ...(blocksBeforeReset17j > 0 && sendAfterRemove17j === 1 && labelAfterReset17j === null
+        ? []
+        : [`既有 resetExcludedContexts() 触发后不得复活：${JSON.stringify({ blocks: blocksBeforeReset17j, send: sendAfterRemove17j, labels: chipsAfterReset17j.labels })}`]),
+      ...(composerBeforeRemove17j.value === composerAfterRemove17j.value
+        ? []
+        : [`移除 chip 不得改 composer 草稿：${JSON.stringify({ before: composerBeforeRemove17j.value, afterRemove: composerAfterRemove17j.value })}`]),
+    ],
+  );
+
+  log("r17-3 切文档：快照清空（chip 消失）");
+  await focusPage(1);
+  let switchProbe17j4 = null;
+  // 重取护栏（既有有界重取范式）：迟到滚动会按既有语义隐藏浮层并清空 cachedText，此时点击不再发射；
+  // 生效信号 = 点击后 document 选区被收进 composer（焦点转移）；未生效则重建选区后重试（≤3 次）。
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const scrollGuardAttempt = await waitStageScrollQuiet();
+    await selectPageSpan(1);
+    const readyAttempt = await ensureQuickAskExcerptReady(1);
+    const quickAskBeforeClick = await quickAskStateProbe();
+    const chipsBeforeClick = await chipSnapshot();
+    const labelBeforeClick = (chipsBeforeClick.labels || []).find((item) => String(item).startsWith("选中文本：")) ?? null;
+    await js(`(() => {
+      const target = Array.from(document.querySelectorAll(".quick-ask-btn")).find((btn) => (btn.textContent || "").includes("解释"));
+      if (!target) throw new Error("解释按钮不存在");
+      target.click();
+      return true;
+    })()`);
+    await waitFor(
+      "切文档前点「解释」后浮层隐藏",
+      `(() => { const el = document.querySelector(${JSON.stringify(SEL.quickAsk)}); return !!el && getComputedStyle(el).display === "none"; })()`,
+    );
+    await sleep(150);
+    const selectionAfterClick = await selectionProbe();
+    const chipsAfterClick = await chipSnapshot();
+    const labelAfterClick = (chipsAfterClick.labels || []).find((item) => String(item).startsWith("选中文本：")) ?? null;
+    switchProbe17j4 = { attempts: attempt, ready: readyAttempt.ok, scrollGuard: scrollGuardAttempt, quickAskBeforeClick, labelBeforeClick, selectionAfterClick, labelAfterClick, chipsAfterClick };
+    if (selectionAfterClick.collapsed === true) break;
+  }
+  await clearSendCalls();
+  await openRow("long-book.pdf");
+  await waitPdfLoaded();
+  await waitFor("long-book 页盒 60 页", `document.querySelectorAll(".pdf-page").length === 60`);
+  const chipsAfterSwitch17j = await chipSnapshot();
+  const labelAfterSwitch17j = (chipsAfterSwitch17j.labels || []).find((label) => String(label).startsWith("选中文本：")) ?? null;
+  const sendDeltaSwitch17j = (await sendCalls()).count;
+  record(
+    "r17-selection-snapshot",
+    {
+      phase: "doc-switch",
+      ready: switchProbe17j4 ? switchProbe17j4.ready : false,
+      scrollGuard: switchProbe17j4 ? switchProbe17j4.scrollGuard : null,
+      attempts: switchProbe17j4 ? switchProbe17j4.attempts : 0,
+      quickAskBeforeClick: switchProbe17j4 ? switchProbe17j4.quickAskBeforeClick : null,
+      labelBeforeClick: switchProbe17j4 ? switchProbe17j4.labelBeforeClick : null,
+      labelBeforeSwitch: switchProbe17j4 ? switchProbe17j4.labelAfterClick : null,
+      selectionBeforeSwitch: switchProbe17j4 ? switchProbe17j4.selectionAfterClick : null,
+      chipsBeforeSwitch: switchProbe17j4 ? switchProbe17j4.chipsAfterClick : null,
+      chipsAfterSwitch: chipsAfterSwitch17j,
+      sendDelta: sendDeltaSwitch17j,
+    },
+    [
+      ...(switchProbe17j4 !== null &&
+      switchProbe17j4.ready === true &&
+      switchProbe17j4.labelBeforeClick !== null &&
+      switchProbe17j4.labelAfterClick !== null &&
+      switchProbe17j4.selectionAfterClick.collapsed === true
+        ? []
+        : [`切换前前置失败：chip 应由快照支撑 ${JSON.stringify(switchProbe17j4)}`]),
+      ...(labelAfterSwitch17j === null ? [] : [`切换文档后不得保留旧选区 chip：${JSON.stringify({ label: labelAfterSwitch17j, labels: chipsAfterSwitch17j.labels })}`]),
+      ...(sendDeltaSwitch17j === 0 ? [] : [`切文档不得发送：${sendDeltaSwitch17j}`]),
     ],
   );
   await restoreStandardSeed();
