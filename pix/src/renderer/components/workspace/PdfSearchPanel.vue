@@ -431,7 +431,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .pdf-search-panel {
   position: absolute;
-  top: 78px;
+  top: 44px;
   right: 12px;
   z-index: 4;
   display: flex;

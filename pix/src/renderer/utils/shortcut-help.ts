@@ -1,6 +1,6 @@
 /**
  * 快捷键总览的只读数据源（R17 N96）。
- * 冻结：3 组 / 19 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
+ * 冻结：3 组 / 22 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
  * 本文件零 import（与 page-anchor.ts / notes-path.ts 同范式）。
  */
 
@@ -28,6 +28,8 @@ export const SHORTCUT_SECTIONS: readonly ShortcutSection[] = [
       { keys: ["End"], desc: "跳到最后一页" },
       { keys: ["["], desc: "上一节" },
       { keys: ["]"], desc: "下一节" },
+      { keys: ["Ctrl+=", "Ctrl+-"], desc: "放大 / 缩小" },
+      { keys: ["Ctrl+0"], desc: "适合宽度" },
       { keys: ["Esc"], desc: "退出框选模式或关闭文档搜索" },
     ],
   },
@@ -47,6 +49,7 @@ export const SHORTCUT_SECTIONS: readonly ShortcutSection[] = [
   {
     title: "工作区",
     rows: [
+      { keys: ["F"], desc: "专注阅读（收起或展开两侧栏）" },
       { keys: ["?"], desc: "打开或关闭本总览" },
       { keys: ["Ctrl+,"], desc: "打开设置" },
     ],

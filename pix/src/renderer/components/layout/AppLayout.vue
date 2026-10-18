@@ -11,20 +11,31 @@
  * A thin drag bar owns the frameless window's draggable strip, so the window
  * controls stay clickable. Left and Right are full-height. Center manages its
  * own internal header / content / composer structure.
- * Left can collapse so reader + chat take the remaining width; below 960px the
- * chat pane becomes an overlay the user can open and close.
+ * Left and right can each collapse so the reader takes the remaining width;
+ * a collapsed chat pane leaves a floating "对话" button to bring it back.
+ * Below 960px the chat pane becomes an overlay the user can open and close.
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
-defineProps<{
+const props = defineProps<{
   leftCollapsed?: boolean;
+  rightCollapsed?: boolean;
+}>();
+
+const emit = defineEmits<{
+  "expand-right": [];
 }>();
 
 const NARROW_QUERY = "(max-width: 959px)";
 const narrow = ref(window.matchMedia(NARROW_QUERY).matches);
 const chatOpen = ref(false);
 
-const chatVisible = computed(() => !narrow.value || chatOpen.value);
+const chatVisible = computed(() => (narrow.value ? chatOpen.value : !props.rightCollapsed));
+
+function openChat(): void {
+  if (narrow.value) chatOpen.value = true;
+  else emit("expand-right");
+}
 
 function onNarrowChange(event: MediaQueryListEvent): void {
   narrow.value = event.matches;
@@ -72,17 +83,17 @@ onBeforeUnmount(() => {
           </button>
         </div>
         <div class="chat-slot">
-          <slot name="right" />
+          <slot name="right" :narrow="narrow" />
         </div>
       </aside>
 
       <button
-        v-if="narrow && !chatOpen"
+        v-if="!chatVisible"
         type="button"
         class="chat-open-btn"
         title="打开对话面板"
         aria-label="打开对话面板"
-        @click="chatOpen = true"
+        @click="openChat"
       >
         <v-icon size="16">mdi-chat-outline</v-icon>
         <span>对话</span>
@@ -166,6 +177,30 @@ onBeforeUnmount(() => {
   display: none;
 }
 
+.chat-open-btn {
+  position: absolute;
+  right: 26px;
+  bottom: 22px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--pix-border-light);
+  border-radius: 999px;
+  background: var(--pix-bg-elevated);
+  box-shadow: var(--pix-shadow-md);
+  color: var(--pix-text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-open-btn:hover {
+  background: var(--pix-bg-hover);
+}
+
 @media (max-width: 959px) {
   .app-layout {
     gap: 6px;
@@ -175,6 +210,10 @@ onBeforeUnmount(() => {
   .layout-left {
     width: 220px;
     min-width: 220px;
+  }
+
+  .chat-open-btn {
+    right: 14px;
   }
 
   /* Chat becomes an overlay above the reader instead of disappearing, so the
@@ -223,30 +262,6 @@ onBeforeUnmount(() => {
   .chat-overlay-close:hover {
     background: var(--pix-bg-hover);
     color: var(--pix-text-primary);
-  }
-
-  .chat-open-btn {
-    position: absolute;
-    right: 14px;
-    bottom: 22px;
-    z-index: 15;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    height: 34px;
-    padding: 0 14px;
-    border: 1px solid var(--pix-border-light);
-    border-radius: 999px;
-    background: var(--pix-bg-elevated);
-    box-shadow: var(--pix-shadow-md);
-    color: var(--pix-text-primary);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .chat-open-btn:hover {
-    background: var(--pix-bg-hover);
   }
 }
 </style>

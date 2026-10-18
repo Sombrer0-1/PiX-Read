@@ -111,6 +111,7 @@ interface AnchorSegment {
   start: number;
 }
 
+const viewerEl = ref<HTMLDivElement | null>(null);
 const scrollEl = ref<HTMLDivElement | null>(null);
 const isLoading = ref(false);
 const failure = ref<LibraryReadFailure | null>(null);
@@ -126,6 +127,12 @@ const captureLayerEl = ref<HTMLDivElement | null>(null);
 const captureRect = ref<{ left: number; top: number; width: number; height: number } | null>(null);
 /** 上一次框选失败（页面未渲染 / 输入框图片已满）：保留框选模式并提示，进入框选/成功后清空。 */
 const captureError = ref<string | null>(null);
+/**
+ * 适配模式：非 null 时缩放跟随阅读区尺寸（窗口缩放、收起侧栏都会重新适配）；
+ * 任何手动缩放或切换文档都会退出适配模式，落盘的仍是具体缩放值。
+ */
+type FitMode = "width" | "page";
+const fitMode = ref<FitMode | null>(null);
 
 const failureMessage = computed(() => (failure.value ? libraryReadFailureMessage(failure.value) : ""));
 const failureIcon = computed(() =>
@@ -374,33 +381,42 @@ function updateCurrentPage(): void {
   }
   const rootRect = root.getBoundingClientRect();
   const marker = rootRect.top + Math.min(120, root.clientHeight * 0.2);
+  const current = pageIndexAt(root, marker);
+  if (current === null) return;
+  readerStore.setPage(current + 1);
+}
+
+/** 视口纵坐标 y 落在哪一页（0 基下标）：页顶单调递增，取最后一个页顶在 y 之上的页，O(log n) 次读矩形。 */
+function pageIndexAt(root: HTMLElement, y: number): number | null {
   if (pageNodes.length !== pageSizes.value.length) {
     pageNodes = Array.from(root.querySelectorAll<HTMLElement>("[data-page]"));
   }
-  if (pageNodes.length === 0) return;
-
-  // Page tops grow monotonically, so the page under the marker is the last
-  // one whose top edge sits above it — O(log n) rect reads per frame.
+  if (pageNodes.length === 0) return null;
   let lo = 0;
   let hi = pageNodes.length - 1;
   let current = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (pageNodes[mid].getBoundingClientRect().top <= marker) {
+    if (pageNodes[mid].getBoundingClientRect().top <= y) {
       current = mid;
       lo = mid + 1;
     } else {
       hi = mid - 1;
     }
   }
-  readerStore.setPage(current + 1);
+  return current;
+}
+
+/** 页顶停靠线：与第 1 页自然位置一致（滚动容器的上内边距），页顶不会被浮在上方的标题条与工具条盖住。 */
+function readingInset(root: HTMLElement): number {
+  return Number.parseFloat(getComputedStyle(root).paddingTop) || 0;
 }
 
 function scrollToPage(pageNumber: number): void {
   const root = scrollEl.value;
   const el = pageElement(pageNumber);
   if (!el || !root) return;
-  const delta = el.getBoundingClientRect().top - root.getBoundingClientRect().top;
+  const delta = el.getBoundingClientRect().top - root.getBoundingClientRect().top - readingInset(root);
   root.scrollTop += delta;
   readerStore.setPage(pageNumber);
 }
@@ -473,6 +489,18 @@ function onWindowKeydown(event: KeyboardEvent): void {
     ) {
       event.preventDefault();
       openSearch();
+      return;
+    }
+    if (!event.ctrlKey || event.altKey || event.metaKey || readerStore.pageCount <= 0 || isEditableTarget(event.target)) return;
+    if (event.key === "=" || event.key === "+") {
+      event.preventDefault();
+      zoomBy(ZOOM_STEP);
+    } else if (event.key === "-") {
+      event.preventDefault();
+      zoomBy(-ZOOM_STEP);
+    } else if (event.key === "0") {
+      event.preventDefault();
+      applyFit("width");
     }
     return;
   }
@@ -758,6 +786,12 @@ async function loadPdf(filePath: string): Promise<void> {
   const jumpPage = readerStore.takePendingJump(filePath);
   const restore = readerStore.takeRestore(filePath);
   readerStore.setScale(restore ? restore.scale : DEFAULT_SCALE);
+  fitMode.value = null;
+  // 上一文档未结算的 Ctrl+滚轮缩放不带进新文档
+  if (zoomFlushTimer) clearTimeout(zoomFlushTimer);
+  zoomFlushTimer = null;
+  pendingZoomDelta = 0;
+  wheelAnchorPoint = null;
 
   try {
     if (!hasLibraryReadApi()) {
@@ -869,8 +903,110 @@ function onSelectionChange(): void {
   readerStore.setSelectedText(selection.toString());
 }
 
+const ZOOM_STEP = 0.1;
+/** 滚动容器左右内边距之和与细滚动条宽度（main.css ::-webkit-scrollbar）。 */
+const PAGE_GUTTER_X = 32 + 5;
+/** 适合整页时页底留给页码条与章节条的高度。 */
+const PAGE_BOTTOM_CLEARANCE = 64;
+
 function zoomBy(delta: number): void {
+  fitMode.value = null;
   readerStore.setScale(readerStore.scale + delta);
+}
+
+function setActualSize(): void {
+  fitMode.value = null;
+  readerStore.setScale(1);
+}
+
+/** 按阅读区尺寸算适配缩放（以最宽 / 最高的页为准，混排页尺寸的文档不会有页溢出）。 */
+function fitScale(mode: FitMode): number {
+  const box = viewerEl.value;
+  if (!box || pageSizes.value.length === 0) return readerStore.scale;
+  const maxWidth = Math.max(...pageSizes.value.map((size) => size.width));
+  const widthScale = (box.clientWidth - PAGE_GUTTER_X) / maxWidth;
+  if (mode === "width") return Math.floor(widthScale * 100) / 100;
+  const maxHeight = Math.max(...pageSizes.value.map((size) => size.height));
+  const top = scrollEl.value ? readingInset(scrollEl.value) : 0;
+  const heightScale = (box.clientHeight - top - PAGE_BOTTOM_CLEARANCE) / maxHeight;
+  return Math.floor(Math.min(widthScale, heightScale) * 100) / 100;
+}
+
+function applyFit(mode: FitMode): void {
+  if (isLoading.value || pageSizes.value.length === 0) return;
+  fitMode.value = mode;
+  readerStore.setScale(fitScale(mode));
+}
+
+const zoomOptions: ReadonlyArray<{ label: string; mode: FitMode | "actual"; shortcut?: string }> = [
+  { label: "适合宽度", mode: "width", shortcut: "Ctrl+0" },
+  { label: "适合整页", mode: "page" },
+  { label: "实际大小", mode: "actual" },
+];
+
+function isZoomOptionActive(mode: FitMode | "actual"): boolean {
+  return mode === "actual" ? fitMode.value === null && readerStore.scale === 1 : fitMode.value === mode;
+}
+
+function onZoomOption(mode: FitMode | "actual"): void {
+  if (mode === "actual") setActualSize();
+  else applyFit(mode);
+}
+
+// 适配模式下跟随阅读区尺寸：拖动窗口时合并成一次重排
+const REFIT_DELAY_MS = 120;
+let refitTimer: ReturnType<typeof setTimeout> | null = null;
+let viewerResizeObserver: ResizeObserver | null = null;
+
+function onViewerResize(): void {
+  if (!fitMode.value) return;
+  if (refitTimer) clearTimeout(refitTimer);
+  refitTimer = setTimeout(() => {
+    refitTimer = null;
+    if (!fitMode.value || isLoading.value || !pdfDoc) return;
+    readerStore.setScale(fitScale(fitMode.value));
+  }, REFIT_DELAY_MS);
+}
+
+/**
+ * 缩放锚点：缩放前记下锚点所在页与页内相对位置，重排后把同一位置放回锚点处，
+ * 读到页中间时缩放不会跳回页顶。Ctrl+滚轮以指针为锚，其余入口以页顶停靠线为锚。
+ */
+interface ZoomAnchor {
+  pageIndex: number;
+  fraction: number;
+  viewportY: number;
+  fractionX: number;
+  viewportX: number;
+}
+
+let wheelAnchorPoint: { x: number; y: number } | null = null;
+
+function captureZoomAnchor(): ZoomAnchor | null {
+  const root = scrollEl.value;
+  if (!root) return null;
+  const rootRect = root.getBoundingClientRect();
+  const point = wheelAnchorPoint ?? { x: rootRect.left + root.clientWidth / 2, y: rootRect.top + readingInset(root) };
+  wheelAnchorPoint = null;
+  const pageIndex = pageIndexAt(root, point.y);
+  if (pageIndex === null) return null;
+  const pageRect = pageNodes[pageIndex].getBoundingClientRect();
+  return {
+    pageIndex,
+    fraction: pageRect.height > 0 ? (point.y - pageRect.top) / pageRect.height : 0,
+    viewportY: point.y,
+    fractionX: pageRect.width > 0 ? (point.x - pageRect.left) / pageRect.width : 0,
+    viewportX: point.x,
+  };
+}
+
+function restoreZoomAnchor(anchor: ZoomAnchor): void {
+  const root = scrollEl.value;
+  const pageEl = pageElement(anchor.pageIndex + 1);
+  if (!root || !pageEl) return;
+  const pageRect = pageEl.getBoundingClientRect();
+  root.scrollTop += pageRect.top + anchor.fraction * pageRect.height - anchor.viewportY;
+  root.scrollLeft += pageRect.left + anchor.fractionX * pageRect.width - anchor.viewportX;
 }
 
 function onPageNotesClick(pageNumber: number): void {
@@ -1021,9 +1157,15 @@ let pendingZoomDelta = 0;
 let zoomLastApplied = 0;
 let zoomFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
+let lastWheelPoint: { x: number; y: number } | null = null;
+
 function applyZoom(delta: number): void {
   zoomLastApplied = performance.now();
+  const before = readerStore.scale;
+  wheelAnchorPoint = lastWheelPoint;
   zoomBy(delta);
+  // 已到缩放上下限：缩放 watcher 不会触发，指针锚点不能留给下一次按钮缩放
+  if (readerStore.scale === before) wheelAnchorPoint = null;
 }
 
 function onWheelZoom(event: WheelEvent): void {
@@ -1031,7 +1173,8 @@ function onWheelZoom(event: WheelEvent): void {
   // also triggers Chromium page zoom.
   if (!event.ctrlKey) return;
   event.preventDefault();
-  pendingZoomDelta += event.deltaY < 0 ? 0.1 : -0.1;
+  pendingZoomDelta += event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
+  lastWheelPoint = { x: event.clientX, y: event.clientY };
   if (performance.now() - zoomLastApplied >= ZOOM_COALESCE_MS) {
     const delta = pendingZoomDelta;
     pendingZoomDelta = 0;
@@ -1060,7 +1203,10 @@ watch(
 watch(
   () => readerStore.scale,
   async () => {
-    if (!pdfDoc) return;
+    // 加载窗口内的缩放（现场恢复 / 首开适配）由唯一落页点负责定位
+    if (!pdfDoc || isLoading.value) return;
+    // pre-flush：此刻页盒仍是旧尺寸，锚点按旧几何取
+    const anchor = captureZoomAnchor();
     for (const pageNumber of [...renderedPages]) {
       releasePage(pageNumber);
     }
@@ -1068,7 +1214,12 @@ watch(
     clearNoteAnchor();
     await nextTick();
     observePages();
-    scrollToPage(readerStore.page);
+    if (anchor) {
+      restoreZoomAnchor(anchor);
+      updateCurrentPage();
+    } else {
+      scrollToPage(readerStore.page);
+    }
   },
 );
 
@@ -1115,6 +1266,10 @@ watch(
 
 onMounted(() => {
   document.addEventListener("selectionchange", onSelectionChange);
+  if (viewerEl.value) {
+    viewerResizeObserver = new ResizeObserver(onViewerResize);
+    viewerResizeObserver.observe(viewerEl.value);
+  }
 });
 
 onBeforeUnmount(() => {
@@ -1128,6 +1283,12 @@ onBeforeUnmount(() => {
     clearTimeout(zoomFlushTimer);
     zoomFlushTimer = null;
   }
+  if (refitTimer) {
+    clearTimeout(refitTimer);
+    refitTimer = null;
+  }
+  viewerResizeObserver?.disconnect();
+  viewerResizeObserver = null;
   loadGeneration += 1;
   if (anchorWaitId !== null) {
     cancelAnimationFrame(anchorWaitId);
@@ -1141,12 +1302,31 @@ defineExpose({ gotoPage });
 </script>
 
 <template>
-  <div class="pdf-viewer" :class="{ 'capture-mode': readerStore.captureMode }">
+  <div ref="viewerEl" class="pdf-viewer" :class="{ 'capture-mode': readerStore.captureMode }">
     <div v-if="readerStore.pageCount > 0" class="pdf-toolbar">
-      <v-btn icon="mdi-minus" size="x-small" variant="text" title="缩小" @click="zoomBy(-0.1)" />
-      <span class="zoom-label">{{ Math.round(readerStore.scale * 100) }}%</span>
-      <v-btn icon="mdi-plus" size="x-small" variant="text" title="放大" @click="zoomBy(0.1)" />
+      <v-btn icon="mdi-minus" size="x-small" variant="text" title="缩小" @click="zoomBy(-ZOOM_STEP)" />
+      <v-menu location="bottom end" offset="6">
+        <template #activator="{ props: menuProps }">
+          <button type="button" class="zoom-label" v-bind="menuProps" title="缩放选项">
+            {{ Math.round(readerStore.scale * 100) }}%
+          </button>
+        </template>
+        <v-list density="compact" class="zoom-menu">
+          <v-list-item v-for="option in zoomOptions" :key="option.mode" @click="onZoomOption(option.mode)">
+            <v-list-item-title class="zoom-option">
+              <v-icon size="15" class="zoom-menu-check" :class="{ visible: isZoomOptionActive(option.mode) }">mdi-check</v-icon>
+              {{ option.label }}
+            </v-list-item-title>
+            <template v-if="option.shortcut" #append>
+              <span class="zoom-menu-key">{{ option.shortcut }}</span>
+            </template>
+          </v-list-item>
+        </v-list>
+      </v-menu>
+      <v-btn icon="mdi-plus" size="x-small" variant="text" title="放大" @click="zoomBy(ZOOM_STEP)" />
+      <span class="toolbar-divider" />
       <v-btn icon="mdi-magnify" size="x-small" variant="text" title="在文档中搜索" @click="openSearch" />
+      <v-btn icon="mdi-open-in-new" size="x-small" variant="text" title="用系统应用打开" @click="openWithSystemApp" />
     </div>
 
     <PdfSearchPanel
@@ -1302,8 +1482,8 @@ defineExpose({ gotoPage });
 
 .pdf-toolbar {
   position: absolute;
-  top: 40px;
-  right: 12px;
+  top: 8px;
+  right: 10px;
   z-index: 3;
   display: inline-flex;
   align-items: center;
@@ -1316,10 +1496,52 @@ defineExpose({ gotoPage });
 }
 
 .zoom-label {
-  min-width: 44px;
-  text-align: center;
-  font-size: 12px;
+  min-width: 48px;
+  height: 22px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
   color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  cursor: pointer;
+}
+
+.zoom-label:hover,
+.zoom-label[aria-expanded="true"] {
+  background: var(--pix-bg-hover, #eef2f6);
+  color: var(--pix-text-primary);
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--pix-border-light, #e3eaf0);
+}
+
+.zoom-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.zoom-menu-check {
+  visibility: hidden;
+  color: var(--pix-text-primary);
+}
+
+.zoom-menu-check.visible {
+  visibility: visible;
+}
+
+.zoom-menu-key {
+  margin-left: 16px;
+  font-size: 11px;
+  color: var(--pix-text-muted);
 }
 
 .pdf-scroll {

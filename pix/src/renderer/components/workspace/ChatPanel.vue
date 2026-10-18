@@ -25,6 +25,7 @@ import type { DisplayBlock, SessionInfo } from "@/types/session";
 import type { PageCapture, ReadingAnchor } from "@shared/types";
 import { deriveSessionTitle, formatSessionTime } from "../../utils/session-title";
 import { docPathKey } from "../../utils/notes-path";
+import { buildChapterRanges, resolveCurrentChapter } from "../../utils/outline-notes";
 import MessageBlock from "../session/MessageBlock.vue";
 import ToolExecutionBlock from "../session/ToolExecutionBlock.vue";
 import ErrorBlock from "../session/ErrorBlock.vue";
@@ -35,6 +36,8 @@ import ThinkingSelector from "../input/ThinkingSelector.vue";
 import ClarificationCard from "../input/ClarificationCard.vue";
 
 const props = defineProps<{
+  /** 宽屏下可收起到阅读区右下角的「对话」按钮；窄屏浮层有自己的关闭条。 */
+  collapsible?: boolean;
   pendingUserInput?: RequestUserInputRequest | null;
   sessions?: SessionInfo[];
   currentSessionPath?: string;
@@ -46,6 +49,7 @@ const emit = defineEmits<{
   "switch-session": [session: SessionInfo];
   "delete-session": [session: SessionInfo];
   "user-input-done": [];
+  collapse: [];
 }>();
 
 const rpc = useRpc();
@@ -205,10 +209,15 @@ const sending = ref(false);
 const MAX_PASTED_IMAGES = 8;
 
 const isStreaming = computed(() => sessionStore.isStreaming);
-const currentModelLabel = computed(() => {
+/** 模型列表已拉取且为空（未配置密钥）：发送注定失败，空态与模型 chip 改为引导去设置。 */
+const modelUnavailable = computed(() => rpc.modelsLoaded.value && rpc.availableModels.value.length === 0);
+/** 内核未选模型时给出的占位模型（packages/agent/src/agent.ts 的默认值），不当作真实模型展示。 */
+const PLACEHOLDER_MODEL_PROVIDER = "unknown";
+const currentModel = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.id}` : "选择模型";
+  return model && model.provider !== PLACEHOLDER_MODEL_PROVIDER ? model : null;
 });
+const currentModelLabel = computed(() => currentModel.value?.id ?? "选择模型");
 const currentThinkingLabel = computed(() => {
   const level = rpc.sessionState.value?.thinkingLevel;
   if (!level) return "思考深度";
@@ -347,6 +356,39 @@ function followScrollEnd(): void {
 
 function updateDraft(value: string): void {
   draft.value = value;
+}
+
+// --- 起手问题：空对话 + 已打开文档时给出的预填草稿（只填入输入框，不自动发送） ---
+
+interface StarterPrompt {
+  icon: string;
+  label: string;
+  draft: string;
+}
+
+const starterPrompts = computed<StarterPrompt[]>(() => {
+  if (!readerStore.filePath || draft.value.trim()) return [];
+  const prompts: StarterPrompt[] = [
+    { icon: "mdi-text-box-search-outline", label: "概括全文的核心观点", draft: "请概括这篇文档的核心观点与主要贡献。" },
+  ];
+  if (readerStore.pageCount === 0) return prompts;
+  const page = readerStore.page;
+  prompts.push({ icon: "mdi-book-open-page-variant-outline", label: `讲解第 ${page} 页`, draft: `请讲解第 ${page} 页的内容。` });
+  const chapter = resolveCurrentChapter(
+    buildChapterRanges(readerStore.outline, readerStore.pageCount),
+    page,
+    readerStore.pageCount,
+  );
+  const chapterTitle = chapter?.title.replace(/\s+/g, " ").trim();
+  if (chapterTitle) {
+    prompts.push({ icon: "mdi-format-list-bulleted", label: `梳理「${chapterTitle}」`, draft: `请梳理「${chapterTitle}」这一节的要点。` });
+  }
+  return prompts;
+});
+
+function useStarterPrompt(prompt: StarterPrompt): void {
+  draft.value = prompt.draft;
+  composerInput.value?.focus();
 }
 
 // --- Quick ask: floating button over the PDF selection (useQuickAsk seam) ---
@@ -1048,7 +1090,18 @@ onUnmounted(() => {
         </button>
       </div>
       <div class="header-actions">
+        <button
+          v-if="modelUnavailable"
+          type="button"
+          class="header-chip is-warning"
+          title="还没有可用的模型，点击前往设置"
+          @click="openSettings"
+        >
+          <v-icon size="14">mdi-key-alert-outline</v-icon>
+          <span>未配置模型</span>
+        </button>
         <v-menu
+          v-else
           v-model="modelMenuOpen"
           :close-on-content-click="false"
           location="bottom end"
@@ -1058,7 +1111,7 @@ onUnmounted(() => {
               type="button"
               class="header-chip"
               v-bind="menuProps"
-              :title="rpc.sessionState.value?.model ? `${rpc.sessionState.value.model.provider}/${rpc.sessionState.value.model.id}` : '选择模型'"
+              :title="currentModel ? `${currentModel.provider}/${currentModel.id}` : '选择模型'"
             >
               <v-icon size="14">mdi-brain</v-icon>
               <span>{{ currentModelLabel }}</span>
@@ -1087,6 +1140,9 @@ onUnmounted(() => {
           aria-label="设置"
           @click="router.push('/settings')"
         />
+        <button v-if="collapsible" type="button" class="pill-icon-btn chat-collapse" title="收起对话" aria-label="收起对话" @click="emit('collapse')">
+          <v-icon size="16">mdi-chevron-right</v-icon>
+        </button>
       </div>
     </div>
 
@@ -1186,9 +1242,32 @@ onUnmounted(() => {
       </template>
 
       <div v-if="blocks.length === 0" class="chat-empty">
-        <v-icon size="40" class="empty-icon">mdi-creation-outline</v-icon>
-        <p class="empty-title">新对话</p>
-        <p class="empty-subtitle">输入消息即可新建或继续对话；提问会自动附带当前文档与页码。</p>
+        <template v-if="modelUnavailable">
+          <v-icon size="40" class="empty-icon">mdi-key-chain-variant</v-icon>
+          <p class="empty-title">先连接一个模型</p>
+          <p class="empty-subtitle">在设置中为任一提供商填入 API 密钥，即可开始提问。</p>
+          <v-btn class="empty-action" size="small" variant="flat" color="primary" prepend-icon="mdi-cog-outline" @click="openSettings">
+            打开模型设置
+          </v-btn>
+        </template>
+        <template v-else>
+          <v-icon size="40" class="empty-icon">mdi-creation-outline</v-icon>
+          <p class="empty-title">新对话</p>
+          <p class="empty-subtitle">输入消息即可新建或继续对话；提问会自动附带当前文档与页码。</p>
+          <div v-if="starterPrompts.length > 0" class="starter-list">
+            <button
+              v-for="prompt in starterPrompts"
+              :key="prompt.label"
+              type="button"
+              class="starter-prompt"
+              :title="prompt.draft"
+              @click="useStarterPrompt(prompt)"
+            >
+              <v-icon size="15" class="starter-icon">{{ prompt.icon }}</v-icon>
+              <span class="starter-label">{{ prompt.label }}</span>
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -1398,6 +1477,20 @@ onUnmounted(() => {
 }
 
 .header-chip:hover {
+  background: var(--pix-bg-hover, #eef2f6);
+}
+
+.header-chip.is-warning {
+  border-color: var(--pix-warning-light);
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+}
+
+.header-chip.is-warning:hover {
+  border-color: var(--pix-warning);
+}
+
+.chat-collapse:hover {
   background: var(--pix-bg-hover, #eef2f6);
 }
 
@@ -1727,6 +1820,52 @@ onUnmounted(() => {
   margin: 0;
   font-size: 13px;
   color: var(--pix-text-muted);
+}
+
+.empty-action {
+  margin-top: 6px;
+}
+
+.starter-list {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  width: 100%;
+  max-width: 280px;
+  margin-top: 10px;
+}
+
+.starter-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 12px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 10px;
+  background: var(--pix-bg-elevated, #ffffff);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.starter-prompt:hover {
+  border-color: var(--pix-border, #d5dfe8);
+  color: var(--pix-text-primary);
+}
+
+.starter-icon {
+  flex-shrink: 0;
+  color: var(--pix-text-muted);
+}
+
+.starter-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer {

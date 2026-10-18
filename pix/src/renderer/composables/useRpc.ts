@@ -24,6 +24,8 @@ function api(): PixApi {
 const agentStatus = ref<"stopped" | "starting" | "running" | "error">("stopped");
 const sessionState = ref<RpcSessionState | null>(null);
 const availableModels = ref<ModelInfo[]>([]);
+/** 可用模型列表是否成功拉取过：成功拉取前 availableModels 为空不代表没有模型。 */
+const modelsLoaded = ref(false);
 const commands = ref<RpcSlashCommand[]>([]);
 const sessionStats = ref<SessionStats | null>(null);
 const stderr = ref("");
@@ -65,6 +67,7 @@ async function refreshModels(): Promise<void> {
 		const result = await api().sendCommand<{ models: ModelInfo[] }>({ type: "get_available_models" });
 		if (result.success && result.data) {
 			availableModels.value = result.data.models;
+			modelsLoaded.value = true;
 		}
 	} catch (err) {
 		console.error("[useRpc] Failed to get models:", err);
@@ -466,6 +469,7 @@ export function useRpc() {
 		agentStatus: computed(() => agentStatus.value),
 		sessionState: computed(() => sessionState.value),
 		availableModels: computed(() => availableModels.value),
+		modelsLoaded: computed(() => modelsLoaded.value),
 		commands: computed(() => commands.value),
 		sessionStats: computed(() => sessionStats.value),
 		stderr: computed(() => stderr.value),
