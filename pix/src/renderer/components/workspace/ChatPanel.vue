@@ -35,6 +35,8 @@ import ThinkingSelector from "../input/ThinkingSelector.vue";
 import ClarificationCard from "../input/ClarificationCard.vue";
 
 const props = defineProps<{
+  /** 宽屏下可收起到阅读区右下角的「对话」按钮；窄屏浮层有自己的关闭条。 */
+  collapsible?: boolean;
   pendingUserInput?: RequestUserInputRequest | null;
   sessions?: SessionInfo[];
   currentSessionPath?: string;
@@ -46,6 +48,7 @@ const emit = defineEmits<{
   "switch-session": [session: SessionInfo];
   "delete-session": [session: SessionInfo];
   "user-input-done": [];
+  collapse: [];
 }>();
 
 const rpc = useRpc();
@@ -1041,6 +1044,9 @@ onUnmounted(() => {
           </template>
           <ThinkingSelector @close="thinkingMenuOpen = false" />
         </v-menu>
+        <button v-if="collapsible" type="button" class="pill-icon-btn chat-collapse" title="收起对话" @click="emit('collapse')">
+          <v-icon size="16">mdi-chevron-right</v-icon>
+        </button>
       </div>
     </div>
 
@@ -1351,6 +1357,10 @@ onUnmounted(() => {
 }
 
 .header-chip:hover {
+  background: var(--pix-bg-hover, #eef2f6);
+}
+
+.chat-collapse:hover {
   background: var(--pix-bg-hover, #eef2f6);
 }
 

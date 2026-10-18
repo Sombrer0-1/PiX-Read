@@ -37,6 +37,9 @@ const rpc = useRpc();
 const selectedFilePath = ref<string | null>(null);
 const pendingUserInput = ref<RequestUserInputRequest | null>(null);
 const leftCollapsed = ref(false);
+const rightCollapsed = ref(false);
+/** 专注阅读 = 两侧栏都收起；切换时两侧一起收起或一起展开。 */
+const focusMode = computed(() => leftCollapsed.value && rightCollapsed.value);
 /** 左栏双标签：资料库文件树 / 笔记面板（两个面板都常挂载，切标签不丢展开态）。 */
 const leftTab = ref<"library" | "notes">("library");
 
@@ -129,6 +132,7 @@ onMounted(async () => {
   unsubscribeUserInput = window.pixApi.onUserInputRequest((request) => {
     pendingUserInput.value = request;
   });
+  window.addEventListener("keydown", onFocusKeydown);
 });
 
 onUnmounted(() => {
@@ -141,6 +145,7 @@ onUnmounted(() => {
   unsubscribeEvent = null;
   unsubscribeUserInput?.();
   unsubscribeUserInput = null;
+  window.removeEventListener("keydown", onFocusKeydown);
   readerStateStore.resetState();
   notesStore.resetNotes();
 });
@@ -151,6 +156,26 @@ function onDocumentVisibilityChange(): void {
 
 function onWindowPageHide(): void {
   readerStateStore.flush();
+}
+
+function toggleFocusMode(): void {
+  const next = !focusMode.value;
+  leftCollapsed.value = next;
+  rightCollapsed.value = next;
+}
+
+function onFocusKeydown(event: KeyboardEvent): void {
+  if (event.key !== "f" && event.key !== "F") return;
+  if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || event.repeat) return;
+  const target = event.target;
+  if (
+    target instanceof HTMLElement &&
+    (target.isContentEditable || target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")
+  ) {
+    return;
+  }
+  event.preventDefault();
+  toggleFocusMode();
 }
 
 function onUserInputDone(): void {
@@ -277,7 +302,12 @@ async function goHome(): Promise<void> {
 
 <template>
   <div class="workspace-page">
-    <AppLayout class="workspace-layout" :left-collapsed="leftCollapsed">
+    <AppLayout
+      class="workspace-layout"
+      :left-collapsed="leftCollapsed"
+      :right-collapsed="rightCollapsed"
+      @expand-right="rightCollapsed = false"
+    >
       <template #left>
         <div class="pane-shell">
           <div class="pane-pill">
@@ -337,6 +367,16 @@ async function goHome(): Promise<void> {
               <v-icon size="16">mdi-chevron-right</v-icon>
             </button>
             <span class="pill-label">{{ selectedFileName || "阅读区" }}</span>
+            <button
+              type="button"
+              class="pill-icon-btn focus-toggle"
+              :class="{ active: focusMode }"
+              :title="focusMode ? '退出专注阅读（F）' : '专注阅读（F）'"
+              :aria-pressed="focusMode"
+              @click="toggleFocusMode"
+            >
+              <v-icon size="14">{{ focusMode ? "mdi-arrow-collapse-horizontal" : "mdi-arrow-expand-horizontal" }}</v-icon>
+            </button>
           </div>
           <ReaderPanel
             class="pane-body reader-under-pill"
@@ -346,8 +386,9 @@ async function goHome(): Promise<void> {
           />
         </div>
       </template>
-      <template #right>
+      <template #right="{ narrow }">
         <ChatPanel
+          :collapsible="!narrow"
           :pending-user-input="pendingUserInput"
           :sessions="projectStore.sessions"
           :current-session-path="currentSessionPath"
@@ -356,6 +397,7 @@ async function goHome(): Promise<void> {
           @switch-session="onSwitchSession"
           @delete-session="onDeleteSession"
           @user-input-done="onUserInputDone"
+          @collapse="rightCollapsed = true"
         />
       </template>
     </AppLayout>
@@ -436,6 +478,11 @@ async function goHome(): Promise<void> {
 .pill-icon-btn:hover {
   background: var(--pix-bg-hover, #eef2f6);
   color: var(--pix-text-primary);
+}
+
+.pill-icon-btn.focus-toggle.active {
+  background: var(--pix-accent, #31424f);
+  color: #ffffff;
 }
 
 .pill-tab {
