@@ -68,6 +68,12 @@ export interface PixApi {
   libraryReadText: (targetPath: string) => Promise<LibraryFileResult & { content?: string; truncated?: boolean }>;
   libraryReadFile: (targetPath: string) => Promise<LibraryFileResult>;
 
+  // pdf.js preset resources (CMaps / standard fonts) for the inline-worker viewer
+  readPdfResource: (
+    kind: "cmap" | "font",
+    name: string,
+  ) => Promise<{ success: boolean; data?: Uint8Array; error?: string }>;
+
   // Reader notes (workspace .pix-read/notes.json)
   notesLoad: () => Promise<ReaderNotesLoadResult>;
   notesAdd: (draft: ReaderNoteDraft) => Promise<ReaderNotesMutationResult>;
@@ -158,6 +164,13 @@ const api: PixApi = {
   libraryShowInFolder: (targetPath: string) => ipcRenderer.invoke("library-show-in-folder", targetPath),
   libraryReadText: (targetPath: string) => ipcRenderer.invoke("library-read-text", targetPath),
   libraryReadFile: (targetPath: string) => ipcRenderer.invoke("library-read-file", targetPath) as Promise<LibraryFileResult>,
+
+  readPdfResource: (kind: "cmap" | "font", name: string) =>
+    ipcRenderer.invoke("pdf-read-resource", kind, name) as Promise<{
+      success: boolean;
+      data?: Uint8Array;
+      error?: string;
+    }>,
 
   notesLoad: () => ipcRenderer.invoke("notes-load") as Promise<ReaderNotesLoadResult>,
   notesAdd: (draft: ReaderNoteDraft) => ipcRenderer.invoke("notes-add", draft) as Promise<ReaderNotesMutationResult>,

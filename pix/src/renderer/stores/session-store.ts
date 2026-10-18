@@ -358,6 +358,7 @@ export const useSessionStore = defineStore("session", () => {
       : null;
     if (block && block.type === "vision-status") {
       block.status = event.success ? "success" : "error";
+      if (!event.success && event.errorMessage) block.errorMessage = event.errorMessage;
       block.timestamp = Date.now();
       if (event.id) {
         visionStatusIds.delete(event.id);
@@ -366,7 +367,7 @@ export const useSessionStore = defineStore("session", () => {
       }
       return;
     }
-    displayBlocks.value.push({
+    const fallback: Extract<DisplayBlock, { type: "vision-status" }> = {
       id: nextBlockId(),
       type: "vision-status",
       provider: event.provider,
@@ -374,7 +375,9 @@ export const useSessionStore = defineStore("session", () => {
       imageCount: event.imageCount,
       status: event.success ? "success" : "error",
       timestamp: Date.now(),
-    });
+    };
+    if (!event.success && event.errorMessage) fallback.errorMessage = event.errorMessage;
+    displayBlocks.value.push(fallback);
   }
 
   function closeCurrentWorkStatus(force = false): void {

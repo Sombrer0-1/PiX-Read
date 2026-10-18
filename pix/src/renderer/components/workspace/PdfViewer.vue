@@ -45,6 +45,46 @@ if (!GlobalWorkerOptions.workerPort) {
   GlobalWorkerOptions.workerPort = new PdfJsWorker();
 }
 
+// 预置 CMap / 标准字体：inline worker 无法用 URL 读盘（file:// 下 fetch 受限），
+// 自定义 factory 改走 IPC 由主进程读取。缺这些数据时 CJK 字体渲染空白、
+// 文字层乱码。baseUrl 仅作非空占位（pdf.js 要求非空才肯 fetch），文件名直接用 name/filename。
+const PDFJS_RESOURCE_BASE = "pix-pdf-resource://";
+
+class IpcCMapReaderFactory {
+	baseUrl: string;
+	isCompressed: boolean;
+
+	constructor({ baseUrl, isCompressed = true }: { baseUrl?: string | null; isCompressed?: boolean }) {
+		this.baseUrl = baseUrl ?? "";
+		this.isCompressed = isCompressed;
+	}
+
+	async fetch({ name }: { name: string }): Promise<{ cMapData: Uint8Array; isCompressed: boolean }> {
+		const filename = `${name}${this.isCompressed ? ".bcmap" : ""}`;
+		const result = await window.pixApi.readPdfResource("cmap", filename);
+		if (!result.success || !result.data) {
+			throw new Error(`Unable to load CMap at: ${filename}`);
+		}
+		return { cMapData: result.data, isCompressed: this.isCompressed };
+	}
+}
+
+class IpcStandardFontDataFactory {
+	baseUrl: string;
+
+	constructor({ baseUrl }: { baseUrl?: string | null }) {
+		this.baseUrl = baseUrl ?? "";
+	}
+
+	async fetch({ filename }: { filename: string }): Promise<Uint8Array> {
+		const result = await window.pixApi.readPdfResource("font", filename);
+		if (!result.success || !result.data) {
+			throw new Error(`Unable to load font data at: ${filename}`);
+		}
+		return result.data;
+	}
+}
+
 const props = defineProps<{
   filePath: string;
 }>();
@@ -85,8 +125,8 @@ const pageInputEl = ref<HTMLInputElement | null>(null);
 const captureLayerEl = ref<HTMLDivElement | null>(null);
 /** Drag rectangle relative to the capture layer, in CSS pixels. */
 const captureRect = ref<{ left: number; top: number; width: number; height: number } | null>(null);
-/** 上一次框选失败（页面未渲染等）：保留框选模式并提示，进入框选/成功后清空。 */
-const captureFailed = ref(false);
+/** 上一次框选失败（页面未渲染 / 输入框图片已满）：保留框选模式并提示，进入框选/成功后清空。 */
+const captureError = ref<string | null>(null);
 /**
  * 适配模式：非 null 时缩放跟随阅读区尺寸（窗口缩放、收起侧栏都会重新适配）；
  * 任何手动缩放或切换文档都会退出适配模式，落盘的仍是具体缩放值。
@@ -423,6 +463,13 @@ function isEditableTarget(target: EventTarget | null): boolean {
   );
 }
 
+/** 事件目标是否落在阅读区滚动容器内（window 级监听时 body/document 代表无焦点状态）。 */
+function isInsideReaderStage(target: EventTarget | null): boolean {
+  if (!(target instanceof Node)) return false;
+  if (target === document.body || target === document.documentElement) return true;
+  return scrollEl.value?.contains(target) ?? false;
+}
+
 function openSearch(): void {
   searchOpen.value = true;
   void nextTick(() => searchPanel.value?.focusInput());
@@ -470,6 +517,12 @@ function onWindowKeydown(event: KeyboardEvent): void {
     return;
   }
   if (readerStore.pageCount <= 0 || isEditableTarget(event.target)) return;
+  // 翻页/跳转键只在阅读区（或无焦点的 body）生效：焦点在聊天记录、笔记列表等
+  // 可滚动面板时，PageUp/PageDown 应滚动对应面板而不是翻 PDF 页。
+  if (!isInsideReaderStage(event.target)) {
+    const navigationKeys = event.key === "PageUp" || event.key === "PageDown" || event.key === "Home" || event.key === "End";
+    if (navigationKeys || event.key === "ArrowLeft" || event.key === "ArrowRight") return;
+  }
   if (event.key === "[" || event.key === "]") {
     // 框选模式：本轮为 [ / ] 新增的屏蔽（既有七键位在框选模式下仍生效，见设计档 §2.1）
     if (readerStore.captureMode) return;
@@ -610,9 +663,11 @@ function onCapturePointerUp(event: PointerEvent): void {
   if (rect && rect.width >= MIN_CAPTURE_PX && rect.height >= MIN_CAPTURE_PX) {
     if (!captureRegion(rect)) {
       // 失败（页面未渲染 / 来源画布不可用）：保留框选模式并提示，让用户重试
-      captureFailed.value = true;
+      captureError.value = "截图失败：页面内容尚未就绪，请稍后重试";
       return;
     }
+    // captureRegion 内部可能已设置满额提示：保留框选浮层让提示可见，Esc 退出
+    if (captureError.value) return;
   }
   exitCaptureMode();
 }
@@ -693,7 +748,10 @@ function captureRegion(rect: CaptureRect): boolean {
   const base64 = canvasToPngBase64(out);
   if (!base64) return false;
   const capture: PageCapture = { mimeType: "image/png", base64 };
-  emitRegionCapture(capture);
+  if (!emitRegionCapture(capture)) {
+    // 输入框未挂载或图片数已满（ChatPanel 侧拒绝）：截图没有落到输入框，必须让用户知道
+    captureError.value = "截图未加入输入框：附件图片已达上限，请先发送或删除部分图片";
+  }
   return true;
 }
 
@@ -746,7 +804,14 @@ async function loadPdf(filePath: string): Promise<void> {
       throw new LibraryReadError(failureFromLibraryResult(result), result.error || "主进程未返回文件内容");
     }
 
-    task = getDocument({ data: result.data });
+    task = getDocument({
+      data: result.data,
+      cMapUrl: `${PDFJS_RESOURCE_BASE}cmap/`,
+      cMapPacked: true,
+      standardFontDataUrl: `${PDFJS_RESOURCE_BASE}font/`,
+      CMapReaderFactory: IpcCMapReaderFactory,
+      StandardFontDataFactory: IpcStandardFontDataFactory,
+    });
     loadingTask = task;
     const doc = await task.promise;
     if (await stale()) return;
@@ -1189,7 +1254,7 @@ watch(
     if (!active) return;
     document.getSelection()?.removeAllRanges();
     readerStore.setSelectedText("");
-    captureFailed.value = false;
+    captureError.value = null;
   },
 );
 
@@ -1323,7 +1388,7 @@ defineExpose({ gotoPage });
     >
       <div v-if="captureRect" class="capture-rect" :style="captureRectStyle" />
       <div class="capture-hint">拖拽框选要提问的区域，Esc 取消</div>
-      <div v-if="captureFailed" class="capture-error-hint">截图失败：页面内容尚未就绪，请稍后重试</div>
+      <div v-if="captureError" class="capture-error-hint">{{ captureError }}</div>
     </div>
 
     <div v-if="readerStore.pageCount > 0" class="pdf-capture-fab">

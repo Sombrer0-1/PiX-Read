@@ -5,7 +5,7 @@
  * Displays one question at a time with optional shortcut options and a free-form
  * textarea. Feels like the AI is asking a follow-up question, not a form.
  */
-import { computed } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import type { RequestUserInputQuestion } from "@/types/rpc";
 
 const props = defineProps<{
@@ -22,6 +22,25 @@ const emit = defineEmits<{
 }>();
 
 const isLastQuestion = computed(() => props.questionIndex + 1 >= props.totalQuestions);
+
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
+
+/** 卡片出现/换题时聚焦输入框；nextTick 等新题目渲染完成后再取焦点。 */
+async function focusTextarea(): Promise<void> {
+  await nextTick();
+  textareaRef.value?.focus();
+}
+
+onMounted(() => {
+  void focusTextarea();
+});
+
+watch(
+  () => props.question.id,
+  () => {
+    void focusTextarea();
+  },
+);
 
 function onTextareaInput(e: Event): void {
   const target = e.target as HTMLTextAreaElement;
@@ -54,6 +73,7 @@ function onTextareaInput(e: Event): void {
       </div>
 
       <textarea
+        ref="textareaRef"
         class="card-textarea"
         :value="answer"
         :placeholder="question.options?.length ? '其他回答...' : '输入回答...'"

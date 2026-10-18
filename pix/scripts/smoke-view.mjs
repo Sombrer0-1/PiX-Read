@@ -762,9 +762,9 @@ function runExcerptMatch() {
   );
 }
 
-// ── 组 shortcut-table（R17 N96；12 条）：键位总览数据源（3 组 / 21 行，逐字） ──────
+// ── 组 shortcut-table（R17 N96；12 条）：键位总览数据源（3 组 / 22 行，逐字） ──────
 
-/** 手写期望常量（不由被测数据生成）：3 个组标题 + 21 行 { keys, desc } + 说明行。 */
+/** 手写期望常量（不由被测数据生成）：3 个组标题 + 22 行 { keys, desc } + 说明行。 */
 const SHORTCUT_EXPECT_TITLES = ["阅读区（打开文档后）", "输入框", "工作区"];
 const SHORTCUT_EXPECT_ROWS_READER = [
   { keys: ["/"], desc: "打开文档搜索" },
@@ -792,6 +792,7 @@ const SHORTCUT_EXPECT_ROWS_INPUT = [
 const SHORTCUT_EXPECT_ROWS_WORKSPACE = [
   { keys: ["F"], desc: "专注阅读（收起或展开两侧栏）" },
   { keys: ["?"], desc: "打开或关闭本总览" },
+  { keys: ["Ctrl+,"], desc: "打开设置" },
 ];
 const SHORTCUT_EXPECT_NOTE = "选区浮层（选中文本后出现，无键位）：问 AI / 解释 / 翻译 / 摘录";
 
@@ -812,7 +813,7 @@ function runShortcutTable() {
   );
 
   const totalRows = sections.reduce((sum, section) => sum + section.rows.length, 0);
-  check(G, 3, "总行数 === 21（11 + 8 + 2）", totalRows === 21, String(totalRows));
+  check(G, 3, "总行数 === 22（11 + 8 + 3）", totalRows === 22, String(totalRows));
 
   check(
     G,
@@ -833,7 +834,7 @@ function runShortcutTable() {
   check(
     G,
     6,
-    "第 3 组 2 行逐字深等（[\"F\"] 专注阅读 / [\"?\"] 打开或关闭本总览）",
+    "第 3 组 3 行逐字深等（[\"F\"] 专注阅读 / [\"?\"] 打开或关闭本总览 / [\"Ctrl+,\"] 打开设置）",
     JSON.stringify(sections[2]?.rows) === JSON.stringify(SHORTCUT_EXPECT_ROWS_WORKSPACE),
     JSON.stringify(sections[2]?.rows),
   );
@@ -875,8 +876,8 @@ function runShortcutTable() {
   check(
     G,
     11,
-    "修饰键白名单：Ctrl+ 恰 4 次（Ctrl+F / Ctrl+= / Ctrl+- / Ctrl+0），且不含 Ctrl+Shift / Alt+ / Meta+",
-    ctrlHits === 4 && !serialized.includes("Ctrl+Shift") && !serialized.includes("Alt+") && !serialized.includes("Meta+"),
+    "修饰键白名单：Ctrl+ 恰 5 次（Ctrl+F / Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+,），且不含 Ctrl+Shift / Alt+ / Meta+",
+    ctrlHits === 5 && !serialized.includes("Ctrl+Shift") && !serialized.includes("Alt+") && !serialized.includes("Meta+"),
     JSON.stringify({ ctrlHits, ctrlShift: serialized.includes("Ctrl+Shift"), alt: serialized.includes("Alt+"), meta: serialized.includes("Meta+") }),
   );
 

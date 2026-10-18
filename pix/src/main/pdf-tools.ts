@@ -7,9 +7,20 @@ import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { Type } from "typebox";
 import { isLibraryFilePath, isPathInsideDirectoryResolved } from "./library-root.js";
+import { getPdfjsCMapsDir, getPdfjsStandardFontsDir, toPdfjsBaseUrl } from "./pdfjs-resources.js";
 import { MAX_PDF_BYTES } from "../shared/limits.js";
 
 const MAX_PAGES_PER_CALL = 20;
+
+// CJK 编码映射与标准字体数据：缺省时需要内置 CMap 的中文字体无法解码（提取乱码/空白）。
+const CMAP_BASE_URL = (() => {
+	const dir = getPdfjsCMapsDir();
+	return dir ? toPdfjsBaseUrl(dir) : null;
+})();
+const STANDARD_FONT_DATA_URL = (() => {
+	const dir = getPdfjsStandardFontsDir();
+	return dir ? toPdfjsBaseUrl(dir) : null;
+})();
 
 interface PdfOutlineNode {
 	title: string;
@@ -38,14 +49,28 @@ function resolveGuardedPdfPath(filePath: string, cwd: string): { path: string } 
 	return { path: resolved };
 }
 
+// CJK 文字没有词边界：pdf.js 按字体切换/排版拆出的相邻 item 之间不能补空格，
+// 否则整句中文会被拆成「字 字 字」。只有拉丁字母在 item 边界处断词时才补空格。
+const CJK_CHAR_RE = /[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]/;
+
+function isLatinWordChar(ch: string | undefined): boolean {
+	if (!ch) return false;
+	return /[\p{L}\p{Nd}]/u.test(ch) && !CJK_CHAR_RE.test(ch);
+}
+
 function extractPageText(items: unknown[]): string {
 	let out = "";
 	for (const item of items) {
 		if (!item || typeof item !== "object") continue;
 		const rec = item as { str?: unknown; hasEOL?: unknown };
 		if (typeof rec.str !== "string") continue;
-		out += rec.str;
-		out += rec.hasEOL === true ? "\n" : " ";
+		if (rec.str) {
+			if (isLatinWordChar(out.at(-1)) && isLatinWordChar(rec.str[0])) {
+				out += " ";
+			}
+			out += rec.str;
+		}
+		if (rec.hasEOL === true) out += "\n";
 	}
 	return out.replace(/[ \t]+\n/g, "\n").replace(/ +/g, " ").trim();
 }
@@ -86,6 +111,9 @@ async function withPdfDocument<T>(filePath: string, fn: (doc: PDFDocumentProxy) 
 	const data = new Uint8Array(file.buffer, file.byteOffset, file.byteLength);
 	const task = getDocument({
 		data,
+		cMapUrl: CMAP_BASE_URL ?? undefined,
+		cMapPacked: true,
+		standardFontDataUrl: STANDARD_FONT_DATA_URL ?? undefined,
 		disableAutoFetch: true,
 		disableStream: true,
 		isEvalSupported: false,
@@ -114,7 +142,7 @@ const pdfReadPagesTool = defineTool({
 	name: "pdf_read_pages",
 	label: "PDF read pages",
 	description:
-		"Extract text from specific 1-based PDF pages. Use this instead of read for PDF files. Prefer the current page and neighbors; do not dump the whole document.",
+		"Extract text from specific 1-based PDF pages. Use this instead of read for PDF files. Prefer the current page and neighbors; do not dump the whole document. A page marked as having no extractable text is a scanned image: tell the user instead of retrying other pages for the missing text.",
 	promptSnippet: "Extract text from selected PDF pages",
 	promptGuidelines: [
 		"Use pdf_read_pages for PDFs instead of read.",
@@ -163,7 +191,11 @@ const pdfReadPagesTool = defineTool({
 					const page = await doc.getPage(pageNumber);
 					const content = await page.getTextContent();
 					const pageText = extractPageText(content.items);
-					parts.push(`\n--- page ${pageNumber} ---\n${pageText || "(no extractable text)"}`);
+					parts.push(
+						`\n--- page ${pageNumber} ---\n${
+							pageText || "(no extractable text; the page is likely a scanned image without a text layer)"
+						}`,
+					);
 				}
 				return parts.join("\n");
 			});

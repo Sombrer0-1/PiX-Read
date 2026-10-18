@@ -29,6 +29,8 @@ const tree = ref<LibraryNode[]>([]);
 const expanded = ref<Set<string>>(new Set());
 const isLoading = ref(false);
 const errorText = ref<string | null>(null);
+/** 子目录懒加载失败的行内错误（目录 path → 消息）；失败节点不进 expanded，重试成功或刷新后清除。 */
+const childErrors = ref<Map<string, string>>(new Map());
 
 const readerStateStore = useReaderStateStore();
 const notesStore = useNotesStore();
@@ -78,10 +80,23 @@ function replaceExpanded(next: Set<string>): void {
   expanded.value = next;
 }
 
+function setChildError(path: string, message: string | null): void {
+  const next = new Map(childErrors.value);
+  if (message === null) next.delete(path);
+  else next.set(path, message);
+  childErrors.value = next;
+}
+
+function childErrorFor(node: LibraryNode): string | null {
+  if (node.type !== "directory") return null;
+  return childErrors.value.get(node.path) ?? null;
+}
+
 async function reload(): Promise<void> {
   if (!props.rootDir) return;
   isLoading.value = true;
   errorText.value = null;
+  childErrors.value = new Map();
   try {
     const result = await window.pixApi.libraryList(props.rootDir, 3);
     if (result.success) {
@@ -113,9 +128,19 @@ async function toggle(node: LibraryNode): Promise<void> {
   }
 
   if (!node.children || node.children.length === 0) {
-    const result = await window.pixApi.libraryList(node.path, 1);
-    if (result.success) {
-      node.children = result.nodes;
+    try {
+      const result = await window.pixApi.libraryList(node.path, 1);
+      if (result.success) {
+        node.children = result.nodes;
+        setChildError(node.path, null);
+      } else {
+        // 失败不展开（children 保持为空，下次点击即重试），行内提示错误
+        setChildError(node.path, result.error || "无法读取目录");
+        return;
+      }
+    } catch (err) {
+      setChildError(node.path, err instanceof Error ? err.message : "无法读取目录");
+      return;
     }
   }
   next.add(node.path);
@@ -160,28 +185,35 @@ function chevronFor(node: LibraryNode): string {
 
     <div class="panel-scroll">
       <div class="tree-section">
-        <button
-          v-for="row in rowsWithBadge"
-          :key="row.node.path"
-          class="tree-row"
-          :class="{ selected: isSelected(row.node) }"
-          :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
-          :title="row.node.path"
-          @click="toggle(row.node)"
-        >
-          <v-icon v-if="row.node.type === 'directory'" size="14" class="row-chevron">
-            {{ chevronFor(row.node) }}
-          </v-icon>
-          <span v-else class="row-chevron-spacer"></span>
-          <v-icon size="16" class="row-icon">{{ iconFor(row.node) }}</v-icon>
-          <span class="row-label">{{ row.node.name }}</span>
-          <span v-if="row.badge" class="row-notes" :title="`摘录 ${row.badge.excerpt} 条 · AI 结论 ${row.badge.answer} 条`">
-            {{ row.badge.total }} 条
-          </span>
-          <span v-if="progressMap.has(row.node.path)" class="row-progress">
-            第 {{ progressMap.get(row.node.path) }} 页
-          </span>
-        </button>
+        <template v-for="row in rowsWithBadge" :key="row.node.path">
+          <button
+            class="tree-row"
+            :class="{ selected: isSelected(row.node) }"
+            :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+            :title="row.node.path"
+            @click="toggle(row.node)"
+          >
+            <v-icon v-if="row.node.type === 'directory'" size="14" class="row-chevron">
+              {{ chevronFor(row.node) }}
+            </v-icon>
+            <span v-else class="row-chevron-spacer"></span>
+            <v-icon size="16" class="row-icon">{{ iconFor(row.node) }}</v-icon>
+            <span class="row-label">{{ row.node.name }}</span>
+            <span v-if="row.badge" class="row-notes" :title="`摘录 ${row.badge.excerpt} 条 · AI 结论 ${row.badge.answer} 条`">
+              {{ row.badge.total }} 条
+            </span>
+            <span v-if="progressMap.has(row.node.path)" class="row-progress">
+              第 {{ progressMap.get(row.node.path) }} 页
+            </span>
+          </button>
+          <div
+            v-if="childErrorFor(row.node)"
+            class="empty-hint"
+            :style="{ paddingLeft: `${8 + (row.depth + 1) * 14}px` }"
+          >
+            加载失败：{{ childErrorFor(row.node) }}
+          </div>
+        </template>
 
         <div v-if="errorText && !isLoading" class="empty-hint">
           {{ errorText }}

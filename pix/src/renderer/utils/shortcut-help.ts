@@ -1,6 +1,6 @@
 /**
  * 快捷键总览的只读数据源（R17 N96）。
- * 3 组 / 21 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
+ * 冻结：3 组 / 22 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
  * 本文件零 import（与 page-anchor.ts / notes-path.ts 同范式）。
  */
 
@@ -51,6 +51,7 @@ export const SHORTCUT_SECTIONS: readonly ShortcutSection[] = [
     rows: [
       { keys: ["F"], desc: "专注阅读（收起或展开两侧栏）" },
       { keys: ["?"], desc: "打开或关闭本总览" },
+      { keys: ["Ctrl+,"], desc: "打开设置" },
     ],
   },
 ];

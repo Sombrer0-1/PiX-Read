@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useRpc } from "../../composables/useRpc";
 import { useAuthStore } from "../../stores/auth-store";
@@ -16,6 +16,26 @@ const searchQuery = ref("");
 const showOnlyConfigured = ref(false);
 /** Provider shown in the inline "needs API key" notice; cleared by the user or on panel close. */
 const unconfiguredProvider = ref<string | null>(null);
+/** 切换失败的临时提示；几秒后自动清除。 */
+const SWITCH_ERROR_MS = 4000;
+const switchError = ref("");
+let switchErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showSwitchError(message: string): void {
+  switchError.value = message;
+  if (switchErrorTimer) clearTimeout(switchErrorTimer);
+  switchErrorTimer = setTimeout(() => {
+    switchErrorTimer = null;
+    switchError.value = "";
+  }, SWITCH_ERROR_MS);
+}
+
+onUnmounted(() => {
+  if (switchErrorTimer) {
+    clearTimeout(switchErrorTimer);
+    switchErrorTimer = null;
+  }
+});
 
 const allModels = computed(() => rpc.availableModels.value);
 const currentModel = computed(() => rpc.sessionState.value?.model);
@@ -63,6 +83,7 @@ async function selectModel(model: { provider: string; id: string }): Promise<voi
     emit("close");
   } catch (err) {
     console.error("[ModelSelector] Failed to set model:", err);
+    showSwitchError(`切换失败：${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -77,6 +98,7 @@ async function cycleModel(direction: "forward" | "backward" = "forward"): Promis
     emit("close");
   } catch (err) {
     console.error("[ModelSelector] Failed to cycle model:", err);
+    showSwitchError(`切换失败：${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -121,6 +143,11 @@ watch(isConnected, (connected) => {
         <span class="auth-notice-text">{{ unconfiguredProvider }} 还没有配置 API 密钥，部分模型无法使用。</span>
         <button type="button" class="auth-notice-go" @click="goToSettings">去设置</button>
         <button type="button" class="auth-notice-close" title="关闭提示" @click="unconfiguredProvider = null">×</button>
+      </div>
+
+      <div v-if="switchError" class="auth-notice">
+        <v-icon size="14" class="auth-notice-icon">mdi-alert-outline</v-icon>
+        <span class="auth-notice-text">{{ switchError }}</span>
       </div>
 
       <div class="search-row">

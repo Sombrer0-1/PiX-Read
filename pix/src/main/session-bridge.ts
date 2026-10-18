@@ -48,7 +48,7 @@ import type {
 	ResourceStatus,
 	ChatMessageAttachment,
 } from "../shared/types.js";
-import { processChatFiles } from "./chat-files.js";
+import { normalizeClipboardImage, processChatFiles } from "./chat-files.js";
 import { normalizeFsPath } from "./library-root.js";
 import { createPdfToolsFactory } from "./pdf-tools.js";
 import { READING_ASSISTANT_SYSTEM_PROMPT } from "./reading-prompt.js";
@@ -980,7 +980,7 @@ export class SessionBridge {
 		// Process clipboard images
 		if (clipboardImages && clipboardImages.length > 0) {
 			for (let i = 0; i < clipboardImages.length; i++) {
-				const img = clipboardImages[i];
+				const img = normalizeClipboardImage(clipboardImages[i]);
 				allImages.push({
 					type: "image",
 					mimeType: img.mimeType,
@@ -1008,6 +1008,36 @@ export class SessionBridge {
 		const visualContext = await this._tryTakeHerEyes(text, allImages, allAttachments);
 		if (visualContext) {
 			parts.push(visualContext);
+			return {
+				text: parts.join(""),
+				images: undefined,
+				displayText: displayText ?? text,
+				attachments: allAttachments,
+			};
+		}
+
+		// 主模型不支持图片输入且视觉转述未产出结果时，剔除图片并显式告知；
+		// 不能把图片原样发给 provider 换回一个 4xx 报错（视觉模型失败也不该连带整轮对话失败）。
+		const mainModel = session.model;
+		if (allImages.length > 0 && mainModel && !mainModel.input.includes("image")) {
+			const notice =
+				`[系统提示] 当前模型 ${mainModel.id} 不支持图片输入，${allImages.length} 张图片未随消息发送。` +
+				"可在 设置 中开启「视觉转述」（由视觉模型代读图片）或切换到支持视觉的模型。";
+			parts.push(notice);
+			// 视觉转述已启用时其内部失败分支已发过失败块，这里只补「未启用/未配置」场景的提示
+			const eyeConfig = this._guiSettings?.takeHerEyes;
+			const eyeReportedFailure = !!eyeConfig?.enabled && !!eyeConfig.provider && !!eyeConfig.modelId;
+			if (!eyeReportedFailure) {
+				this._emitSessionEvent({
+					type: "eye_model_end",
+					id: `eye_fallback_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+					provider: mainModel.provider,
+					modelId: mainModel.id,
+					imageCount: allImages.length,
+					success: false,
+					errorMessage: `已忽略 ${allImages.length} 张图片：当前模型不支持图片输入。可在设置中开启「视觉转述」或换用支持视觉的模型。`,
+				});
+			}
 			return {
 				text: parts.join(""),
 				images: undefined,
@@ -1061,11 +1091,11 @@ export class SessionBridge {
 
 		const eyeModel = session.modelRegistry.find(config.provider, config.modelId);
 		if (!eyeModel || !eyeModel.input.includes("image")) {
-			emitUnavailable("配置的视觉模型不可用");
+			emitUnavailable("视觉转述失败：配置的视觉模型不可用");
 			return null;
 		}
 		if (!session.modelRegistry.hasConfiguredAuth(eyeModel)) {
-			emitUnavailable("视觉模型未配置鉴权");
+			emitUnavailable("视觉转述失败：视觉模型未配置鉴权");
 			return null;
 		}
 
@@ -1088,7 +1118,7 @@ export class SessionBridge {
 			const auth = await session.modelRegistry.getApiKeyAndHeaders(eyeModel);
 			if (!auth.ok) {
 				console.warn(`[takeHerEyes] Auth unavailable for ${eyeModel.provider}/${eyeModel.id}: ${auth.error}`);
-				emitUnavailable("鉴权失败");
+				emitUnavailable("视觉转述失败：鉴权不可用");
 				return null;
 			}
 
@@ -1113,7 +1143,7 @@ export class SessionBridge {
 			if (response.stopReason === "error") {
 				const errorMessage = response.errorMessage ?? "unknown error";
 				console.warn(`[takeHerEyes] Vision model failed: ${errorMessage}`);
-				emitEnd(false, errorMessage);
+				emitEnd(false, `视觉转述失败：${errorMessage}`);
 				return null;
 			}
 
@@ -1125,13 +1155,13 @@ export class SessionBridge {
 				.trim();
 
 			if (!description) {
-				emitEnd(false, "Vision model returned no text.");
+				emitEnd(false, "视觉转述失败：视觉模型没有返回任何描述文本");
 				return null;
 			}
 			emitEnd(true);
 			return this._formatVisualContext(description, eyeModel, images.length);
 		} catch (error) {
-			emitEnd(false, error instanceof Error ? error.message : String(error));
+			emitEnd(false, `视觉转述失败：${error instanceof Error ? error.message : String(error)}`);
 			console.warn("[takeHerEyes] Vision preprocessing failed:", error);
 			return null;
 		}

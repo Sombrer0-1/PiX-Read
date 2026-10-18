@@ -69,8 +69,16 @@ async function openWorkspace(dirPath: string): Promise<void> {
 }
 
 async function openFolder(): Promise<void> {
+  if (opening.value) return;
   if (!window.pixApi) return;
-  const dirPath = await window.pixApi.selectProject();
+  // 同步置位后再弹系统目录对话框，连点不会穿透出第二个对话框
+  opening.value = true;
+  let dirPath: string | null = null;
+  try {
+    dirPath = await window.pixApi.selectProject();
+  } finally {
+    opening.value = false;
+  }
   if (!dirPath) return;
   await openWorkspace(dirPath);
 }
@@ -80,7 +88,15 @@ async function openRecentProject(project: ProjectInfo): Promise<void> {
 }
 
 async function removeRecentProject(project: ProjectInfo): Promise<void> {
-  await projectStore.removeRecentProject(project.path);
+  try {
+    await projectStore.removeRecentProject(project.path);
+    // store 内部吞错并回滚列表：await 后项目仍在即表示持久化失败
+    if (recentProjects.value.some((item) => item.path === project.path)) {
+      showFeedback("移除最近项目失败");
+    }
+  } catch {
+    showFeedback("移除最近项目失败");
+  }
 }
 
 function formatDate(timestamp: number): string {
@@ -113,6 +129,7 @@ function formatDate(timestamp: number): string {
               color="primary"
               size="large"
               block
+              :loading="opening"
               prepend-icon="mdi-folder-open-outline"
               @click="openFolder"
             >
