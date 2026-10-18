@@ -1,6 +1,6 @@
 /**
  * 快捷键总览的只读数据源（R17 N96）。
- * 冻结：3 组 / 18 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
+ * 冻结：3 组 / 19 行；组件只按 keys.join(SHORTCUT_KEY_JOIN) 与 desc 渲染，不得手写键位文案。
  * 本文件零 import（与 page-anchor.ts / notes-path.ts 同范式）。
  */
 
@@ -46,7 +46,10 @@ export const SHORTCUT_SECTIONS: readonly ShortcutSection[] = [
   },
   {
     title: "工作区",
-    rows: [{ keys: ["?"], desc: "打开或关闭本总览" }],
+    rows: [
+      { keys: ["?"], desc: "打开或关闭本总览" },
+      { keys: ["Ctrl+,"], desc: "打开设置" },
+    ],
   },
 ];
 

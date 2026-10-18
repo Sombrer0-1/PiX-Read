@@ -168,15 +168,22 @@ async function onNewSession(): Promise<void> {
 }
 
 async function onSwitchSession(session: SessionInfo): Promise<void> {
+  // 先切换内核会话，成功后才动本地 UI；失败时保持当前会话状态，避免两边错位。
+  const result = await rpc.switchSession(session.path);
+  if (!result || result.cancelled === true) {
+    sessionStore.appendError("切换对话失败，请重试", "system");
+    return;
+  }
   sessionStore.clearSession();
   pendingUserInput.value = null;
-  await rpc.switchSession(session.path);
   projectStore.setCurrentSession(session);
   await syncWorkspaceState({ loadMessagesIfEmpty: true });
 }
 
-/** R18：入口 → 会话切换（复用既有 onSwitchSession；两条 no-op 守卫）。 */
+/** R18：入口 → 会话切换（复用既有 onSwitchSession；三条 no-op 守卫）。 */
 function onOpenDiscussionSession(sessionPath: string): void {
+  // 触发按钮在 ReaderPanel（不可改），流式守卫落在这里，与其它会话切换入口同口径。
+  if (sessionStore.isStreaming) return;
   const key = docPathKey(sessionPath);
   const session = projectStore.sessions.find((item) => docPathKey(item.path) === key);
   if (!session) return;

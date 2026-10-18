@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useRpc } from "../../composables/useRpc";
 import type { ModelInfo, ThinkingLevel } from "@/types/rpc";
 
@@ -31,6 +31,27 @@ const THINKING_LEVEL_DESCRIPTIONS: Record<string, string> = {
 
 const currentModel = computed(() => rpc.sessionState.value?.model);
 const currentThinkingLevel = computed(() => rpc.sessionState.value?.thinkingLevel ?? "medium");
+
+/** 切换失败的临时提示；几秒后自动清除。 */
+const SWITCH_ERROR_MS = 4000;
+const switchError = ref("");
+let switchErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showSwitchError(message: string): void {
+  switchError.value = message;
+  if (switchErrorTimer) clearTimeout(switchErrorTimer);
+  switchErrorTimer = setTimeout(() => {
+    switchErrorTimer = null;
+    switchError.value = "";
+  }, SWITCH_ERROR_MS);
+}
+
+onUnmounted(() => {
+  if (switchErrorTimer) {
+    clearTimeout(switchErrorTimer);
+    switchErrorTimer = null;
+  }
+});
 
 const currentModelInfo = computed<ModelInfo | null>(() => {
   const model = currentModel.value;
@@ -67,6 +88,7 @@ async function selectThinkingLevel(level: ThinkingLevel): Promise<void> {
     emit("close");
   } catch (err) {
     console.error("[ThinkingSelector] Failed to set thinking level:", err);
+    showSwitchError(`切换失败：${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -85,6 +107,11 @@ watch(currentModel, () => {
         </button>
       </div>
       <div class="thinking-model-name">{{ modelTitle }}</div>
+
+      <div v-if="switchError" class="switch-error">
+        <v-icon size="14" class="switch-error-icon">mdi-alert-outline</v-icon>
+        <span class="switch-error-text">{{ switchError }}</span>
+      </div>
 
       <div class="thinking-options">
         <button
@@ -143,6 +170,30 @@ watch(currentModel, () => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 与 ModelSelector 的 auth-notice 同构的失败提示行 */
+.switch-error {
+  display: flex;
+  align-items: center;
+  gap: var(--pix-space-sm);
+  margin: 0 0 var(--pix-space-sm);
+  padding: var(--pix-space-sm) var(--pix-space-md);
+  border: 1px solid var(--pix-warning-light);
+  border-radius: var(--pix-radius-lg);
+  background: var(--pix-warning-bg);
+  flex-shrink: 0;
+}
+
+.switch-error-icon {
+  color: var(--pix-warning);
+  flex-shrink: 0;
+}
+
+.switch-error-text {
+  min-width: 0;
+  font-size: var(--pix-text-xs);
+  color: var(--pix-text-primary);
 }
 
 .thinking-close-btn {

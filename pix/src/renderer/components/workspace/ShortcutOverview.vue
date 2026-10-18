@@ -4,8 +4,10 @@
  * 键位文案全部来自 utils/shortcut-help.ts；不读取阅读器状态、不做持久化、不改既有键位语义。
  */
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { SHORTCUT_KEY_JOIN, SHORTCUT_NOTE, SHORTCUT_SECTIONS } from "../../utils/shortcut-help";
 
+const router = useRouter();
 const open = ref(false);
 const pillReady = ref(false);
 const panelEl = ref<HTMLDivElement | null>(null);
@@ -56,6 +58,12 @@ function onWindowKeydown(event: KeyboardEvent): void {
   if (event.key === "Escape") {
     // 关闭浮层但绝不阻断阅读区既有 Esc 语义（不 preventDefault、不阻断冒泡）。
     if (open.value) close();
+    return;
+  }
+  // Ctrl+, 打开设置：应用级快捷键，与「?」总览同一注册点（本组件的 window keydown）。
+  if (event.key === "," && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+    event.preventDefault();
+    router.push("/settings");
     return;
   }
   if (event.key !== "?") return;

@@ -275,8 +275,10 @@ async function sendSteer(
 	await sendCommandOrThrow({ type: "steer", message, filePaths, images, displayText });
 }
 
-async function abort(): Promise<void> {
-	await sendCommand({ type: "abort" });
+/** 返回 false 表示停止命令失败（lastError 已记录，调用方负责向用户反馈）。 */
+async function abort(): Promise<boolean> {
+	const result = await sendCommand<{ ok?: boolean }>({ type: "abort" });
+	return result !== null;
 }
 
 async function newSession(): Promise<{ cancelled: boolean } | null> {

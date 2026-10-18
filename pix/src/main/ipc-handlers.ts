@@ -20,6 +20,7 @@ import type { SettingsStore } from "./settings-store.js";
 import { clearLibraryRoot, getLibraryRoot, isLibraryDirAllowed, isLibraryFilePath, isPathInsideDirectory, setLibraryRoot } from "./library-root.js";
 import { addNote, deleteNote, exportDocumentReport, exportNotesMarkdown, loadNotes, resetCorruptNotes, restoreNote, statNotesFile, updateNoteComment } from "./notes-store.js";
 import { loadReaderState, saveReaderState } from "./reader-state-store.js";
+import { getPdfjsCMapsDir, getPdfjsStandardFontsDir } from "./pdfjs-resources.js";
 import type {
   GuiSettings,
   LibraryFileResult,
@@ -461,6 +462,23 @@ export function registerIpcHandlers(
   ipcMain.handle("library-show-in-folder", async (_event, targetPath: string) => {
     shell.showItemInFolder(resolve(targetPath));
     return { success: true };
+  });
+
+  // 渲染层 pdf.js（inline worker）无法用 URL 读取预置 CMap/标准字体，改由主进程按文件名读取。
+  // 文件名走白名单正则，杜绝路径穿越。
+  ipcMain.handle("pdf-read-resource", (_event, kind: unknown, name: unknown): { success: boolean; data?: Uint8Array; error?: string } => {
+    if (kind !== "cmap" && kind !== "font") return { success: false, error: "invalid kind" };
+    if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) {
+      return { success: false, error: "invalid resource name" };
+    }
+    const dir = kind === "cmap" ? getPdfjsCMapsDir() : getPdfjsStandardFontsDir();
+    if (!dir) return { success: false, error: "pdfjs resources unavailable" };
+    try {
+      const buffer = readFileSync(join(dir, name));
+      return { success: true, data: new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) };
+    } catch {
+      return { success: false, error: `failed to read pdf resource: ${name}` };
+    }
   });
 
   ipcMain.handle("library-read-text", async (_event, targetPath: string): Promise<LibraryFileResult & { content?: string; truncated?: boolean }> => {

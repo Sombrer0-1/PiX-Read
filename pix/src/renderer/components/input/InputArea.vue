@@ -4,7 +4,7 @@
  *
  * Reusable text input with auto-resize and keybindings.
  */
-import { ref } from "vue";
+import { ref, watch } from "vue";
 
 const props = defineProps<{
   placeholder?: string;
@@ -40,6 +40,11 @@ function autoResize(): void {
     textareaRef.value.style.height = Math.min(textareaRef.value.scrollHeight, 200) + "px";
   }
 }
+
+// Programmatic model changes (template injection, draft restore after a failed
+// send, clearing after send) bypass onInput; re-measure them as well. flush
+// "post" runs after the DOM value patch so scrollHeight is up to date.
+watch(() => props.modelValue, autoResize, { flush: "post" });
 
 function focus(): void {
   textareaRef.value?.focus();

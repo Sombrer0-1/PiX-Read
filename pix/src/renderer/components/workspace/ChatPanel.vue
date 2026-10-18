@@ -22,7 +22,7 @@ import { renderMarkdown } from "../../utils/markdown";
 import { preparePastedImage } from "../../utils/image-capture";
 import type { RequestUserInputRequest } from "@/types/rpc";
 import type { DisplayBlock, SessionInfo } from "@/types/session";
-import type { ReadingAnchor } from "@shared/types";
+import type { PageCapture, ReadingAnchor } from "@shared/types";
 import { deriveSessionTitle, formatSessionTime } from "../../utils/session-title";
 import { docPathKey } from "../../utils/notes-path";
 import MessageBlock from "../session/MessageBlock.vue";
@@ -195,6 +195,11 @@ const modelMenuOpen = ref(false);
 const thinkingMenuOpen = ref(false);
 const messagesEl = ref<HTMLElement | null>(null);
 const optimisticBlockId = ref<string | null>(null);
+/**
+ * 发送在途防抖：agent_start 到达前 isStreaming 仍为 false，这个窗口内重复
+ * send 会走 prompt 而被内核以 "already processing" 拒绝。
+ */
+const sending = ref(false);
 
 /** One message can carry at most this many pasted screenshots. */
 const MAX_PASTED_IMAGES = 8;
@@ -246,6 +251,8 @@ const usageMeta = computed<{ left: string; right: string | null } | null>(() => 
 });
 
 let answerMap = ref<Record<string, string>>({});
+/** 澄清应答 IPC 失败时的卡片内错误行；新请求到达或成功提交/取消时清除。 */
+const clarificationError = ref("");
 const clarifying = computed(() => !!props.pendingUserInput);
 const currentQuestionIndex = ref(0);
 const currentQuestion = computed(() => {
@@ -264,6 +271,7 @@ watch(
   () => {
     currentQuestionIndex.value = 0;
     answerMap.value = {};
+    clarificationError.value = "";
   },
 );
 
@@ -400,6 +408,11 @@ function removeAttachment(index: number): void {
 }
 
 async function send(): Promise<void> {
+  // 发送在途防抖：sendPrompt 的 IPC await 会持续到整轮流式结束，所以 sending
+  // 覆盖整个流式期——流式中（isStreaming=true）必须放行，否则 steer 永远发不出去。
+  // 只拦截「agent_start 尚未到达」的窗口（此窗口内连发第二条会被内核以
+  // "already processing" 拒绝）。
+  if (sending.value && !isStreaming.value) return;
   const text = draft.value.trim();
   if ((!text && attachments.value.length === 0 && clipboardImages.value.length === 0) || clarifying.value) return;
   // Snapshot for this send; resetExcludedContexts() swaps in a new Set below.
@@ -437,6 +450,7 @@ async function send(): Promise<void> {
   const pastedImages = clipboardImages.value;
   clipboardImages.value = [];
   nextTick(() => scrollToEnd());
+  sending.value = true;
   try {
     const sendImages = pastedImages.length > 0 ? pastedImages : undefined;
     // Excluding the document chip sends the raw text; excluding the selection
@@ -464,6 +478,7 @@ async function send(): Promise<void> {
       sessionStore.appendGuide("auth", AUTH_GUIDE_MESSAGE);
     }
   } finally {
+    sending.value = false;
     optimisticBlockId.value = null;
     resetExcludedContexts();
   }
@@ -492,9 +507,10 @@ function removePastedImage(index: number): void {
 
 // --- Region capture: PdfViewer pushes framed screenshots (useRegionCapture seam) ---
 
-function onRegionCapture(image: { mimeType: string; base64: string }): void {
-  if (clipboardImages.value.length >= MAX_PASTED_IMAGES) return;
+function onRegionCapture(image: PageCapture): boolean {
+  if (clipboardImages.value.length >= MAX_PASTED_IMAGES) return false;
   clipboardImages.value = [...clipboardImages.value, image];
+  return true;
 }
 
 // --- Clipboard: async API first, execCommand fallback for denied contexts ---
@@ -772,7 +788,7 @@ function updateAnswer(value: string): void {
   }
 }
 
-function submitClarification(): void {
+async function submitClarification(): Promise<void> {
   const req = props.pendingUserInput;
   const q = currentQuestion.value;
   if (!req || !q) return;
@@ -781,22 +797,35 @@ function submitClarification(): void {
     currentQuestionIndex.value++;
     return;
   }
-  void window.pixApi.sendCommand({
-    type: "respond_user_input",
-    response: { id: req.id, answers: { ...answerMap.value } },
-  });
+  try {
+    const result = await window.pixApi.sendCommand({
+      type: "respond_user_input",
+      response: { id: req.id, answers: { ...answerMap.value } },
+    });
+    if (!result.success) throw new Error(result.error || "respond_user_input 命令失败");
+  } catch (err) {
+    // 保留卡片与已填答案，用户可重试；agent 仍在等待应答。
+    clarificationError.value = `提交回答失败：${err instanceof Error ? err.message : String(err)}`;
+    return;
+  }
   answerMap.value = {};
   currentQuestionIndex.value = 0;
   emit("user-input-done");
 }
 
-function cancelClarification(): void {
+async function cancelClarification(): Promise<void> {
   const req = props.pendingUserInput;
   if (!req) return;
-  void window.pixApi.sendCommand({
-    type: "respond_user_input",
-    response: { id: req.id, answers: {}, cancelled: true },
-  });
+  try {
+    const result = await window.pixApi.sendCommand({
+      type: "respond_user_input",
+      response: { id: req.id, answers: {}, cancelled: true },
+    });
+    if (!result.success) throw new Error(result.error || "respond_user_input 命令失败");
+  } catch (err) {
+    clarificationError.value = `取消澄清失败：${err instanceof Error ? err.message : String(err)}`;
+    return;
+  }
   answerMap.value = {};
   currentQuestionIndex.value = 0;
   emit("user-input-done");
@@ -868,7 +897,16 @@ function workElapsedSeconds(block: { timestamp: number; elapsedSeconds?: number 
 function visionStatusLabel(block: Extract<DisplayBlock, { type: "vision-status" }>): string {
   if (block.status === "running") return `视觉模型正在读取 ${block.imageCount} 张图片…`;
   if (block.status === "success") return `视觉模型已读取 ${block.imageCount} 张图片`;
-  return "视觉模型读取失败";
+  // 失败原因来自主进程且已是完整可读句子（如「已忽略 N 张图片：当前模型不支持图片输入…」）。
+  return block.errorMessage || "视觉模型读取失败";
+}
+
+/** 停止请求也要可见地失败：abort 走吞错通道返回 false，据此在消息流里补一条错误。 */
+async function stopStreaming(): Promise<void> {
+  const ok = await rpc.abort();
+  if (!ok) {
+    sessionStore.appendError(`停止请求失败：${rpc.lastError.value || "未知错误"}`, "system");
+  }
 }
 
 function compactionLabel(block: Extract<DisplayBlock, { type: "compaction" }>): string {
@@ -1041,6 +1079,14 @@ onUnmounted(() => {
           </template>
           <ThinkingSelector @close="thinkingMenuOpen = false" />
         </v-menu>
+        <v-btn
+          icon="mdi-cog"
+          size="x-small"
+          variant="text"
+          title="设置"
+          aria-label="设置"
+          @click="router.push('/settings')"
+        />
       </div>
     </div>
 
@@ -1157,6 +1203,7 @@ onUnmounted(() => {
         @next="submitClarification"
         @cancel="cancelClarification"
       />
+      <div v-if="clarifying && clarificationError" class="clarification-error">{{ clarificationError }}</div>
 
       <div v-if="contextChips.length > 0" class="context-row">
         <span v-for="chip in contextChips" :key="chip.kind" class="context-chip" :title="chip.title">
@@ -1196,13 +1243,13 @@ onUnmounted(() => {
         <button
           v-if="!isStreaming"
           class="composer-send"
-          :disabled="!draft.trim() && attachments.length === 0 && clipboardImages.length === 0"
+          :disabled="sending || (!draft.trim() && attachments.length === 0 && clipboardImages.length === 0)"
           title="发送"
           @click="send"
         >
           <v-icon size="18">mdi-arrow-up</v-icon>
         </button>
-        <button v-else class="composer-stop" title="停止" @click="rpc.abort()">
+        <button v-else class="composer-stop" title="停止" @click="stopStreaming">
           <v-icon size="18">mdi-stop</v-icon>
         </button>
       </div>
@@ -1685,6 +1732,14 @@ onUnmounted(() => {
 .composer {
   padding: 8px 10px 10px;
   border-top: 1px solid var(--pix-border-light, #e3eaf0);
+}
+
+/* 澄清卡下方的 IPC 失败提示行：卡片保留、答案保留，仅提示失败原因 */
+.clarification-error {
+  margin-bottom: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--pix-error, #b75a55);
 }
 
 .context-row {
