@@ -15,7 +15,7 @@ const toggleEl = ref<HTMLButtonElement | null>(null);
 /** 打开前的焦点元素；关闭时优先归还（不可连接则退回入口按钮）。 */
 let lastFocused: HTMLElement | null = null;
 
-/** 与 PdfViewer.vue:400-407 的谓词逐字同构（有意重复：本轮 PdfViewer.vue 零 diff）。 */
+/** 与 PdfViewer.vue 的 isEditableTarget 逐字同构（有意重复，不跨组件共享）。 */
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
   return (

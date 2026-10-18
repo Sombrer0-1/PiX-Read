@@ -212,6 +212,10 @@ onBeforeUnmount(() => {
     min-width: 220px;
   }
 
+  .chat-open-btn {
+    right: 14px;
+  }
+
   /* Chat becomes an overlay above the reader instead of disappearing, so the
    * narrow layout still gives the conversation a full-height column. */
   .layout-right.chat-overlay {

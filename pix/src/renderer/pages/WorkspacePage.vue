@@ -166,7 +166,9 @@ function toggleFocusMode(): void {
 
 function onFocusKeydown(event: KeyboardEvent): void {
   if (event.key !== "f" && event.key !== "F") return;
-  if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || event.repeat) return;
+  if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey || event.repeat || event.isComposing) return;
+  // 菜单或快捷键总览打开时按键属于浮层
+  if (document.querySelector(".v-overlay--active, .shortcut-overview")) return;
   const target = event.target;
   if (
     target instanceof HTMLElement &&
@@ -373,12 +375,13 @@ async function goHome(): Promise<void> {
             >
               <v-icon size="16">mdi-chevron-right</v-icon>
             </button>
-            <span class="pill-label">{{ selectedFileName || "阅读区" }}</span>
+            <span class="pill-label" :title="selectedFileName || undefined">{{ selectedFileName || "阅读区" }}</span>
             <button
               type="button"
               class="pill-icon-btn focus-toggle"
               :class="{ active: focusMode }"
               :title="focusMode ? '退出专注阅读（F）' : '专注阅读（F）'"
+              :aria-label="focusMode ? '退出专注阅读' : '专注阅读'"
               :aria-pressed="focusMode"
               @click="toggleFocusMode"
             >
@@ -454,6 +457,11 @@ async function goHome(): Promise<void> {
   position: absolute;
   top: 0;
   left: 0;
+}
+
+/* PDF 缩放工具条与标题条同排（右上，约 153px 宽）：标题条让出这段宽度，文件名先省略 */
+.pane-shell:has(.pdf-toolbar) .center-pill {
+  max-width: calc(100% - 192px);
 }
 
 .pill-label {

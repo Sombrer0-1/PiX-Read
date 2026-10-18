@@ -787,6 +787,11 @@ async function loadPdf(filePath: string): Promise<void> {
   const restore = readerStore.takeRestore(filePath);
   readerStore.setScale(restore ? restore.scale : DEFAULT_SCALE);
   fitMode.value = null;
+  // 上一文档未结算的 Ctrl+滚轮缩放不带进新文档
+  if (zoomFlushTimer) clearTimeout(zoomFlushTimer);
+  zoomFlushTimer = null;
+  pendingZoomDelta = 0;
+  wheelAnchorPoint = null;
 
   try {
     if (!hasLibraryReadApi()) {
@@ -928,6 +933,7 @@ function fitScale(mode: FitMode): number {
 }
 
 function applyFit(mode: FitMode): void {
+  if (isLoading.value || pageSizes.value.length === 0) return;
   fitMode.value = mode;
   readerStore.setScale(fitScale(mode));
 }
@@ -970,7 +976,7 @@ interface ZoomAnchor {
   pageIndex: number;
   fraction: number;
   viewportY: number;
-  ratioX: number;
+  fractionX: number;
   viewportX: number;
 }
 
@@ -989,7 +995,7 @@ function captureZoomAnchor(): ZoomAnchor | null {
     pageIndex,
     fraction: pageRect.height > 0 ? (point.y - pageRect.top) / pageRect.height : 0,
     viewportY: point.y,
-    ratioX: root.scrollWidth > 0 ? (root.scrollLeft + point.x - rootRect.left) / root.scrollWidth : 0,
+    fractionX: pageRect.width > 0 ? (point.x - pageRect.left) / pageRect.width : 0,
     viewportX: point.x,
   };
 }
@@ -1000,7 +1006,7 @@ function restoreZoomAnchor(anchor: ZoomAnchor): void {
   if (!root || !pageEl) return;
   const pageRect = pageEl.getBoundingClientRect();
   root.scrollTop += pageRect.top + anchor.fraction * pageRect.height - anchor.viewportY;
-  root.scrollLeft = anchor.ratioX * root.scrollWidth - (anchor.viewportX - root.getBoundingClientRect().left);
+  root.scrollLeft += pageRect.left + anchor.fractionX * pageRect.width - anchor.viewportX;
 }
 
 function onPageNotesClick(pageNumber: number): void {

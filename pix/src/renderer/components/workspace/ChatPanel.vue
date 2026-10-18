@@ -209,14 +209,15 @@ const sending = ref(false);
 const MAX_PASTED_IMAGES = 8;
 
 const isStreaming = computed(() => sessionStore.isStreaming);
-/** 会话已就绪但没有任何可用模型（未配置密钥）：发送注定失败，空态与模型 chip 改为引导去设置。 */
-const modelUnavailable = computed(() => rpc.sessionState.value !== null && rpc.availableModels.value.length === 0);
-/** 当前模型不在可用列表里（如尚未选择时内核给出的占位模型）时提示去选择。 */
-const currentModelLabel = computed(() => {
+/** 模型列表已拉取且为空（未配置密钥）：发送注定失败，空态与模型 chip 改为引导去设置。 */
+const modelUnavailable = computed(() => rpc.modelsLoaded.value && rpc.availableModels.value.length === 0);
+/** 内核未选模型时给出的占位模型（packages/agent/src/agent.ts 的默认值），不当作真实模型展示。 */
+const PLACEHOLDER_MODEL_PROVIDER = "unknown";
+const currentModel = computed(() => {
   const model = rpc.sessionState.value?.model;
-  const usable = model && rpc.availableModels.value.some((item) => item.provider === model.provider && item.id === model.id);
-  return usable ? model.id : "选择模型";
+  return model && model.provider !== PLACEHOLDER_MODEL_PROVIDER ? model : null;
 });
+const currentModelLabel = computed(() => currentModel.value?.id ?? "选择模型");
 const currentThinkingLabel = computed(() => {
   const level = rpc.sessionState.value?.thinkingLevel;
   if (!level) return "思考深度";
@@ -1110,7 +1111,7 @@ onUnmounted(() => {
               type="button"
               class="header-chip"
               v-bind="menuProps"
-              :title="rpc.sessionState.value?.model ? `${rpc.sessionState.value.model.provider}/${rpc.sessionState.value.model.id}` : '选择模型'"
+              :title="currentModel ? `${currentModel.provider}/${currentModel.id}` : '选择模型'"
             >
               <v-icon size="14">mdi-brain</v-icon>
               <span>{{ currentModelLabel }}</span>
@@ -1139,7 +1140,7 @@ onUnmounted(() => {
           aria-label="设置"
           @click="router.push('/settings')"
         />
-        <button v-if="collapsible" type="button" class="pill-icon-btn chat-collapse" title="收起对话" @click="emit('collapse')">
+        <button v-if="collapsible" type="button" class="pill-icon-btn chat-collapse" title="收起对话" aria-label="收起对话" @click="emit('collapse')">
           <v-icon size="16">mdi-chevron-right</v-icon>
         </button>
       </div>
