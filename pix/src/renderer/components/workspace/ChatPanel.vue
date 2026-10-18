@@ -25,6 +25,7 @@ import type { DisplayBlock, SessionInfo } from "@/types/session";
 import type { ReadingAnchor } from "@shared/types";
 import { deriveSessionTitle, formatSessionTime } from "../../utils/session-title";
 import { docPathKey } from "../../utils/notes-path";
+import { buildChapterRanges, resolveCurrentChapter } from "../../utils/outline-notes";
 import MessageBlock from "../session/MessageBlock.vue";
 import ToolExecutionBlock from "../session/ToolExecutionBlock.vue";
 import ErrorBlock from "../session/ErrorBlock.vue";
@@ -203,9 +204,13 @@ const optimisticBlockId = ref<string | null>(null);
 const MAX_PASTED_IMAGES = 8;
 
 const isStreaming = computed(() => sessionStore.isStreaming);
+/** 会话已就绪但没有任何可用模型（未配置密钥）：发送注定失败，空态与模型 chip 改为引导去设置。 */
+const modelUnavailable = computed(() => rpc.sessionState.value !== null && rpc.availableModels.value.length === 0);
+/** 当前模型不在可用列表里（如尚未选择时内核给出的占位模型）时提示去选择。 */
 const currentModelLabel = computed(() => {
   const model = rpc.sessionState.value?.model;
-  return model ? `${model.id}` : "选择模型";
+  const usable = model && rpc.availableModels.value.some((item) => item.provider === model.provider && item.id === model.id);
+  return usable ? model.id : "选择模型";
 });
 const currentThinkingLabel = computed(() => {
   const level = rpc.sessionState.value?.thinkingLevel;
@@ -342,6 +347,39 @@ function followScrollEnd(): void {
 
 function updateDraft(value: string): void {
   draft.value = value;
+}
+
+// --- 起手问题：空对话 + 已打开文档时给出的预填草稿（只填入输入框，不自动发送） ---
+
+interface StarterPrompt {
+  icon: string;
+  label: string;
+  draft: string;
+}
+
+const starterPrompts = computed<StarterPrompt[]>(() => {
+  if (!readerStore.filePath || draft.value.trim()) return [];
+  const prompts: StarterPrompt[] = [
+    { icon: "mdi-text-box-search-outline", label: "概括全文的核心观点", draft: "请概括这篇文档的核心观点与主要贡献。" },
+  ];
+  if (readerStore.pageCount === 0) return prompts;
+  const page = readerStore.page;
+  prompts.push({ icon: "mdi-book-open-page-variant-outline", label: `讲解第 ${page} 页`, draft: `请讲解第 ${page} 页的内容。` });
+  const chapter = resolveCurrentChapter(
+    buildChapterRanges(readerStore.outline, readerStore.pageCount),
+    page,
+    readerStore.pageCount,
+  );
+  const chapterTitle = chapter?.title.replace(/\s+/g, " ").trim();
+  if (chapterTitle) {
+    prompts.push({ icon: "mdi-format-list-bulleted", label: `梳理「${chapterTitle}」`, draft: `请梳理「${chapterTitle}」这一节的要点。` });
+  }
+  return prompts;
+});
+
+function useStarterPrompt(prompt: StarterPrompt): void {
+  draft.value = prompt.draft;
+  composerInput.value?.focus();
 }
 
 // --- Quick ask: floating button over the PDF selection (useQuickAsk seam) ---
@@ -1013,7 +1051,18 @@ onUnmounted(() => {
         </button>
       </div>
       <div class="header-actions">
+        <button
+          v-if="modelUnavailable"
+          type="button"
+          class="header-chip is-warning"
+          title="还没有可用的模型，点击前往设置"
+          @click="openSettings"
+        >
+          <v-icon size="14">mdi-key-alert-outline</v-icon>
+          <span>未配置模型</span>
+        </button>
         <v-menu
+          v-else
           v-model="modelMenuOpen"
           :close-on-content-click="false"
           location="bottom end"
@@ -1146,9 +1195,32 @@ onUnmounted(() => {
       </template>
 
       <div v-if="blocks.length === 0" class="chat-empty">
-        <v-icon size="40" class="empty-icon">mdi-creation-outline</v-icon>
-        <p class="empty-title">新对话</p>
-        <p class="empty-subtitle">输入消息即可新建或继续对话；提问会自动附带当前文档与页码。</p>
+        <template v-if="modelUnavailable">
+          <v-icon size="40" class="empty-icon">mdi-key-chain-variant</v-icon>
+          <p class="empty-title">先连接一个模型</p>
+          <p class="empty-subtitle">在设置中为任一提供商填入 API 密钥，即可开始提问。</p>
+          <v-btn class="empty-action" size="small" variant="flat" color="primary" prepend-icon="mdi-cog-outline" @click="openSettings">
+            打开模型设置
+          </v-btn>
+        </template>
+        <template v-else>
+          <v-icon size="40" class="empty-icon">mdi-creation-outline</v-icon>
+          <p class="empty-title">新对话</p>
+          <p class="empty-subtitle">输入消息即可新建或继续对话；提问会自动附带当前文档与页码。</p>
+          <div v-if="starterPrompts.length > 0" class="starter-list">
+            <button
+              v-for="prompt in starterPrompts"
+              :key="prompt.label"
+              type="button"
+              class="starter-prompt"
+              :title="prompt.draft"
+              @click="useStarterPrompt(prompt)"
+            >
+              <v-icon size="15" class="starter-icon">{{ prompt.icon }}</v-icon>
+              <span class="starter-label">{{ prompt.label }}</span>
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -1358,6 +1430,16 @@ onUnmounted(() => {
 
 .header-chip:hover {
   background: var(--pix-bg-hover, #eef2f6);
+}
+
+.header-chip.is-warning {
+  border-color: var(--pix-warning-light);
+  background: var(--pix-warning-bg);
+  color: var(--pix-warning);
+}
+
+.header-chip.is-warning:hover {
+  border-color: var(--pix-warning);
 }
 
 .chat-collapse:hover {
@@ -1690,6 +1772,52 @@ onUnmounted(() => {
   margin: 0;
   font-size: 13px;
   color: var(--pix-text-muted);
+}
+
+.empty-action {
+  margin-top: 6px;
+}
+
+.starter-list {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  width: 100%;
+  max-width: 280px;
+  margin-top: 10px;
+}
+
+.starter-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 12px;
+  border: 1px solid var(--pix-border-light, #e3eaf0);
+  border-radius: 10px;
+  background: var(--pix-bg-elevated, #ffffff);
+  color: var(--pix-text-secondary);
+  font-family: var(--pix-font-ui);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.starter-prompt:hover {
+  border-color: var(--pix-border, #d5dfe8);
+  color: var(--pix-text-primary);
+}
+
+.starter-icon {
+  flex-shrink: 0;
+  color: var(--pix-text-muted);
+}
+
+.starter-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer {
